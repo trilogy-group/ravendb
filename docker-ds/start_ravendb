@@ -1,0 +1,11 @@
+#!/bin/bash
+
+export RAVEN_ServerUrl="http://$(hostname):8080"
+export RAVEN_ServerUrl_Tcp="tcp://$(hostname):38888"
+
+BASEDIR=$(dirname $(readlink -f $0))
+COMMAND="$BASEDIR/../artifacts/linux-x64/ServerPackage/RavenDB/Server/Raven.Server -c=$BASEDIR/../docker-ds/settings.json"
+
+eval $COMMAND
+exit $?
+

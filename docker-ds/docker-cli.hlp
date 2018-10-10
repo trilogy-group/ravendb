@@ -1,0 +1,12 @@
+Build the Docker image: 
+  docker-cli build
+
+Start the development container: 
+  docker-cli up
+
+Conect to the development container: 
+  docker-cli exec
+
+Shutdown the development container: 
+  docker-cli down
+
