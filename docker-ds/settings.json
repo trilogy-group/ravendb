@@ -1,0 +1,6 @@
+{
+  "Setup.Mode": "None",
+  "DataDir": "RavenData",
+  "Security.UnsecuredAccessAllowed": "PublicNetwork",
+  "License.Eula.Accepted": true
+}
