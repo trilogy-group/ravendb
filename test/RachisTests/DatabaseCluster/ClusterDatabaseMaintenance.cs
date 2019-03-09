@@ -1,15 +1,16 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
-using FastTests.Server.Replication;
+using FastTests;
 using Raven.Client.Documents;
 using Raven.Client.Documents.Indexes;
+using Raven.Client.Documents.Operations.Attachments;
 using Raven.Client.ServerWide;
 using Raven.Client.ServerWide.Operations;
 using Raven.Client.ServerWide.Operations.Certificates;
-using Raven.Server;
 using Raven.Server.Config;
 using Raven.Server.Config.Categories;
 using Raven.Server.Rachis;
@@ -36,6 +37,26 @@ namespace RachisTests.DatabaseCluster
                 Map = usersCollection => from user in usersCollection
                                          select new { user.Name };
                 Index(x => x.Name, FieldIndexing.Search);
+
+            }
+        }
+
+        [Fact]
+        public void CreateDatabaseOn00000Node()
+        {
+            using (var server = GetNewServer(new Dictionary<string, string>
+            {
+                [RavenConfiguration.GetKey(x => x.Core.ServerUrls)] = "http://0.0.0.0:0",
+                [RavenConfiguration.GetKey(x => x.Security.UnsecuredAccessAllowed)] = UnsecuredAccessAddressRange.PublicNetwork.ToString()
+            }))
+            using (var store = GetDocumentStore(new Options
+            {
+                Server = server,
+                ModifyDocumentStore = documentStore => documentStore.Urls = new []{server.ServerStore.GetNodeHttpServerUrl()},
+                CreateDatabase = true,
+                DeleteDatabaseOnDispose = true
+            }))
+            {
 
             }
         }
@@ -611,7 +632,7 @@ namespace RachisTests.DatabaseCluster
 
             var databaseName = GetDatabaseName();
             var groupSize = 3;
-            var newUrl = "http://" + Environment.MachineName + ":0";
+            var newUrl = "http://127.0.0.1:0";
             string nodeTag;
 
             var leader = await CreateRaftClusterAndGetLeader(groupSize, shouldRunInMemory: false, leaderIndex: 0, customSettings: new Dictionary<string, string>
@@ -665,6 +686,39 @@ namespace RachisTests.DatabaseCluster
             var (_, dbGroupNodes) = await CreateDatabaseInCluster(GetDatabaseName(), groupSize, leader.WebUrl);
             Assert.True(dbGroupNodes.Select(s => s.WebUrl).Contains(newUrl));
             
+        }
+
+        [Fact]
+        public async Task RavenDB_12744()
+        {
+            var databaseName = GetDatabaseName();
+            var leader = await CreateRaftClusterAndGetLeader(3);
+            var result = await CreateDatabaseInCluster(databaseName, 1, leader.WebUrl);
+
+            using (var store = new DocumentStore
+            {
+                Database = databaseName,
+                Urls = new[] { leader.WebUrl }
+            }.Initialize())
+            {
+                using (var commands = store.Commands())
+                {
+                    await commands.PutAsync("users/1", null, new Raven.Tests.Core.Utils.Entities.User { Name = "Fitzchak" });
+                }
+
+                using (var a1 = new MemoryStream(new byte[] { 1, 2, 3 }))
+                {
+                    await store.Operations.SendAsync(new PutAttachmentOperation("users/1", "a1", a1, "a1/png"));
+                }
+
+                var res = await store.Maintenance.Server.SendAsync(new AddDatabaseNodeOperation(databaseName));
+                var val = await WaitForValueAsync(async () => await GetMembersCount(store, databaseName), 2);
+                Assert.Equal(2, val);
+
+                res = await store.Maintenance.Server.SendAsync(new AddDatabaseNodeOperation(databaseName));
+                val = await WaitForValueAsync(async () => await GetMembersCount(store, databaseName), 3);
+                Assert.Equal(3, val);
+            }
         }
 
         private static async Task<int> GetPromotableCount(IDocumentStore store, string databaseName)

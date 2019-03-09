@@ -3,14 +3,15 @@ import endpoints = require("endpoints");
 
 class testClusterNodeConnectionCommand extends commandBase {
 
-    constructor(private serverUrl: string, private databaseName?: string) {
+    constructor(private serverUrl: string, private databaseName?: string, private bidirectional: boolean = true) {
         super();
     }
 
     execute(): JQueryPromise<Raven.Server.Web.System.NodeConnectionTestResult> {
         const args = {
             url: this.serverUrl,
-            database: this.databaseName
+            database: this.databaseName,
+            bidirectional: this.bidirectional
         };
         const url = endpoints.global.testConnection.adminTestConnection + this.urlEncodeArgs(args);
 

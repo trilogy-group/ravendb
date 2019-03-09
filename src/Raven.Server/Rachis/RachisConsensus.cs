@@ -86,9 +86,9 @@ namespace Raven.Server.Rachis
             return StateMachine.ShouldSnapshot(slice, type);
         }
 
-        public override Task SnapshotInstalledAsync(long lastIncludedIndex)
+        public override Task SnapshotInstalledAsync(long lastIncludedIndex, CancellationToken token)
         {
-            return StateMachine.OnSnapshotInstalledAsync(lastIncludedIndex, _serverStore);
+            return StateMachine.OnSnapshotInstalledAsync(lastIncludedIndex, _serverStore, token);
         }
 
         public override Task<RachisConnection> ConnectToPeer(string url, string tag, X509Certificate2 certificate)
@@ -114,6 +114,7 @@ namespace Raven.Server.Rachis
                 foreach (var value in table.SeekByPrimaryKey(key, 0))
                 {
                     var entry = FollowerAmbassador.BuildRachisEntryToSend(context, value);
+                    Transaction.DebugDisposeReaderAfterTransaction(context.Transaction.InnerTransaction, entry);
                     entries.Add(entry);
                     if (entries.Count >= max)
                         break;
@@ -739,7 +740,7 @@ namespace Raven.Server.Rachis
 
         public void RemoveAndDispose(IDisposable parentState, IDisposable disposable)
         {
-            if(disposable == null)
+            if (disposable == null)
                 return;
 
             using (ContextPool.AllocateOperationContext(out TransactionOperationContext context))
@@ -747,7 +748,7 @@ namespace Raven.Server.Rachis
             using (disposable)
             {
                 if (_disposables.Count == 0 || ReferenceEquals(_disposables[0], parentState) == false)
-                    throw new ConcurrencyException(
+                    throw new RachisConcurrencyException(
                         "Could not remove the disposable because by the time we did it the parent state has changed");
                 _disposables.Remove(disposable);
             }
@@ -890,7 +891,11 @@ namespace Raven.Server.Rachis
             if (read == null)
                 return null;
 
-            return new BlittableJsonReaderObject(read.Reader.Base, read.Reader.Length, context);
+            BlittableJsonReaderObject topologyBlittable = new BlittableJsonReaderObject(read.Reader.Base, read.Reader.Length, context);
+
+            Transaction.DebugDisposeReaderAfterTransaction(context.Transaction.InnerTransaction, topologyBlittable);
+
+            return topologyBlittable;
         }
 
         public BlittableJsonReaderObject SetTopology(TransactionOperationContext context, ClusterTopology topology)
@@ -918,6 +923,9 @@ namespace Raven.Server.Rachis
                 TaskExecutor.CompleteAndReplace(ref engine._topologyChanged);
                 engine.TopologyChanged?.Invoke(engine, clusterTopology);
             };
+
+            Transaction.DebugDisposeReaderAfterTransaction(context.Transaction.InnerTransaction, topologyJson);
+
 
             return topologyJson;
         }
@@ -1278,6 +1286,8 @@ namespace Raven.Server.Rachis
                     }
                 }
             }
+
+            Transaction.DebugDisposeReaderAfterTransaction(context.Transaction.InnerTransaction, lastTopology);
             return (lastTopology, lastTopologyIndex);
         }
 
@@ -1325,7 +1335,10 @@ namespace Raven.Server.Rachis
                 flags = *(RachisEntryFlags*)reader.Read(3, out int size);
                 Debug.Assert(size == sizeof(RachisEntryFlags));
                 var ptr = reader.Read(2, out size);
-                return new BlittableJsonReaderObject(ptr, size, context);
+                BlittableJsonReaderObject entry = new BlittableJsonReaderObject(ptr, size, context);
+
+                Transaction.DebugDisposeReaderAfterTransaction(context.Transaction.InnerTransaction, entry);
+                return entry;
             }
         }
 
@@ -1770,6 +1783,8 @@ namespace Raven.Server.Rachis
                     return safe ? Volatile.Read(ref _leaderTag) : _leaderTag;
                 case RachisState.LeaderElect:
                 case RachisState.Leader:
+                    if (CurrentLeader?.Running != true)
+                        return null;
                     return safe ? Volatile.Read(ref _tag) : _tag; 
                 default:
                     throw new ArgumentOutOfRangeException();
@@ -1784,7 +1799,7 @@ namespace Raven.Server.Rachis
 
         public abstract long Apply(TransactionOperationContext context, long uptoInclusive, Leader leader, Stopwatch duration);
 
-        public abstract Task SnapshotInstalledAsync(long lastIncludedIndex);
+        public abstract Task SnapshotInstalledAsync(long lastIncludedIndex, CancellationToken token);
 
         private readonly AsyncManualResetEvent _leadershipTimeChanged = new AsyncManualResetEvent();
         private int _heartbeatWaitersCounter;
@@ -1880,6 +1895,14 @@ namespace Raven.Server.Rachis
             {
                 table.DeleteByPrimaryKey(key, _ => true);
             }
+        }
+
+        public static bool IsExpectedException(Exception e)
+        {
+            if (e is AggregateException)
+                return IsExpectedException(e.InnerException);
+
+            return e is OperationCanceledException || e is ObjectDisposedException;
         }
     }
 

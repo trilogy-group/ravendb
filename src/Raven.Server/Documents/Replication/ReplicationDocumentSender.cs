@@ -215,11 +215,11 @@ namespace Raven.Server.Documents.Replication
                                 lastTransactionMarker = item.TransactionMarker;
 
                                 if (_parent.SupportedFeatures.Replication.Counters == false)
-                                {                                    
+                                {
                                     AssertNotCounterForLegacyReplication(item);
                                 }
 
-                                if (_parent.SupportedFeatures.Replication.ClusterTransaction == false )
+                                if (_parent.SupportedFeatures.Replication.ClusterTransaction == false)
                                 {
                                     AssertNotClusterTransactionDocumentForLegacyReplication(item);
                                 }
@@ -279,6 +279,7 @@ namespace Raven.Server.Documents.Replication
 
                             numberOfItemsSent++;
                         }
+
                     }
                     
                     if (_log.IsInfoEnabled)
@@ -289,7 +290,10 @@ namespace Raven.Server.Documents.Replication
                             _log.Info(message);
                         }
                         
-                        _log.Info($"Found {_orderedReplicaItems.Count:#,#;;0} documents and {_replicaAttachmentStreams.Count} attachment's streams to replicate to {_parent.Node.FromString()}.");
+                        _log.Info($"Found {_orderedReplicaItems.Count:#,#;;0} documents " +
+                                  $"and {_replicaAttachmentStreams.Count} attachment's streams " +
+                                  $"to replicate to {_parent.Node.FromString()}, " +
+                                  $"total size: {new Size(size, SizeUnit.Bytes)}");
                     }
 
                     if (_orderedReplicaItems.Count == 0)
@@ -420,7 +424,7 @@ namespace Raven.Server.Documents.Replication
                 if (isArtificial)
                     _skippedArtificialDocuments++;
 
-                if (_startChangeVector != null)
+                if (_startChangeVector == null)
                 {
                     _startChangeVector = item.ChangeVector;
                     _startEtag = item.Etag;
@@ -453,7 +457,6 @@ namespace Raven.Server.Documents.Replication
                 _endChangeVector = null;
             }
         }
-
         private bool AddReplicationItemToBatch(ReplicationBatchItem item, OutgoingReplicationStatsScope stats, SkippedReplicationItemsInfo skippedReplicationItemsInfo)
         {
             if (item.Type == ReplicationBatchItem.ReplicationItemType.Document ||
@@ -467,13 +470,23 @@ namespace Raven.Server.Documents.Replication
                 }
             }
 
-
             if (item.Type == ReplicationBatchItem.ReplicationItemType.CounterTombstone && 
                 _parent.SupportedFeatures.Replication.Counters == false)
             {
                 // skip counter tombstones in legacy mode
                 skippedReplicationItemsInfo.Update(item);
                 return false;
+            }
+
+            if (item.Flags.Contain(DocumentFlags.Revision) || item.Flags.Contain(DocumentFlags.DeleteRevision))
+            {
+                // we let pass all the conflicted/resolved revisions, since we keep them with their original change vector which might be `AlreadyMerged` at the destination.
+                if (item.Flags.Contain(DocumentFlags.Conflicted) || 
+                    item.Flags.Contain(DocumentFlags.Resolved))
+                {
+                    _orderedReplicaItems.Add(item.Etag, item);
+                    return true;
+                }
             }
 
             // destination already has it
@@ -492,6 +505,7 @@ namespace Raven.Server.Documents.Replication
                     var message = skippedReplicationItemsInfo.GetInfoForDebug(_parent.LastAcceptedChangeVector);
                     _log.Info(message);
                 }
+
                 skippedReplicationItemsInfo.Reset();
             }
 

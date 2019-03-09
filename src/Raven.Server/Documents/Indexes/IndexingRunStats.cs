@@ -4,6 +4,7 @@ using Raven.Client.Documents.Indexes;
 using Raven.Client.Util;
 using Raven.Server.Documents.Indexes.MapReduce.Exceptions;
 using Raven.Server.Exceptions;
+using Voron.Exceptions;
 
 namespace Raven.Server.Documents.Indexes
 {
@@ -76,7 +77,7 @@ namespace Raven.Server.Documents.Indexes
             AddError(null, $"Critical exception occurred: {exception}", "Critical");
         }
 
-        public void AddMemoryError(OutOfMemoryException oome)
+        public void AddMemoryError(Exception oome)
         {
             AddError(null, $"Memory exception occurred: {oome}", "Memory");
         }
@@ -84,6 +85,11 @@ namespace Raven.Server.Documents.Indexes
         public void AddExcessiveNumberOfReduceErrors(ExcessiveNumberOfReduceErrorsException e)
         {
             AddError(null, $"Excessive number of reduce errors: {e}", "Reduce");
+        }
+
+        public void AddDiskFullError(DiskFullException e)
+        {
+            AddError(null, $"Disk full error occured: {e}", "Disk Full");
         }
 
         private void AddError(string key, string message, string action)

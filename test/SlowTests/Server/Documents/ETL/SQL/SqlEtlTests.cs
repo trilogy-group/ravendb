@@ -40,7 +40,7 @@ namespace SlowTests.Server.Documents.ETL.SQL
             if (TryConnect(cString))
                 return cString;
 
-            cString = @"Data Source=ci1\sqlexpress;Integrated Security=SSPI;Connection Timeout=3";
+            cString = @"Data Source=ci1\sqlexpress;Integrated Security=SSPI;Connection Timeout=15";
 
             if (TryConnect(cString))
                 return cString;
@@ -542,29 +542,30 @@ loadToOrders(orderData);");
                     await session.StoreAsync(new Order());
                     await session.SaveChangesAsync();
                 }
-                string str = string.Format("{0}/admin/logs/watch", store.Urls.First().Replace("http", "ws"));
-                StringBuilder sb = new StringBuilder();
+
+                var str = string.Format("{0}/admin/logs/watch", store.Urls.First().Replace("http", "ws"));
+                var sb = new StringBuilder();
 
                 var mre = new AsyncManualResetEvent();
 
                 await client.ConnectAsync(new Uri(str), CancellationToken.None);
-                var task = Task.Run((Func<Task>)(async () =>
-               {
-                   ArraySegment<byte> buffer = new ArraySegment<byte>(new byte[1024]);
-                   while (client.State == WebSocketState.Open)
-                   {
-                       var value = await ReadFromWebSocket(buffer, client);
-                       lock (sb)
-                       {
-                           mre.Set();
-                           sb.AppendLine(value);
-                       }
-                       const string expectedValue = "skipping document: orders/1";
-                       if (value.Contains(expectedValue) || sb.ToString().Contains(expectedValue))
-                           return;
+                var task = Task.Run(async () =>
+                {
+                    ArraySegment<byte> buffer = new ArraySegment<byte>(new byte[1024]);
+                    while (client.State == WebSocketState.Open)
+                    {
+                        var value = await ReadFromWebSocket(buffer, client);
+                        lock (sb)
+                        {
+                            mre.Set();
+                            sb.AppendLine(value);
+                        }
+                        const string expectedValue = "skipping document: orders/";
+                        if (value.Contains(expectedValue) || sb.ToString().Contains(expectedValue))
+                            return;
 
-                   }
-               }));
+                    }
+                });
                 await mre.WaitAsync(TimeSpan.FromSeconds(60));
                 SetupSqlEtl(store, @"output ('Tralala'); 
 
@@ -572,10 +573,18 @@ undefined();
 
 var nameArr = this.StepName.split('.'); loadToOrders({});");
 
+                using (var session = store.OpenAsyncSession())
+                {
+                    for (var i = 0; i < 100; i++)
+                        await session.StoreAsync(new Order());
+
+                    await session.SaveChangesAsync();
+                }
+
                 var condition = await task.WaitWithTimeout(TimeSpan.FromSeconds(60));
                 if (condition == false)
                 {
-                    var msg = "Could not process SQL Replication script for OrdersAndLines, skipping document: orders/1";
+                    var msg = "Could not process SQL Replication script for OrdersAndLines, skipping document: orders/";
                     var tempFileName = Path.GetTempFileName();
                     lock (sb)
                     {
@@ -618,9 +627,8 @@ var nameArr = this.StepName.split('.'); loadToOrders({});");
                 var database = GetDatabase(store.Database).Result;
 
                 using (database.DocumentsStorage.ContextPool.AllocateOperationContext(out DocumentsOperationContext context))
-                using (context.OpenReadTransaction())
                 {
-                    var result = (SqlEtlTestScriptResult) SqlEtl.TestScript(new TestSqlEtlScript
+                    var result = (SqlEtlTestScriptResult)SqlEtl.TestScript(new TestSqlEtlScript
                     {
                         PerformRolledBackTransaction = performRolledBackTransaction,
                         DocumentId = "orders/1-A",
@@ -661,6 +669,88 @@ var nameArr = this.StepName.split('.'); loadToOrders({});");
                     Assert.Equal(2, orders.Commands.Length); // delete and insert
 
                     Assert.Equal("test output", result.DebugOutput[0]);
+                }
+            }
+        }
+
+        [Theory]
+        [InlineData(true)]
+        [InlineData(false)]
+        public async Task CanTestDeletion(bool performRolledBackTransaction)
+        {
+            using (var store = GetDocumentStore())
+            {
+                CreateRdbmsSchema(store);
+
+                using (var session = store.OpenAsyncSession())
+                {
+                    await session.StoreAsync(new Order
+                    {
+                        OrderLines = new List<OrderLine>
+                        {
+                            new OrderLine{Cost = 3, Product = "Milk", Quantity = 3},
+                            new OrderLine{Cost = 4, Product = "Bear", Quantity = 2},
+                        }
+                    });
+                    await session.SaveChangesAsync();
+                }
+
+                store.Maintenance.Send(new PutConnectionStringOperation<SqlConnectionString>(new SqlConnectionString()
+                {
+                    Name = "simulate",
+                    ConnectionString = GetConnectionString(store),
+                    FactoryName = "System.Data.SqlClient",
+                }));
+
+                var database = GetDatabase(store.Database).Result;
+
+                using (database.DocumentsStorage.ContextPool.AllocateOperationContext(out DocumentsOperationContext context))
+                {
+                    var result = (SqlEtlTestScriptResult)SqlEtl.TestScript(new TestSqlEtlScript
+                    {
+                        PerformRolledBackTransaction = performRolledBackTransaction,
+                        DocumentId = "orders/1-A",
+                        IsDelete = true,
+                        Configuration = new SqlEtlConfiguration()
+                        {
+                            Name = "simulate",
+                            ConnectionStringName = "simulate",
+                            SqlTables =
+                            {
+                                new SqlEtlTable {TableName = "Orders", DocumentIdColumn = "Id"},
+                                new SqlEtlTable {TableName = "OrderLines", DocumentIdColumn = "OrderId"},
+                                new SqlEtlTable {TableName = "NotUsedInScript", DocumentIdColumn = "OrderId"},
+                            },
+                            Transforms =
+                            {
+                                new Transformation()
+                                {
+                                    Collections = {"Orders"},
+                                    Name = "OrdersAndLines",
+                                    Script = defaultScript
+                                }
+                            }
+                        }
+                    }, database, database.ServerStore, context);
+
+                    Assert.Equal(0, result.TransformationErrors.Count);
+                    Assert.Equal(0, result.LoadErrors.Count);
+                    Assert.Equal(0, result.SlowSqlWarnings.Count);
+
+                    Assert.Equal(2, result.Summary.Count);
+
+                    var orderLines = result.Summary.First(x => x.TableName == "OrderLines");
+
+                    Assert.Equal(1, orderLines.Commands.Length); // delete
+
+                    var orders = result.Summary.First(x => x.TableName == "Orders");
+
+                    Assert.Equal(1, orders.Commands.Length); // delete
+                }
+
+                using (var session = store.OpenAsyncSession())
+                {
+                    Assert.NotNull(session.Query<Order>("orders/1-A"));
                 }
             }
         }
@@ -927,7 +1017,7 @@ loadToOrders(orderData);
                         dbCommand.CommandText = " SELECT Pic FROM Orders WHERE Id = 'orders/1-A'";
 
                         var sqlDataReader = dbCommand.ExecuteReader();
-                        
+
                         Assert.True(sqlDataReader.Read());
                         Assert.True(sqlDataReader.IsDBNull(0));
                     }

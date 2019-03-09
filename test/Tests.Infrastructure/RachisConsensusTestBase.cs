@@ -116,7 +116,7 @@ namespace Tests.Infrastructure
             return nodes.FirstOrDefault(x => x.CurrentState == RachisState.Leader);
         }
 
-        protected RachisConsensus<CountingStateMachine> SetupServer(bool bootstrap = false, int port = 0, int electionTimeout = 300 ,[CallerMemberName] string caller = null)
+        protected RachisConsensus<CountingStateMachine> SetupServer(bool bootstrap = false, int port = 0, int electionTimeout = 300, [CallerMemberName] string caller = null)
         {
             var tcpListener = new TcpListener(IPAddress.Loopback, port);
             tcpListener.Start();
@@ -132,12 +132,12 @@ namespace Tests.Infrastructure
             var server = StorageEnvironmentOptions.CreateMemoryOnly();
 
             int seed = PredictableSeeds ? _random.Next(int.MaxValue) : _count;
-            var configuration = new RavenConfiguration(caller, ResourceType.Server);
+            var configuration = RavenConfiguration.CreateForServer(caller);
             configuration.Initialize();
             configuration.Core.RunInMemory = true;
             configuration.Core.PublicServerUrl = new UriSetting($"http://localhost:{((IPEndPoint)tcpListener.LocalEndpoint).Port}");
             configuration.Cluster.ElectionTimeout = new TimeSetting(electionTimeout, TimeUnit.Milliseconds);
-            var serverStore = new RavenServer(configuration).ServerStore;
+            var serverStore = new RavenServer(configuration) { ThrowOnLicenseActivationFailure = true }.ServerStore;
             serverStore.Initialize();
             var rachis = new RachisConsensus<CountingStateMachine>(serverStore, seed);
             var storageEnvironment = new StorageEnvironment(server);
@@ -198,7 +198,7 @@ namespace Tests.Infrastructure
                 }
                 catch
                 {
-                  // expected
+                    // expected
                 }
             }
         }
@@ -252,7 +252,7 @@ namespace Tests.Infrastructure
 
             await ActionWithLeader(l =>
             {
-                
+
                 using (l.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
                 using (context.OpenReadTransaction())
                     index = l.GetLastEntryIndex(context);

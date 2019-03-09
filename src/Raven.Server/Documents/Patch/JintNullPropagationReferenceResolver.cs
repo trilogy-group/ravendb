@@ -8,9 +8,19 @@ namespace Raven.Server.Documents.Patch
 {
     public abstract class JintNullPropagationReferenceResolver : IReferenceResolver
     {
+        protected JsValue _selfInstance;
+        protected BlittableObjectInstance _args;
+
         public virtual bool TryUnresolvableReference(Engine engine, Reference reference, out JsValue value)
         {
-            value = reference.GetReferencedName() == "length" ? 0 : Null.Instance;
+            var name = reference.GetReferencedName();
+            if (_args == null || name == null || name.StartsWith('$') == false)
+            {
+                value = name == "length" ? 0 : Null.Instance;
+                return true;
+            }
+
+            value = _args.Get(name.Substring(1));
             return true;
         }
 
@@ -39,7 +49,7 @@ namespace Raven.Server.Documents.Patch
                     switch (name)
                     {
                         case "reduce":
-                            value = new ClrFunctionInstance(engine, (thisObj, values) => values.Length > 1 ? values[1] : thisObj);
+                            value = new ClrFunctionInstance(engine, (thisObj, values) => values.Length > 1 ? values[1] : JsValue.Null);
                             return true;
                         case "concat":
                             value = new ClrFunctionInstance(engine, (thisObj, values) => values[0]);

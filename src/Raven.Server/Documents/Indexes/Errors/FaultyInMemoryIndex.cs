@@ -5,6 +5,7 @@ using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
 using Raven.Client.Documents.Indexes;
 using Raven.Server.Config.Categories;
+using Raven.Server.Documents.Handlers;
 using Raven.Server.Documents.Includes;
 using Raven.Server.Documents.Indexes.Auto;
 using Raven.Server.Documents.Indexes.Persistence.Lucene;
@@ -76,6 +77,11 @@ namespace Raven.Server.Documents.Indexes.Errors
             throw new NotSupportedException($"{Type} index does not support updating it's definition and configuration.");
         }
 
+        public override void SaveLastState()
+        {
+            throw new NotSupportedException($"{Type} index does not support flushing it's filters.");
+        }
+
         public override List<IndexingError> GetErrors()
         {
             return new List<IndexingError>
@@ -124,7 +130,7 @@ namespace Raven.Server.Documents.Indexes.Errors
             throw new NotSupportedException($"Index {Name} is in-memory implementation of a faulty index", _e);
         }
 
-        public override void SetState(IndexState state)
+        public override void SetState(IndexState state, bool inMemoryOnly = false, bool ignoreWriteError = false)
         {
             throw new NotSupportedException($"Index {Name} is in-memory implementation of a faulty index", _e);
         }
@@ -144,7 +150,7 @@ namespace Raven.Server.Documents.Indexes.Errors
             throw new NotSupportedException($"Index {Name} is in-memory implementation of a faulty index", _e);
         }
 
-        public override Task StreamQuery(HttpResponse response, IStreamDocumentQueryResultWriter writer, IndexQueryServerSide query, DocumentsOperationContext documentsContext, OperationCancelToken token)
+        public override Task StreamQuery(HttpResponse response, IStreamQueryResultWriter<Document> writer, IndexQueryServerSide query, DocumentsOperationContext documentsContext, OperationCancelToken token)
         {
             throw new NotSupportedException($"Index {Name} is in-memory implementation of a faulty index", _e);
         }

@@ -2,13 +2,7 @@
 
 import virtualColumn = require("widgets/virtualGrid/columns/virtualColumn");
 import virtualGridController = require("widgets/virtualGrid/virtualGridController");
-import utils = require("widgets/virtualGrid/virtualGridUtils");
-
-type textColumnOpts<T> = {
-    extraClass?: (item: T) => string;
-    useRawValue?: (item: T) => boolean;
-    title?: (item:T) => string;
-}
+import generalUtils = require("common/generalUtils");
 
 type preparedValue = {
     rawText: string;
@@ -25,22 +19,53 @@ class textColumn<T> implements virtualColumn {
     }
     
     get headerTitle() {
-        return this.header;
+        return generalUtils.unescapeHtml(this.header);
     }
 
     get headerAsText() {
         return this.header;
     }
+    
+    get sortable(): boolean {
+        return this.opts && !!this.opts.sortable;
+    }
 
+    sortProvider(mode: sortMode): (array: Array<any>) => Array<any> {
+        if (this.opts && this.opts.sortable) {
+            switch (this.opts.sortable) {
+                case "string":
+                case "number":
+                    return (input: Array<any>) => input.sort((a, b) => generalUtils.sortAlphaNumeric(this.getCellValue(a), this.getCellValue(b), mode));
+                default:
+                    const provider = this.opts.sortable as valueProvider<T>;
+                    return (input: Array<any>) => input.sort((a, b) => generalUtils.sortAlphaNumeric(provider(a), provider(b), mode));
+            }
+        }
+        return null;
+    }
+
+    get defaultSortOrder(): sortMode {
+        if (this.opts && this.opts.defaultSortOrder) {
+            return this.opts.defaultSortOrder;
+        }
+        
+        return "asc";
+    }
+    
     getCellValue(item: T) {
         return _.isFunction(this.valueAccessor)
             ? this.valueAccessor.bind(item)(item) // item is available as this, as well as first argument
             : (item as any)[this.valueAccessor as string];
     }
 
-    renderCell(item: T, isSelected: boolean): string {
-        const extraHtml = this.opts.title ? ` title="${utils.escape(this.opts.title(item))}" ` : '';
-        const extraCssClasses = this.opts.extraClass ? this.opts.extraClass(item) : '';
+    renderCell(item: T, isSelected: boolean, isSorted: boolean): string {
+        const extraHtml = this.opts.title ? ` title="${generalUtils.escapeHtml(this.opts.title(item))}" ` : '';
+        let extraCssClasses = this.opts.extraClass ? this.opts.extraClass(item) : '';
+        
+        if (isSorted) {
+            extraCssClasses += ' sorted';
+        }
+        
         try {
             const preparedValue = this.prepareValue(item);
             return `<div  ${extraHtml} class="cell text-cell ${preparedValue.typeCssClass} ${extraCssClasses}" style="width: ${this.width}">${preparedValue.rawText}</div>`;
@@ -48,14 +73,13 @@ class textColumn<T> implements virtualColumn {
             //TODO: work on L&F of errors!
             return `<div class="cell text-cell eval-error ${extraCssClasses}" style="width: ${this.width}">Error!</div>`;
         }
-        
     }
 
     protected prepareValue(item: T): preparedValue {
         const cellValue = this.getCellValue(item);
 
         if (_.isString(cellValue)) {
-            const rawText = this.opts.useRawValue && this.opts.useRawValue(item) ? cellValue : utils.escape(cellValue);
+            const rawText = this.opts.useRawValue && this.opts.useRawValue(item) ? cellValue : generalUtils.escapeHtml(cellValue);
             return {
                 rawText: rawText,
                 typeCssClass: "token string"
@@ -93,7 +117,7 @@ class textColumn<T> implements virtualColumn {
         }
 
         if (_.isArray(cellValue)) {
-            const value = utils.escape(JSON.stringify(cellValue, null, 2));
+            const value = generalUtils.escapeHtml(JSON.stringify(cellValue, null, 2));
 
             return {
                 rawText: "[ ... ]",
@@ -102,7 +126,7 @@ class textColumn<T> implements virtualColumn {
         }
 
         if (_.isObject(cellValue)) {
-            const value = utils.escape(JSON.stringify(cellValue, null, 2));
+            const value = generalUtils.escapeHtml(JSON.stringify(cellValue, null, 2));
 
             return {
                 rawText: "{ ... }",
@@ -111,7 +135,7 @@ class textColumn<T> implements virtualColumn {
         }
 
         if (cellValue != null) {
-            const value = utils.escape(cellValue.toString());
+            const value = generalUtils.escapeHtml(cellValue.toString());
             return {
                 rawText: value,
                 typeCssClass: ""
@@ -119,6 +143,15 @@ class textColumn<T> implements virtualColumn {
         }
 
         throw new Error("Unhandled value: " + cellValue);
+    }
+    
+    toDto(): virtualColumnDto {
+        return {
+            type: "text",
+            width: this.width,
+            header: this.header,
+            serializedValue: this.valueAccessor.toString()
+        }
     }
 
 }

@@ -64,7 +64,7 @@ namespace Voron.Platform.Win32
             _copyOnWriteMode = Options.CopyOnWriteMode && FileName.FullPath.EndsWith(Constants.DatabaseFilename);
             if (_copyOnWriteMode)
             {
-                _memoryMappedFileAccess = MemoryMappedFileAccess.Read | MemoryMappedFileAccess.CopyOnWrite;
+                _memoryMappedFileAccess = MemoryMappedFileAccess.CopyOnWrite;
                 fileAttributes = Win32NativeFileAttributes.Readonly;
                 _access = Win32NativeFileAccess.GenericRead;
             }
@@ -82,7 +82,7 @@ namespace Voron.Platform.Win32
             if (_handle.IsInvalid)
             {
                 int lastWin32ErrorCode = Marshal.GetLastWin32Error();
-                throw new IOException("Failed to open file storage of Win32MemoryMapPager for " + file,
+                throw new IOException("Failed to open file storage of WinMemoryMapPager for " + file,
                     new Win32Exception(lastWin32ErrorCode));
             }
 

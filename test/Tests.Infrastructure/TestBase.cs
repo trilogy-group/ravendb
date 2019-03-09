@@ -111,8 +111,12 @@ namespace FastTests
 
         protected string GetDatabaseName([CallerMemberName] string caller = null)
         {
-            //if (caller != null && caller.Contains(".ctor"))
-            //    throw new InvalidOperationException($"Usage of '{nameof(GetDocumentStore)}' without explicit '{nameof(caller)}' parameter is forbidden from inside constructor.");
+            if (caller != null && caller.Contains(".ctor"))
+                throw new InvalidOperationException(
+                    $"{nameof(GetDatabaseName)} was invoked from within {GetType().Name} constructor. This is an indication that you're trying to generate" +
+                    " a database within a test class constructor. This is forbidden because this database will be generated but the test won't run until" +
+                    $" it gets the semaphore at {nameof(InitializeAsync)} also the constructor is invoked per test method and it is not shared between tests" +
+                    " so there is no value in generating the database from the constructor.");
 
             var name = caller != null ? $"{caller}_{Interlocked.Increment(ref _counter)}" : Guid.NewGuid().ToString("N");
             return name;
@@ -126,13 +130,23 @@ namespace FastTests
 
         protected static volatile string _selfSignedCertFileName;
 
-        protected static string GenerateAndSaveSelfSignedCertificate()
+        protected string GenerateAndSaveSelfSignedCertificate()
         {
             if (_selfSignedCertFileName == null)
                 GenerateSelfSignedCertFileName();
 
-            var tmp = Path.GetTempFileName();
+            var tmp = GetTempFileName();
             File.Copy(_selfSignedCertFileName, tmp, true);
+
+            return tmp;
+        }
+
+        protected string GetTempFileName()
+        {
+            var tmp = Path.GetTempFileName();
+
+            _localPathsToDelete.Add(tmp);
+
             return tmp;
         }
 
@@ -147,7 +161,7 @@ namespace FastTests
                 byte[] certBytes;
                 try
                 {
-                    certBytes = CertificateUtils.CreateSelfSignedCertificate(Environment.MachineName, "RavenTestsServer", log);
+                    certBytes = CertificateUtils.CreateSelfSignedTestCertificate(Environment.MachineName, "RavenTestsServer", log);
                 }
                 catch (Exception e)
                 {
@@ -182,6 +196,8 @@ namespace FastTests
                 }
 
                 _selfSignedCertFileName = tempFileName;
+
+                GlobalPathsToDelete.Add(_selfSignedCertFileName);
             }
         }
 
@@ -336,7 +352,11 @@ namespace FastTests
         {
             lock (_getNewServerSync)
             {
-                var configuration = new RavenConfiguration(Guid.NewGuid().ToString(), ResourceType.Server, customConfigPath);
+                var configuration = RavenConfiguration.CreateForServer(Guid.NewGuid().ToString(), customConfigPath);
+
+                configuration.SetSetting(RavenConfiguration.GetKey(x => x.Replication.ReplicationMinimalHeartbeat), "1");
+                configuration.SetSetting(RavenConfiguration.GetKey(x => x.Replication.RetryReplicateAfter), "3");
+                configuration.SetSetting(RavenConfiguration.GetKey(x => x.Cluster.AddReplicaTimeout), "10");
 
                 if (customSettings != null)
                 {
@@ -345,7 +365,7 @@ namespace FastTests
                         configuration.SetSetting(setting.Key, setting.Value);
                     }
                 }
-
+             
                 configuration.Initialize();
                 configuration.Logs.Mode = LogMode.None;
                 if (customSettings == null || customSettings.ContainsKey(RavenConfiguration.GetKey(x => x.Core.ServerUrls)) == false)
@@ -357,9 +377,6 @@ namespace FastTests
                 configuration.Core.DataDirectory =
                     configuration.Core.DataDirectory.Combine(partialPath ?? $"Tests{Interlocked.Increment(ref _serverCounter)}");
                 configuration.Server.MaxTimeForTaskToWaitForDatabaseToLoad = new TimeSetting(60, TimeUnit.Seconds);
-                configuration.Replication.ReplicationMinimalHeartbeat = new TimeSetting(100, TimeUnit.Milliseconds);
-                configuration.Replication.RetryReplicateAfter = new TimeSetting(3, TimeUnit.Seconds);
-                configuration.Cluster.AddReplicaTimeout = new TimeSetting(10, TimeUnit.Seconds);
                 configuration.Licensing.EulaAccepted = true;
                 if (customSettings == null || customSettings.ContainsKey(RavenConfiguration.GetKey(x => x.Core.FeaturesAvailability)) == false)
                 {
@@ -369,7 +386,7 @@ namespace FastTests
                 if (deletePrevious)
                     IOExtensions.DeleteDirectory(configuration.Core.DataDirectory.FullPath);
 
-                var server = new RavenServer(configuration);
+                var server = new RavenServer(configuration) { ThrowOnLicenseActivationFailure = true };
                 server.Initialize();
 
                 return server;

@@ -51,7 +51,7 @@ namespace Sparrow.Json
 
             if (_buffer.Length - Used > count)
             {
-                Unsafe.CopyBlock(_buffer.Pointer + Used, buffer, (uint)count);
+                Memory.Copy(_buffer.Pointer + Used, buffer, (uint)count);
                 _sizeInBytes += count;
                 Used += count;
             }
@@ -76,7 +76,7 @@ namespace Sparrow.Json
 
                 var bytesToWrite = Math.Min(lengthLeft, _buffer.Length - Used);
 
-                Unsafe.CopyBlock(_buffer.Pointer + Used, buffer, (uint)bytesToWrite);
+                Memory.Copy(_buffer.Pointer + Used, buffer, (uint)bytesToWrite);
 
                 _sizeInBytes += bytesToWrite;
                 lengthLeft -= bytesToWrite;
@@ -271,7 +271,7 @@ namespace Sparrow.Json
             var head = _head;
             if (head.Allocation.SizeInBytes - head.Used > count)
             {
-                Unsafe.CopyBlock(head.Address + head.Used, buffer, (uint)count);
+                Memory.Copy(head.Address + head.Used, buffer, (uint)count);
                 head.AccumulatedSizeInBytes += count;
                 head.Used += count;
             }
@@ -298,7 +298,7 @@ namespace Sparrow.Json
 
                 // Write as much as we can in the current Segment
                 var amountWrittenInRound = Math.Min(amountPending, availableSpace);
-                Unsafe.CopyBlock(head.Address + head.Used, buffer, (uint)amountWrittenInRound);
+                Memory.Copy(head.Address + head.Used, buffer, (uint)amountWrittenInRound);
 
                 // Update Segment invariants
                 head.AccumulatedSizeInBytes += amountWrittenInRound;
@@ -332,6 +332,9 @@ namespace Sparrow.Json
             // mutate it to ensure all copies have the same allocations.
             var allocation = _context.GetMemory(segmentSize);
 
+            if (allocation.SizeInBytes < required)
+                ThrowOnAllocationSizeMismatch(allocation.SizeInBytes, required);
+
             // Copy the head
             Segment previousHead = _head.ShallowCopy();
 
@@ -343,6 +346,12 @@ namespace Sparrow.Json
             _head.Address = allocation.Address;
             _head.Used = 0;
             _head.AccumulatedSizeInBytes = previousHead.AccumulatedSizeInBytes;
+        }
+
+        private static void ThrowOnAllocationSizeMismatch(int allocationSizeInBytes, int required)
+        {
+            throw new InvalidOperationException($"Allocated {new Size(allocationSizeInBytes, SizeUnit.Bytes)}" +
+                                                $"but we requested at least {new Size(required, SizeUnit.Bytes)}");
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -385,8 +394,20 @@ Grow:
                 copiedBytes += head.Used;
                 Memory.Copy(whereToWrite, head.Address, head.Used);
             }
-            Debug.Assert(copiedBytes == _head.AccumulatedSizeInBytes);
+
+            ThrowOnCopiedBytesMismatch(copiedBytes, _head.AccumulatedSizeInBytes);
+
             return copiedBytes;
+        }
+
+        [Conditional("DEBUG")]
+        private static void ThrowOnCopiedBytesMismatch(int copiedBytes, int accumulatedSizeInBytes)
+        {
+            if (copiedBytes != accumulatedSizeInBytes)
+            {
+                throw new InvalidOperationException($"Copied size is: {new Size(copiedBytes, SizeUnit.Bytes)} " +
+                                                    $"while the accumulated size (in the segment) is: {new Size(accumulatedSizeInBytes, SizeUnit.Bytes)}");
+            }
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -477,7 +498,7 @@ Grow:
             {
                 CopyTo(_head.Address + _head.Used);
                 // we need to fit in the beginning of the chunk, so we must move it backward.
-                UnmanagedMemory.Move(_head.Address, _head.Address + _head.Used, SizeInBytes);
+                Memory.Move(_head.Address, _head.Address + _head.Used, SizeInBytes);
 
                 ptr = _head.Address;
                 size = SizeInBytes;

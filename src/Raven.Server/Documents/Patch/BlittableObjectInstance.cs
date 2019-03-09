@@ -4,7 +4,6 @@ using System.Diagnostics;
 using Jint;
 using Jint.Native;
 using Jint.Native.Array;
-using Jint.Native.Json;
 using Jint.Native.Object;
 using Jint.Runtime.Descriptors;
 using Jint.Runtime.Interop;
@@ -19,14 +18,15 @@ namespace Raven.Server.Documents.Patch
     public class BlittableObjectInstance : ObjectInstance
     {
         public bool Changed;
-        private readonly BlittableObjectInstance _parent;        
+        private readonly BlittableObjectInstance _parent;
+        private bool _put;
 
         public readonly DateTime? LastModified;
         public readonly string ChangeVector;
         public readonly BlittableJsonReaderObject Blittable;
         public readonly string DocumentId;
         public HashSet<string> Deletes;
-        public Dictionary<string, BlittableObjectProperty > OwnValues = 
+        public Dictionary<string, BlittableObjectProperty> OwnValues = 
             new Dictionary<string, BlittableObjectProperty>();
         public Dictionary<string, BlittableJsonToken> OriginalPropertiesTypes;
         public Lucene.Net.Documents.Document LuceneDocument;
@@ -40,8 +40,7 @@ namespace Raven.Server.Documents.Patch
 
         public ObjectInstance GetOrCreate(string key)
         {
-            BlittableObjectProperty property;
-            if (OwnValues.TryGetValue(key, out property) == false)
+            if (OwnValues.TryGetValue(key, out var property) == false)
             {
                 property = GenerateProperty(key);
 
@@ -133,7 +132,17 @@ namespace Raven.Server.Documents.Patch
                             }
                             else
                             {
-                                _value = values[0];
+                                var value = values[0];
+                                switch (value)
+                                {
+                                    case Client.Constants.Documents.Indexing.Fields.NullValue:
+                                        value = null;
+                                        break;
+                                    case Client.Constants.Documents.Indexing.Fields.EmptyString:
+                                        value = string.Empty;
+                                        break;
+                                }
+                                _value = value;
                             }                            
                         }
                         else
@@ -202,15 +211,14 @@ namespace Raven.Server.Documents.Patch
                 return jsArray;
             }
 
-            private unsafe JsValue TranslateToJs(BlittableObjectInstance owner, string key, BlittableJsonToken type, object value)
+            private JsValue TranslateToJs(BlittableObjectInstance owner, string key, BlittableJsonToken type, object value)
             {
-                
                 switch (type & BlittableJsonReaderBase.TypesMask)
                 {
                     case BlittableJsonToken.Null:
                         return JsValue.Null;
                     case BlittableJsonToken.Boolean:
-                        return (bool)value?JsBoolean.True:JsBoolean.False;
+                        return (bool)value ? JsBoolean.True : JsBoolean.False;
                     case BlittableJsonToken.Integer:
                         // TODO: in the future, add [numeric type]TryFormat, when parsing numbers to strings
                         owner?.RecordNumericFieldType(key, BlittableJsonToken.Integer);
@@ -269,6 +277,7 @@ namespace Raven.Server.Documents.Patch
             ChangeVector = changeVector;
             Blittable = blittable;
             DocumentId = docId;
+            Prototype = engine.Object.PrototypeObject;
         }
 
 
@@ -285,16 +294,35 @@ namespace Raven.Server.Documents.Patch
         public override PropertyDescriptor GetOwnProperty(string propertyName)
         {
             if (OwnValues.TryGetValue(propertyName, out var val))
-            {
                 return val;
-            }
-                
+
             Deletes?.Remove(propertyName);
 
             val = new BlittableObjectProperty(this, propertyName);
-            
+
+            if (val.Value.IsUndefined() && 
+                DocumentId == null &&
+                _put == false)
+            {
+                return PropertyDescriptor.Undefined;
+            }
+
             OwnValues[propertyName] = val;
+
             return val;
+        }
+
+        public override void Put(string propertyName, JsValue value, bool throwOnError)
+        {
+            _put = true;
+            try
+            {
+                base.Put(propertyName, value, throwOnError);
+            }
+            finally
+            {
+                _put = false;
+            }
         }
 
         public override IEnumerable<KeyValuePair<string, PropertyDescriptor>> GetOwnProperties()

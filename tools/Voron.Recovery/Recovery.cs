@@ -26,6 +26,7 @@ using Voron.Data;
 using Voron.Data.BTrees;
 using Voron.Data.RawData;
 using Voron.Data.Tables;
+using Voron.Exceptions;
 using Voron.Global;
 using Voron.Impl.Paging;
 using static System.String;
@@ -42,19 +43,29 @@ namespace Voron.Recovery
             _pageSize = config.PageSizeInKB * Constants.Size.Kilobyte;
             _initialContextSize = config.InitialContextSizeInMB * Constants.Size.Megabyte;
             _initialContextLongLivedSize = config.InitialContextLongLivedSizeInKB * Constants.Size.Kilobyte;
-            _option = StorageEnvironmentOptions.ForPath(config.DataFileDirectory, null, null, null, null);
-            _copyOnWrite = !config.DisableCopyOnWriteMode;
+            
             // by default CopyOnWriteMode will be true
-            _option.CopyOnWriteMode = _copyOnWrite;
-            _option.ManualFlushing = true;
+            _copyOnWrite = !config.DisableCopyOnWriteMode;
+            _config = config;
+            _option = CreateOptions();
+            
             _progressIntervalInSec = config.ProgressIntervalInSec;
             _previouslyWrittenDocs = new Dictionary<string, long>();
             if(config.LoggingMode != LogMode.None)
                 LoggingSource.Instance.SetupLogMode(config.LoggingMode, Path.Combine(Path.GetDirectoryName(_output), LogFileName));
             _logger = LoggingSource.Instance.GetLogger<Recovery>("Voron Recovery");
-            _config = config;
         }
 
+        private StorageEnvironmentOptions CreateOptions()
+        {
+            var result = StorageEnvironmentOptions.ForPath(_config.DataFileDirectory, null, null, null, null);
+            result.CopyOnWriteMode = _copyOnWrite;
+            result.ManualFlushing = true;
+            result.ManualSyncing = true;
+            result.IgnoreInvalidJournalErrors = _config.IgnoreInvalidJournalErrors;
+
+            return result;
+        }
 
         private readonly byte[] _streamHashState = new byte[(int)Sodium.crypto_generichash_statebytes()];
         private readonly byte[] _streamHashResult = new byte[(int)Sodium.crypto_generichash_bytes()];
@@ -68,6 +79,14 @@ namespace Voron.Recovery
 
         public RecoveryStatus Execute(TextWriter writer, CancellationToken ct)
         {
+            void PrintRecoveryProgress(long startOffset, byte* mem, byte* eof, DateTime now)
+            {
+                var currPos = GetFilePosition(startOffset, mem);
+                var eofPos = GetFilePosition(startOffset, eof);
+                writer.WriteLine(
+                    $"{now:hh:MM:ss}: Recovering page at position {currPos:#,#;;0}/{eofPos:#,#;;0} ({(double)currPos / eofPos:p}) - Last recovered doc is {_lastRecoveredDocumentKey}");
+            }
+
             StorageEnvironment se = null;
             try
             {
@@ -82,7 +101,27 @@ namespace Voron.Recovery
                     try
                     {
                         _option.OwnsPagers = false;
-                        se = new StorageEnvironment(_option);
+
+                        while (true)
+                        {
+                            try
+                            {
+                                se = new StorageEnvironment(_option);
+                                break;
+                            }
+                            catch (IncreasingDataFileInCopyOnWriteModeException e)
+                            {
+                                _option.Dispose();
+
+                                using (var file = File.Open(e.DataFilePath, FileMode.Open))
+                                {
+                                    file.SetLength(e.RequestedSize);
+                                }
+
+                                _option = CreateOptions();
+                            }
+                        }
+
                         mem = se.Options.DataPager.AcquirePagePointer(null, 0);
                         writer.WriteLine(
                             $"Journal recovery has completed successfully within {sw.Elapsed.TotalSeconds:N1} seconds");
@@ -90,7 +129,9 @@ namespace Voron.Recovery
                     catch (Exception e)
                     {
                         se?.Dispose();
-                        writer.WriteLine($"Journal recovery failed, reason:{Environment.NewLine}{e}");
+                        writer.WriteLine("Journal recovery failed, don't worry we will continue with data recovery.");
+                        writer.WriteLine("The reason for the Jornal recovery failure was:");
+                        writer.WriteLine(e);
                     }
                     finally
                     {
@@ -149,10 +190,7 @@ namespace Voron.Recovery
                                     writer.WriteLine("Press 'q' to quit the recovery process");
                                 }
                                 lastProgressReport = now;
-                                var currPos = GetFilePosition(startOffset, mem);
-                                var eofPos = GetFilePosition(startOffset, eof);
-                                writer.WriteLine(
-                                    $"{now:hh:MM:ss}: Recovering page at position {currPos:#,#;;0}/{eofPos:#,#;;0} ({(double)currPos / eofPos:p}) - Last recovered doc is {_lastRecoveredDocumentKey}");
+                                PrintRecoveryProgress(startOffset, mem, eof, now);
                             }
 
                             var pageHeader = (PageHeader*)mem;
@@ -367,6 +405,8 @@ namespace Voron.Recovery
                             mem = PrintErrorAndAdvanceMem(message, mem);
                         }
                     }
+
+                    PrintRecoveryProgress(startOffset, mem, eof, DateTime.UtcNow);
 
                     ReportOrphanAttachmentsAndMissingAttachments(writer, documentsWriter, ct);
                     //This will only be the case when we don't have orphan attachments and we wrote the last attachment after we wrote the 

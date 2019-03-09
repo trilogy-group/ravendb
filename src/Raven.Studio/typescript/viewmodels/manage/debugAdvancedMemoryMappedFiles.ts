@@ -1,7 +1,6 @@
 import viewModelBase = require("viewmodels/viewModelBase");
 
 import virtualGridController = require("widgets/virtualGrid/virtualGridController");
-import columnsSelector = require("viewmodels/partial/columnsSelector");
 import textColumn = require("widgets/virtualGrid/columns/textColumn");
 import columnPreviewPlugin = require("widgets/virtualGrid/columnPreviewPlugin");
 import generalUtils = require("common/generalUtils");
@@ -24,7 +23,6 @@ class memoryMappedFiles extends viewModelBase {
     filter = ko.observable<string>();
     
     private gridController = ko.observable<virtualGridController<memoryMappingItem>>();
-    columnsSelector = new columnsSelector<memoryMappingItem>();
     private columnPreview = new columnPreviewPlugin<memoryMappingItem>();
     
     filesCount: KnockoutComputed<number>;
@@ -97,12 +95,21 @@ class memoryMappedFiles extends viewModelBase {
 
         const grid = this.gridController();
         grid.headerVisible(true);
+        grid.setDefaultSortBy(3, "desc");
         grid.init(fetcher, () =>
             [
-                new textColumn<memoryMappingItem>(grid, x => x.Directory, "Directory", "15%"),
-                new textColumn<memoryMappingItem>(grid, x => x.FileName, "File Name", "25%"),
-                new textColumn<memoryMappingItem>(grid, x => x.HumaneFileSize, "File Size", "15%"),
-                new textColumn<memoryMappingItem>(grid, x => x.HumaneTotalMapped, "Total Mapped", "30%"),
+                new textColumn<memoryMappingItem>(grid, x => x.Directory, "Directory", "15%", {
+                    sortable: "string"
+                }),
+                new textColumn<memoryMappingItem>(grid, x => x.FileName, "File Name", "25%", {
+                    sortable: "string"
+                }),
+                new textColumn<memoryMappingItem>(grid, x => x.HumaneFileSize, "File Size", "15%", {
+                    sortable: x => x.FileSize
+                }),
+                new textColumn<memoryMappingItem>(grid, x => x.HumaneTotalMapped, "Total Mapped", "30%", {
+                    sortable: x => x.TotalMapped
+                }),
             ]
         );
 

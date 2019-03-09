@@ -13,7 +13,9 @@ using Raven.Client.Documents.Operations.Backups;
 using Raven.Client.Documents.Smuggler;
 using Raven.Client.Exceptions;
 using Raven.Client.ServerWide.Operations;
+using Raven.Server.Documents;
 using Raven.Server.Documents.PeriodicBackup;
+using Raven.Server.ServerWide.Context;
 using Raven.Tests.Core.Utils.Entities;
 using Xunit;
 
@@ -492,6 +494,15 @@ namespace SlowTests.Server.Documents.PeriodicBackup
                         val = await session.CountersFor("users/2").GetAsync("downloads");
                         Assert.Equal(200, val);
                     }
+
+                    var originalDatabase = await Server.ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(store.Database);
+                    var restoredDatabase = await Server.ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(databaseName);
+                    using (restoredDatabase.DocumentsStorage.ContextPool.AllocateOperationContext(out DocumentsOperationContext ctx))
+                    using (ctx.OpenReadTransaction())
+                    {
+                        var databaseChangeVector = DocumentsStorage.GetDatabaseChangeVector(ctx);
+                        Assert.Equal($"A:6-{originalDatabase.DbBase64Id}, A:6-{restoredDatabase.DbBase64Id}", databaseChangeVector);
+                    }
                 }
             }
         }
@@ -584,6 +595,15 @@ namespace SlowTests.Server.Documents.PeriodicBackup
 
                     var stats = await store.Maintenance.SendAsync(new GetStatisticsOperation());
                     Assert.Equal(2, stats.CountOfIndexes);
+
+                    var originalDatabase = await Server.ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(store.Database);
+                    var restoredDatabase = await Server.ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(restoredDatabaseName);
+                    using (restoredDatabase.DocumentsStorage.ContextPool.AllocateOperationContext(out DocumentsOperationContext ctx))
+                    using (ctx.OpenReadTransaction())
+                    {
+                        var databaseChangeVector = DocumentsStorage.GetDatabaseChangeVector(ctx);
+                        Assert.Equal($"A:7-{originalDatabase.DbBase64Id}, A:7-{restoredDatabase.DbBase64Id}", databaseChangeVector);
+                    }
                 }
             }
         }
@@ -697,7 +717,8 @@ namespace SlowTests.Server.Documents.PeriodicBackup
 
                 using (var store2 = GetDocumentStore())
                 {
-                    await store2.Smuggler.ImportAsync(new DatabaseSmugglerImportOptions(), exportPath);
+                    var op = await store2.Smuggler.ImportAsync(new DatabaseSmugglerImportOptions(), exportPath);
+                    await op.WaitForCompletionAsync(TimeSpan.FromMinutes(1));
 
                     var stats = await store2.Maintenance.SendAsync(new GetStatisticsOperation());
                     Assert.Equal(2, stats.CountOfDocuments);
@@ -740,7 +761,8 @@ namespace SlowTests.Server.Documents.PeriodicBackup
                     // importing to a new database, in order to verify that
                     // periodic backup imports only the changed documents (and counters)
 
-                    await store3.Smuggler.ImportAsync(new DatabaseSmugglerImportOptions(), exportPath);
+                    var op = await store3.Smuggler.ImportAsync(new DatabaseSmugglerImportOptions(), exportPath);
+                    await op.WaitForCompletionAsync(TimeSpan.FromMinutes(1));
 
                     var stats = await store3.Maintenance.SendAsync(new GetStatisticsOperation());
                     Assert.Equal(1, stats.CountOfDocuments);

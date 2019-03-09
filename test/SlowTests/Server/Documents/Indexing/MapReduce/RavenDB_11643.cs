@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Threading;
 using FastTests;
 using Raven.Client.Documents.Indexes;
@@ -11,6 +12,7 @@ using Raven.Server.ServerWide.Context;
 using Raven.Server.Utils;
 using Sparrow.Binary;
 using Sparrow.Json.Parsing;
+using Sparrow.Platform;
 using Sparrow.Utils;
 using Voron;
 using Voron.Data.Tables;
@@ -69,7 +71,13 @@ namespace SlowTests.Server.Documents.Indexing.MapReduce
 
                             long pageNumber = 541;
 
-                            store2.FreedPages.Add(pageNumber);
+                            if (tx.InnerTransaction.LowLevelTransaction.Environment.Options.ForceUsing32BitsPager || PlatformDetails.Is32Bits)
+                            {
+                                // in 32 bits we might allocate different pages, 93 is going to be used during store1.Add() calls
+                                pageNumber = 93;
+                            }
+
+                            mapReduceContext.FreedPages.Add(pageNumber);
 
                             for (int i = 0; i < 200; i++)
                             {
@@ -83,27 +91,34 @@ namespace SlowTests.Server.Documents.Indexing.MapReduce
                                 }
                             }
                             
-                            var writeOperation =
-                                new Lazy<IndexWriteOperation>(() => index.IndexPersistence.OpenIndexWriter(tx.InnerTransaction, null));
+                            var writeOperation = new Lazy<IndexWriteOperation>(() => index.IndexPersistence.OpenIndexWriter(tx.InnerTransaction, null));
 
-                            var stats = new IndexingStatsScope(new IndexingRunStats());
-                            reducer.Execute(null, indexContext,
-                                writeOperation,
-                                stats, CancellationToken.None);
-
-                            Assert.DoesNotContain(pageNumber, store2.FreedPages);
-
-                            var table = indexContext.Transaction.InnerTransaction.OpenTable(ReduceMapResultsBase<MapReduceIndexDefinition>.ReduceResultsSchema,
-                                ReduceMapResultsBase<MapReduceIndexDefinition>.PageNumberToReduceResultTableName);
-
-                            var page = Bits.SwapBytes(pageNumber);
-
-                            unsafe
+                            try
                             {
-                                using (Slice.External(indexContext.Allocator, (byte*)&page, sizeof(long), out Slice pageSlice))
+                                var stats = new IndexingStatsScope(new IndexingRunStats());
+                                reducer.Execute(null, indexContext,
+                                    writeOperation,
+                                    stats, CancellationToken.None);
+
+                                Assert.DoesNotContain(pageNumber, mapReduceContext.FreedPages);
+
+                                var table = indexContext.Transaction.InnerTransaction.OpenTable(ReduceMapResultsBase<MapReduceIndexDefinition>.ReduceResultsSchema,
+                                    ReduceMapResultsBase<MapReduceIndexDefinition>.PageNumberToReduceResultTableName);
+
+                                var page = Bits.SwapBytes(pageNumber);
+
+                                unsafe
                                 {
-                                    Assert.True(table.ReadByKey(pageSlice, out TableValueReader tvr));
+                                    using (Slice.External(indexContext.Allocator, (byte*)&page, sizeof(long), out Slice pageSlice))
+                                    {
+                                        Assert.True(table.ReadByKey(pageSlice, out TableValueReader tvr));
+                                    }
                                 }
+                            }
+                            finally
+                            {
+                                if (writeOperation.IsValueCreated)
+                                    writeOperation.Value.Dispose();
                             }
                         }
                     }

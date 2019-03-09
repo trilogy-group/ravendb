@@ -6,8 +6,6 @@ using System.Runtime.CompilerServices;
 using System.Runtime.ExceptionServices;
 using System.Threading.Tasks;
 using Sparrow;
-using Sparrow.Collections;
-using Sparrow.LowMemory;
 using Sparrow.Threading;
 using Sparrow.Utils;
 using Voron.Data;
@@ -66,14 +64,12 @@ namespace Voron.Impl
             public int ScratchPagesTablePoolIndex = 0;
             public Dictionary<long, PageFromScratchBuffer> ScratchPagesInUse = new Dictionary<long, PageFromScratchBuffer>(NumericEqualityComparer.BoxedInstanceInt64);
             public Dictionary<long, PageFromScratchBuffer> ScratchPagesReadyForNextTx = new Dictionary<long, PageFromScratchBuffer>(NumericEqualityComparer.BoxedInstanceInt64);
-            public readonly Dictionary<long, long> DirtyOverflowPagesPool = new Dictionary<long, long>(NumericEqualityComparer.BoxedInstanceInt64);
             public readonly HashSet<long> DirtyPagesPool = new HashSet<long>(NumericEqualityComparer.BoxedInstanceInt64);
 
             public void Reset()
             {
                 ScratchPagesReadyForNextTx.Clear();
                 ScratchPagesInUse.Clear();
-                DirtyOverflowPagesPool.Clear();
                 DirtyPagesPool.Clear();
                 TableValueBuilder.Reset();
             }
@@ -81,7 +77,6 @@ namespace Voron.Impl
 
         // BEGIN: Structures that are safe to pool.
         private readonly HashSet<long> _dirtyPages;
-        private readonly Dictionary<long, long> _dirtyOverflowPages;
         private readonly Stack<long> _pagesToFreeOnCommit;
         private readonly Dictionary<long, PageFromScratchBuffer> _scratchPagesTable;
         private readonly HashSet<PagerState> _pagerStates;
@@ -106,6 +101,7 @@ namespace Voron.Impl
         private readonly StorageEnvironmentState _state;
 
         private CommitStats _requestedCommitStats;
+        private JournalFile.UpdatePageTranslationTableAndUnusedPagesAction? _updatePageTranslationTableAndUnusedPages;
 
         public TransactionPersistentContext PersistentContext { get; }
         public TransactionFlags Flags { get; }
@@ -154,12 +150,12 @@ namespace Voron.Impl
             _journal = env.Journal;
             _id = txId;
             _freeSpaceHandling = previous._freeSpaceHandling;
-            _allocator = previous._allocator;
-
-            _disposeAllocator = previous._disposeAllocator;
-            previous._disposeAllocator = false;
-
             PersistentContext = previous.PersistentContext;
+
+            _allocator = new ByteStringContext(SharedMultipleUseFlag.None);
+            _disposeAllocator = true;
+            _allocator.AllocationFailed += MarkTransactionAsFailed;
+
             Flags = TransactionFlags.ReadWrite;
 
             _pagerStates = new HashSet<PagerState>(ReferenceEqualityComparer<PagerState>.Default);
@@ -172,7 +168,7 @@ namespace Voron.Impl
             }
 
             var pagers = new HashSet<AbstractPager>();
-            
+
             foreach (var scratchAndDataPagerState in previous._pagerStates)
             {
                 // in order to avoid "dragging" pager state ref on non active scratch - we will not copy disposed scratches from previous async tx. RavenDB-6766
@@ -194,8 +190,6 @@ namespace Voron.Impl
 
             // we can reuse those instances, not calling Reset on the pool
             // because we are going to need to scratch buffer pool
-            _dirtyOverflowPages = previous._dirtyOverflowPages;
-            _dirtyOverflowPages.Clear();
 
             _scratchPagesTable = _env.WriteTransactionPool.ScratchPagesReadyForNextTx;
 
@@ -236,6 +230,9 @@ namespace Voron.Impl
             _id = id;
             _freeSpaceHandling = freeSpaceHandling;
             _allocator = context ?? new ByteStringContext(SharedMultipleUseFlag.None);
+
+            _allocator.AllocationFailed += MarkTransactionAsFailed;
+
             _disposeAllocator = context == null;
             _pagerStates = new HashSet<PagerState>(ReferenceEqualityComparer<PagerState>.Default);
 
@@ -276,7 +273,6 @@ namespace Voron.Impl
                 journalFile.AddRef();
             }
             _env.WriteTransactionPool.Reset();
-            _dirtyOverflowPages = _env.WriteTransactionPool.DirtyOverflowPagesPool;
             _scratchPagesTable = _env.WriteTransactionPool.ScratchPagesInUse;
             _dirtyPages = _env.WriteTransactionPool.DirtyPagesPool;
             _freedPages = new HashSet<long>(NumericEqualityComparer.BoxedInstanceInt64);
@@ -292,12 +288,17 @@ namespace Voron.Impl
         [Conditional("DEBUG")]
         private void EnsureNoDuplicateTransactionId(long id)
         {
+            EnsureNoDuplicateTransactionId_Forced(id);
+        }
+
+        internal void EnsureNoDuplicateTransactionId_Forced(long id)
+        {
             foreach (var journalFile in _journal.Files)
             {
                 var lastSeenTxIdByJournal = journalFile.PageTranslationTable.GetLastSeenTransactionId();
 
                 if (id <= lastSeenTxIdByJournal)
-                    VoronUnrecoverableErrorException.Raise(_env,
+                    VoronUnrecoverableErrorException.Raise(this,
                         $"PTT of journal {journalFile.Number} already contains records for a new write tx. " +
                         $"Tx id = {id}, last seen by journal = {lastSeenTxIdByJournal}");
 
@@ -307,7 +308,7 @@ namespace Voron.Impl
                 var maxTxIdInJournal = journalFile.PageTranslationTable.MaxTransactionId();
 
                 if (id <= maxTxIdInJournal)
-                    VoronUnrecoverableErrorException.Raise(_env,
+                    VoronUnrecoverableErrorException.Raise(this,
                         $"PTT of journal {journalFile.Number} already contains records for a new write tx. " +
                         $"Tx id = {id}, max id in journal = {maxTxIdInJournal}");
             }
@@ -394,22 +395,19 @@ namespace Voron.Impl
             Page newPage;
             if (currentPage.IsOverflow)
             {
-                int numberOfAllocatedPages;
-                newPage = AllocateOverflowRawPage(currentPage.OverflowSize, out numberOfAllocatedPages, num, currentPage, zeroPage: false);
+                newPage = AllocateOverflowRawPage(currentPage.OverflowSize, out var numberOfAllocatedPages, num, currentPage, zeroPage: false);
                 pageSize = Constants.Storage.PageSize * numberOfAllocatedPages;
-                _numberOfModifiedPages += numberOfAllocatedPages;
             }
             else
             {
                 newPage = AllocatePage(1, num, currentPage, zeroPage: false); // allocate new page in a log file but with the same number			
                 pageSize = Environment.Options.PageSize;
-                _numberOfModifiedPages += 1;
             }
 
             Memory.Copy(newPage.Pointer, currentPage.Pointer, pageSize);
 
             ZeroPageHeaderChecksumToEnsureNoUseOfCryptoReservedSpace(newPage.Pointer);
-            
+
             TrackWritablePage(newPage);
 
             _pageLocator.SetWritable(num, newPage);
@@ -426,8 +424,8 @@ namespace Voron.Impl
                 // that check for the full page hash, and it isn't relevant for 
                 // crypto anyway
                 return;
-            } 
-            
+            }
+
             // in order to ensure that the last 32 bytes of the page are always reserved
             // for crypto, we'll zero them after copying them from the pager. If using 
             // encrypted, we'll always re-write it anyway, and this ensures that we'll
@@ -438,12 +436,20 @@ namespace Voron.Impl
 
         private const int InvalidScratchFile = -1;
         private PagerStateCacheItem _lastScratchFileUsed = new PagerStateCacheItem(InvalidScratchFile, null);
-        private bool _disposed;
+        private TxState _disposed;
+
+        [Flags]
+        private enum TxState
+        {
+            None,
+            Disposed = 1,
+            Errored = 2
+        }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public Page GetPage(long pageNumber)
         {
-            if (_disposed)
+            if (_disposed != TxState.None)
                 ThrowObjectDisposed();
 
             if (_pageLocator.TryGetReadOnlyPage(pageNumber, out Page result))
@@ -504,9 +510,14 @@ namespace Voron.Impl
             return p;
         }
 
-        private static void ThrowObjectDisposed()
+        private void ThrowObjectDisposed()
         {
-            throw new ObjectDisposedException("Transaction");
+            if (_disposed.HasFlag(TxState.Disposed))
+                ThrowObjectDisposed();
+            if (_disposed.HasFlag(TxState.Errored))
+                throw new InvalidDataException("The transaction is in error state, and cannot be used further");
+
+            throw new ObjectDisposedException("Transaction state is invalid: " + _disposed);
         }
 
         public Page AllocatePage(int numberOfPages, long? pageNumber = null, Page? previousPage = null, bool zeroPage = true)
@@ -541,64 +552,69 @@ namespace Voron.Impl
 
         private Page AllocatePage(int numberOfPages, long pageNumber, Page? previousVersion, bool zeroPage)
         {
-            if (_disposed)
-                throw new ObjectDisposedException("Transaction");
+            if (_disposed != TxState.None)
+                ThrowObjectDisposed();
 
-            var maxAvailablePageNumber = _env.Options.MaxStorageSize / Constants.Storage.PageSize;
+            try
+            {
+                var maxAvailablePageNumber = _env.Options.MaxStorageSize / Constants.Storage.PageSize;
 
-            if (pageNumber > maxAvailablePageNumber)
-                ThrowQuotaExceededException(pageNumber, maxAvailablePageNumber);
+                if (pageNumber > maxAvailablePageNumber)
+                    ThrowQuotaExceededException(pageNumber, maxAvailablePageNumber);
 
 
-            Debug.Assert(pageNumber < State.NextPageNumber);
+                Debug.Assert(pageNumber < State.NextPageNumber);
 
 #if VALIDATE
             VerifyNoDuplicateScratchPages();
 #endif
-            var pageFromScratchBuffer = _env.ScratchBufferPool.Allocate(this, numberOfPages);
-            pageFromScratchBuffer.PreviousVersion = previousVersion;
-            _transactionPages.Add(pageFromScratchBuffer);
+                var pageFromScratchBuffer = _env.ScratchBufferPool.Allocate(this, numberOfPages);
+                pageFromScratchBuffer.PreviousVersion = previousVersion;
+                _transactionPages.Add(pageFromScratchBuffer);
 
-            _numberOfModifiedPages += numberOfPages;
+                _numberOfModifiedPages += numberOfPages;
 
-            _scratchPagesTable[pageNumber] = pageFromScratchBuffer;
+                _scratchPagesTable[pageNumber] = pageFromScratchBuffer;
 
-            _dirtyPages.Add(pageNumber);
+                _dirtyPages.Add(pageNumber);
 
-            TrackDirtyPage(pageNumber);
+                TrackDirtyPage(pageNumber);
 
-            if (numberOfPages > 1)
-                _dirtyOverflowPages.Add(pageNumber + 1, numberOfPages - 1);
+                if (numberOfPages != 1)
+                {
+                    _env.ScratchBufferPool.EnsureMapped(this,
+                        pageFromScratchBuffer.ScratchFileNumber,
+                        pageFromScratchBuffer.PositionInScratchBuffer,
+                        numberOfPages);
+                }
 
-            if (numberOfPages != 1)
-            {
-                _env.ScratchBufferPool.EnsureMapped(this,
-                    pageFromScratchBuffer.ScratchFileNumber,
-                    pageFromScratchBuffer.PositionInScratchBuffer,
-                    numberOfPages);
+                var newPagePointer = _env.ScratchBufferPool.AcquirePagePointerForNewPage(this, pageFromScratchBuffer.ScratchFileNumber,
+                    pageFromScratchBuffer.PositionInScratchBuffer, numberOfPages);
+
+                if (zeroPage)
+                    Memory.Set(newPagePointer, 0, Constants.Storage.PageSize * numberOfPages);
+
+                var newPage = new Page(newPagePointer)
+                {
+                    PageNumber = pageNumber,
+                    Flags = PageFlags.Single
+                };
+
+                _pageLocator.SetWritable(pageNumber, newPage);
+
+                TrackWritablePage(newPage);
+
+#if VALIDATE
+            VerifyNoDuplicateScratchPages();
+#endif
+
+                return newPage;
             }
-
-            var newPagePointer = _env.ScratchBufferPool.AcquirePagePointerForNewPage(this, pageFromScratchBuffer.ScratchFileNumber,
-                pageFromScratchBuffer.PositionInScratchBuffer, numberOfPages);
-
-            if (zeroPage)
-                Memory.Set(newPagePointer, 0, Constants.Storage.PageSize * numberOfPages);
-
-            var newPage = new Page(newPagePointer)
+            catch
             {
-                PageNumber = pageNumber,
-                Flags = PageFlags.Single
-            };
-
-            _pageLocator.SetWritable(pageNumber, newPage);
-
-            TrackWritablePage(newPage);
-
-#if VALIDATE
-            VerifyNoDuplicateScratchPages();
-#endif
-
-            return newPage;
+                _disposed |= TxState.Errored;
+                throw;
+            }
         }
 
         private void ThrowQuotaExceededException(long pageNumber, long? maxAvailablePageNumber)
@@ -613,8 +629,8 @@ namespace Voron.Impl
 
         internal void BreakLargeAllocationToSeparatePages(long pageNumber)
         {
-            if (_disposed)
-                throw new ObjectDisposedException("Transaction");
+            if (_disposed != TxState.None)
+                ThrowObjectDisposed();
 
             PageFromScratchBuffer value;
             if (_scratchPagesTable.TryGetValue(pageNumber, out value) == false)
@@ -631,7 +647,6 @@ namespace Voron.Impl
                 var pageFromScratchBuffer = new PageFromScratchBuffer(value.ScratchFileNumber, value.PositionInScratchBuffer + i, 1, 1);
                 _transactionPages.Add(pageFromScratchBuffer);
                 _scratchPagesTable[pageNumber + i] = pageFromScratchBuffer;
-                _dirtyOverflowPages.Remove(pageNumber + i);
                 _dirtyPages.Add(pageNumber + i);
                 TrackDirtyPage(pageNumber + i);
                 var newPage = _env.ScratchBufferPool.ReadPage(this, value.ScratchFileNumber, value.PositionInScratchBuffer + i);
@@ -643,8 +658,8 @@ namespace Voron.Impl
 
         internal void ShrinkOverflowPage(long pageNumber, int newSize, TreeMutableState treeState)
         {
-            if (_disposed)
-                throw new ObjectDisposedException("Transaction");
+            if (_disposed != TxState.None)
+                ThrowObjectDisposed();
 
             PageFromScratchBuffer value;
             if (_scratchPagesTable.TryGetValue(pageNumber, out value) == false)
@@ -667,12 +682,6 @@ namespace Voron.Impl
             for (int i = lowerNumberOfPages; i < prevNumberOfPages; i++)
             {
                 FreePage(page.PageNumber + i);
-            }
-
-            if (lowerNumberOfPages > 1)
-            {
-                // if we aren't freeing pages of the overflow from the beginning we need to manually change the range
-                _dirtyOverflowPages[pageNumber + 1] = lowerNumberOfPages - 1; 
             }
 
             // need to set the proper number of pages in the scratch page
@@ -700,12 +709,12 @@ namespace Voron.Impl
         }
 
 
-        public bool IsDisposed => _disposed;
+        public bool IsDisposed => _disposed != TxState.None;
         public NativeMemory.ThreadStats CurrentTransactionHolder { get; set; }
 
         public void Dispose()
         {
-            if (_disposed)
+            if (_disposed.HasFlag(TxState.Disposed))
                 return;
 
             try
@@ -713,7 +722,7 @@ namespace Voron.Impl
                 if (!Committed && !RolledBack && Flags == TransactionFlags.ReadWrite)
                     Rollback();
 
-                _disposed = true;
+                _disposed |= TxState.Disposed;
 
                 PersistentContext.FreePageLocator(_pageLocator);
             }
@@ -737,6 +746,7 @@ namespace Voron.Impl
                 _root?.Dispose();
                 _freeSpaceTree?.Dispose();
 
+                _allocator.AllocationFailed -= MarkTransactionAsFailed;
                 if (_disposeAllocator)
                     _allocator.Dispose();
 
@@ -744,24 +754,18 @@ namespace Voron.Impl
             }
         }
 
+        public void MarkTransactionAsFailed()
+        {
+            _disposed |= TxState.Errored;
+        }
+
         internal void FreePageOnCommit(long pageNumber)
         {
             _pagesToFreeOnCommit.Push(pageNumber);
         }
 
-        internal void FreePage(long pageNumber)
+        internal void DiscardScratchModificationOn(long pageNumber)
         {
-            if (_disposed)
-                throw new ObjectDisposedException("Transaction");
-
-            UntrackPage(pageNumber);
-            Debug.Assert(pageNumber >= 0);
-
-            _pageLocator.Reset(pageNumber); // Remove it from the page locator.
-
-            _freeSpaceHandling.FreePage(this, pageNumber);
-            _freedPages.Add(pageNumber);
-
             if (_scratchPagesTable.TryGetValue(pageNumber, out var scratchPage))
             {
                 if (_transactionPages.Remove(scratchPage))
@@ -770,16 +774,41 @@ namespace Voron.Impl
                 _scratchPagesTable.Remove(pageNumber);
             }
 
-            if (_dirtyPages.Remove(pageNumber) == false &&
-                _dirtyOverflowPages.TryGetValue(pageNumber, out long numberOfOverflowPages))
-            {
-                _dirtyOverflowPages.Remove(pageNumber);
-
-                if (numberOfOverflowPages > 1) // prevent adding range which length is 0
-                    _dirtyOverflowPages.Add(pageNumber + 1, numberOfOverflowPages - 1); // change the range of the overflow page
-            }
+            _dirtyPages.Remove(pageNumber);
 
             UntrackDirtyPage(pageNumber);
+        }
+
+        internal void FreePage(long pageNumber)
+        {
+            if (_disposed != TxState.None)
+                ThrowObjectDisposed();
+
+            try
+            {
+                UntrackPage(pageNumber);
+                Debug.Assert(pageNumber >= 0);
+
+                _pageLocator.Reset(pageNumber); // Remove it from the page locator.
+
+                _freeSpaceHandling.FreePage(this, pageNumber);
+                _freedPages.Add(pageNumber);
+
+                if (_scratchPagesTable.TryGetValue(pageNumber, out var scratchPage))
+                {
+                    if (_transactionPages.Remove(scratchPage))
+                        _unusedScratchPages.Add(scratchPage);
+
+                    _scratchPagesTable.Remove(pageNumber);
+                }
+
+                DiscardScratchModificationOn(pageNumber);
+            }
+            catch
+            {
+                _disposed |= TxState.Errored;
+                throw;
+            }
         }
 
 
@@ -862,6 +891,8 @@ namespace Voron.Impl
 
                 AsyncCommit = null;
 
+                _disposed |= TxState.Errored;
+
                 throw;
             }
         }
@@ -885,6 +916,7 @@ namespace Voron.Impl
         {
             if (AsyncCommit == null)
             {
+                _disposed |= TxState.Errored;
                 ThrowInvalidAsyncEndWithoutBegin();
                 return;// never reached
             }
@@ -899,6 +931,7 @@ namespace Voron.Impl
                 // of writing to the journal means that we don't know what the current
                 // state of the journal is. We have to shut down and run recovery to 
                 // come to a known good state
+                _disposed |= TxState.Errored;
                 _env.Options.SetCatastrophicFailure(ExceptionDispatchInfo.Capture(e));
 
                 throw;
@@ -919,7 +952,6 @@ namespace Voron.Impl
         private bool WriteToJournalIsRequired()
         {
             return _dirtyPages.Count > 0
-                   || _dirtyOverflowPages.Count > 0
                    || _freedPages.Count > 0
                    // nothing changed in this transaction
                    // allow call to writeToJournal for flushing lazy tx
@@ -931,12 +963,26 @@ namespace Voron.Impl
             // In the case of non-lazy transactions, we must flush the data from older lazy transactions
             // to ensure the sequentiality of the data.
             Stopwatch sp = null;
-            if(_requestedCommitStats != null)
+            if (_requestedCommitStats != null)
             {
                 sp = Stopwatch.StartNew();
             }
-            var numberOfWrittenPages = _journal.WriteToJournal(this, out var journalFilePath);
-            FlushedToJournal = true;
+
+            string journalFilePath;
+            CompressedPagesResult numberOfWrittenPages;
+            try
+            {
+                numberOfWrittenPages = _journal.WriteToJournal(this, out journalFilePath);
+                FlushedToJournal = true;
+                _updatePageTranslationTableAndUnusedPages = numberOfWrittenPages.UpdatePageTranslationTableAndUnusedPages;
+                if (SimulateThrowingOnCommitStage2)
+                    ThrowSimulateErrorOnCommitStage2();
+            }
+            catch
+            {
+                _disposed |= TxState.Errored;
+                throw;
+            }
 
             if (_requestedCommitStats != null)
             {
@@ -949,7 +995,7 @@ namespace Voron.Impl
 
         private void CommitStage1_CompleteTransaction()
         {
-            if (_disposed)
+            if (_disposed != TxState.None)
                 ThrowObjectDisposed();
 
             if (Committed)
@@ -989,6 +1035,9 @@ namespace Voron.Impl
                 Allocator.Release(ref _txHeaderMemory);
 
                 Committed = true;
+
+                _updatePageTranslationTableAndUnusedPages?.ExecuteAfterCommit();
+
                 _env.TransactionAfterCommit(this);
 
                 if (_asyncCommitNextTransaction != null)
@@ -1007,8 +1056,8 @@ namespace Voron.Impl
             }
             catch (Exception e)
             {
+                _disposed |= TxState.Errored;
                 _env.Options.SetCatastrophicFailure(ExceptionDispatchInfo.Capture(e));
-
                 throw;
             }
         }
@@ -1026,8 +1075,9 @@ namespace Voron.Impl
 
         public void Rollback()
         {
-            if (_disposed)
-                throw new ObjectDisposedException("Transaction");
+            // here we allow rolling back of errored transaction
+            if (_disposed.HasFlag(TxState.Disposed))
+                ThrowObjectDisposed();
 
 
             if (Committed || RolledBack || Flags != (TransactionFlags.ReadWrite))
@@ -1059,6 +1109,11 @@ namespace Voron.Impl
         public void RetrieveCommitStats(out CommitStats stats)
         {
             _requestedCommitStats = stats = new CommitStats();
+        }
+
+        public string GetTxState()
+        {
+            return _disposed.ToString();
         }
 
         private PagerState _lastState;
@@ -1209,6 +1264,13 @@ namespace Voron.Impl
         internal TransactionHeader* GetTransactionHeader()
         {
             return _txHeader;
+        }
+
+        internal bool SimulateThrowingOnCommitStage2 = false;
+
+        private static void ThrowSimulateErrorOnCommitStage2()
+        {
+            throw new InvalidOperationException("Simulation error");
         }
     }
 }

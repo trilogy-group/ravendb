@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -8,6 +9,7 @@ using System.Threading.Tasks;
 using Raven.Client;
 using Raven.Client.ServerWide;
 using Raven.Client.ServerWide.Operations;
+using Raven.Client.Util;
 using Raven.Server.Background;
 using Raven.Server.Documents;
 using Raven.Server.Json;
@@ -18,6 +20,8 @@ using Raven.Server.Utils;
 using Sparrow;
 using Sparrow.Collections;
 using Sparrow.Json;
+using Sparrow.Platform;
+using Sparrow.Utils;
 
 namespace Raven.Server.Dashboard
 {
@@ -29,7 +33,7 @@ namespace Raven.Server.Dashboard
         private DateTime _lastSentNotification = DateTime.MinValue;
 
         public DatabasesInfoNotificationSender(string resourceName, ServerStore serverStore,
-            ConcurrentSet<ConnectedWatcher> watchers, TimeSpan notificationsThrottle, CancellationToken shutdown) 
+            ConcurrentSet<ConnectedWatcher> watchers, TimeSpan notificationsThrottle, CancellationToken shutdown)
             : base(resourceName, shutdown)
         {
             _serverStore = serverStore;
@@ -39,7 +43,7 @@ namespace Raven.Server.Dashboard
 
         protected override async Task DoWork()
         {
-            var now = DateTime.UtcNow;
+            var now = SystemTime.UtcNow;
             var timeSpan = now - _lastSentNotification;
             if (timeSpan < _notificationsThrottle)
             {
@@ -67,8 +71,19 @@ namespace Raven.Server.Dashboard
             }
             finally
             {
-                _lastSentNotification = DateTime.UtcNow;
+                _lastSentNotification = SystemTime.UtcNow;
             }
+        }
+
+        private static readonly ConcurrentDictionary<string, DatabaseInfoCache> CachedDatabaseInfo =
+            new ConcurrentDictionary<string, DatabaseInfoCache>(StringComparer.OrdinalIgnoreCase);
+
+        private class DatabaseInfoCache
+        {
+            public long Hash;
+            public DatabaseInfoItem Item;
+            public List<Client.ServerWide.Operations.MountPointUsage> MountPoints = new List<Client.ServerWide.Operations.MountPointUsage>();
+            public DateTime NextDiskSpaceCheck;
         }
 
         public static IEnumerable<AbstractDashboardNotification> FetchDatabasesInfo(ServerStore serverStore, Func<string, bool> isValidFor, CancellationTokenSource cts)
@@ -118,42 +133,63 @@ namespace Raven.Server.Dashboard
                         var replicationFactor = GetReplicationFactor(databaseTuple.Value);
                         var documentsStorage = database.DocumentsStorage;
                         var indexStorage = database.IndexStore;
-                        using (documentsStorage.ContextPool.AllocateOperationContext(out DocumentsOperationContext documentsContext))
-                        using (documentsContext.OpenReadTransaction())
-                        {
-                            var databaseInfoItem = new DatabaseInfoItem
-                            {
-                                Database = databaseName,
-                                DocumentsCount = documentsStorage.GetNumberOfDocuments(documentsContext),
-                                IndexesCount = database.IndexStore.Count,
-                                AlertsCount = database.NotificationCenter.GetAlertCount(),
-                                ReplicationFactor = replicationFactor,
-                                ErroredIndexesCount = indexStorage.GetIndexes().Count(index => index.GetErrorCount() > 0),
-                                Online = true
-                            };
-                            databasesInfo.Items.Add(databaseInfoItem);
-                        }
-                        var writesPerSecond = (int)database.Metrics.Docs.PutsPerSec.OneSecondRate +
-                                              (int)database.Metrics.Attachments.PutsPerSec.OneSecondRate +
-                                              (int)database.Metrics.Counters.PutsPerSec.OneSecondRate;
-                        var writeBytesPerSecond = database.Metrics.Docs.BytesPutsPerSec.OneSecondRate +
-                                                  database.Metrics.Attachments.BytesPutsPerSec.OneSecondRate +
-                                                  database.Metrics.Counters.BytesPutsPerSec.OneSecondRate;
+
+
                         var trafficWatchItem = new TrafficWatchItem
                         {
-                            Database = databaseName,
+                            Database = database.Name,
                             RequestsPerSecond = (int)database.Metrics.Requests.RequestsPerSec.OneSecondRate,
-                            WritesPerSecond = writesPerSecond,
-                            WriteBytesPerSecond = writeBytesPerSecond
+                            DocumentWritesPerSecond = (int)database.Metrics.Docs.PutsPerSec.OneSecondRate,
+                            AttachmentWritesPerSecond = (int)database.Metrics.Attachments.PutsPerSec.OneSecondRate,
+                            CounterWritesPerSecond = (int)database.Metrics.Counters.PutsPerSec.OneSecondRate,
+                            DocumentsWriteBytesPerSecond = database.Metrics.Docs.BytesPutsPerSec.OneSecondRate,
+                            AttachmentsWriteBytesPerSecond = database.Metrics.Attachments.BytesPutsPerSec.OneSecondRate,
+                            CountersWriteBytesPerSecond = database.Metrics.Counters.BytesPutsPerSec.OneSecondRate
                         };
                         trafficWatch.Items.Add(trafficWatchItem);
 
-                        foreach (var mountPointUsage in database.GetMountPointsUsage())
+                        var currentEnvironmentsHash = database.GetEnvironmentsHash();
+                        if (CachedDatabaseInfo.TryGetValue(database.Name, out var item) && item.Hash == currentEnvironmentsHash)
                         {
-                            if (cts.IsCancellationRequested)
-                                yield break;
+                            databasesInfo.Items.Add(item.Item);
 
-                            UpdateMountPoint(mountPointUsage, databaseName, drivesUsage);
+                            if (item.NextDiskSpaceCheck < SystemTime.UtcNow)
+                            {
+                                item.MountPoints = new List<Client.ServerWide.Operations.MountPointUsage>();
+                                DiskUsageCheck(item, database, drivesUsage, cts);
+                            }
+                            else
+                            {
+                                foreach (var cachedMountPoint in item.MountPoints)
+                                {
+                                    UpdateMountPoint(cachedMountPoint, database.Name, drivesUsage);
+                                }
+                            }
+                        }
+                        else
+                        {
+                            using (documentsStorage.ContextPool.AllocateOperationContext(out DocumentsOperationContext documentsContext))
+                            using (documentsContext.OpenReadTransaction())
+                            {
+                                var databaseInfoItem = new DatabaseInfoItem
+                                {
+                                    Database = database.Name,
+                                    DocumentsCount = documentsStorage.GetNumberOfDocuments(documentsContext),
+                                    IndexesCount = database.IndexStore.Count,
+                                    AlertsCount = database.NotificationCenter.GetAlertCount(),
+                                    ReplicationFactor = replicationFactor,
+                                    ErroredIndexesCount = indexStorage.GetIndexes().Count(index => index.GetErrorCount() > 0),
+                                    Online = true
+                                };
+                                databasesInfo.Items.Add(databaseInfoItem);
+                                CachedDatabaseInfo[database.Name] = item = new DatabaseInfoCache
+                                {
+                                    Hash = currentEnvironmentsHash,
+                                    Item = databaseInfoItem
+                                };
+                            }
+
+                            DiskUsageCheck(item, database, drivesUsage, cts);
                         }
                     }
                     catch (Exception)
@@ -167,12 +203,25 @@ namespace Raven.Server.Dashboard
             yield return indexingSpeed;
             yield return trafficWatch;
             yield return drivesUsage;
-            
+        }
+
+        private static void DiskUsageCheck(DatabaseInfoCache item, DocumentDatabase database, DrivesUsage drivesUsage, CancellationTokenSource cts)
+        {
+            foreach (var mountPointUsage in database.GetMountPointsUsage())
+            {
+                if (cts.IsCancellationRequested)
+                    return;
+
+                UpdateMountPoint(mountPointUsage, database.Name, drivesUsage);
+                item.MountPoints.Add(mountPointUsage);
+            }
+
+            item.NextDiskSpaceCheck = SystemTime.UtcNow.AddSeconds(30);
         }
 
         private static void UpdateMountPoint(
-            Client.ServerWide.Operations.MountPointUsage mountPointUsage, 
-            string databaseName, 
+            Client.ServerWide.Operations.MountPointUsage mountPointUsage,
+            string databaseName,
             DrivesUsage drivesUsage)
         {
             var mountPoint = mountPointUsage.DiskSpaceResult.DriveName;
@@ -210,20 +259,21 @@ namespace Raven.Server.Dashboard
         private static void SetOfflineDatabaseInfo(
             ServerStore serverStore,
             TransactionOperationContext context,
-            string databaseName, 
-            DatabasesInfo existingDatabasesInfo, 
-            DrivesUsage existingDrivesUsage, 
+            string databaseName,
+            DatabasesInfo existingDatabasesInfo,
+            DrivesUsage existingDrivesUsage,
             bool disabled)
         {
-            var databaseRecord = serverStore.Cluster.ReadDatabase(context, databaseName, out var _);
+            var databaseRecord = serverStore.Cluster.ReadRawDatabase(context, databaseName, out var _);
             if (databaseRecord == null)
             {
                 // database doesn't exist
                 return;
             }
 
-            var irrelevant = databaseRecord.Topology == null || 
-                             databaseRecord.Topology.AllNodes.Contains(serverStore.NodeTag) == false;
+            var databaseTopology = serverStore.Cluster.ReadDatabaseTopology(databaseRecord);
+            var irrelevant = databaseTopology == null ||
+                             databaseTopology.AllNodes.Contains(serverStore.NodeTag) == false;
             var databaseInfoItem = new DatabaseInfoItem
             {
                 Database = databaseName,
@@ -241,7 +291,7 @@ namespace Raven.Server.Dashboard
             existingDatabasesInfo.Items.Add(databaseInfoItem);
         }
 
-        private static void UpdateDatabaseInfo(DatabaseRecord databaseRecord, ServerStore serverStore, string databaseName, DrivesUsage existingDrivesUsage,
+        private static void UpdateDatabaseInfo(BlittableJsonReaderObject databaseRecord, ServerStore serverStore, string databaseName, DrivesUsage existingDrivesUsage,
             DatabaseInfoItem databaseInfoItem)
         {
             DatabaseInfo databaseInfo = null;
@@ -250,19 +300,28 @@ namespace Raven.Server.Dashboard
                 return;
 
             Debug.Assert(databaseInfo != null);
+            var databaseTopology = serverStore.Cluster.ReadDatabaseTopology(databaseRecord);
+            databaseRecord.TryGet(nameof(DatabaseRecord.Indexes), out BlittableJsonReaderObject indexes);
+            var indexesCount = indexes?.Count ?? 0;
 
             databaseInfoItem.DocumentsCount = databaseInfo.DocumentsCount ?? 0;
-            databaseInfoItem.IndexesCount = databaseInfo.IndexesCount ?? databaseRecord.Indexes.Count;
-            databaseInfoItem.ReplicationFactor = databaseRecord.Topology?.ReplicationFactor ?? databaseInfo.ReplicationFactor;
+            databaseInfoItem.IndexesCount = databaseInfo.IndexesCount ?? indexesCount;
+            databaseInfoItem.ReplicationFactor = databaseTopology?.ReplicationFactor ?? databaseInfo.ReplicationFactor;
             databaseInfoItem.ErroredIndexesCount = databaseInfo.IndexingErrors ?? 0;
 
             if (databaseInfo.MountPointsUsage == null)
                 return;
 
-            var drives = DriveInfo.GetDrives();
             foreach (var mountPointUsage in databaseInfo.MountPointsUsage)
             {
-                var diskSpaceResult = DiskSpaceChecker.GetFreeDiskSpace(mountPointUsage.DiskSpaceResult.DriveName, drives);
+                var driveName = mountPointUsage.DiskSpaceResult.DriveName;
+                var diskSpaceResult = DiskSpaceChecker.GetDiskSpaceInfo(
+                    mountPointUsage.DiskSpaceResult.DriveName,
+                    new DriveInfoBase
+                    {
+                        DriveName = driveName
+                    });
+
                 if (diskSpaceResult != null)
                 {
                     // update the latest drive info

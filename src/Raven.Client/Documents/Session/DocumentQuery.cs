@@ -192,6 +192,13 @@ namespace Raven.Client.Documents.Session
         }
 
         /// <inheritdoc />
+        IDocumentQuery<T> IFilterDocumentQueryBase<T, IDocumentQuery<T>>.ContainsAll<TValue>(Expression<Func<T, IEnumerable<TValue>>> propertySelector, IEnumerable<TValue> values)
+        {
+            ContainsAll(GetMemberQueryPath(propertySelector.Body), values.Cast<object>());
+            return this;
+        }
+
+        /// <inheritdoc />
         IDocumentQuery<T> IFilterDocumentQueryBase<T, IDocumentQuery<T>>.ContainsAny(string fieldName, IEnumerable<object> values)
         {
             ContainsAny(fieldName, values);
@@ -200,6 +207,13 @@ namespace Raven.Client.Documents.Session
 
         /// <inheritdoc />
         IDocumentQuery<T> IFilterDocumentQueryBase<T, IDocumentQuery<T>>.ContainsAny<TValue>(Expression<Func<T, TValue>> propertySelector, IEnumerable<TValue> values)
+        {
+            ContainsAny(GetMemberQueryPath(propertySelector.Body), values.Cast<object>());
+            return this;
+        }
+
+        /// <inheritdoc />
+        IDocumentQuery<T> IFilterDocumentQueryBase<T, IDocumentQuery<T>>.ContainsAny<TValue>(Expression<Func<T, IEnumerable<TValue>>> propertySelector, IEnumerable<TValue> values)
         {
             ContainsAny(GetMemberQueryPath(propertySelector.Body), values.Cast<object>());
             return this;
@@ -857,11 +871,14 @@ namespace Raven.Client.Documents.Session
             {
                 var fields = queryData.Fields;
 
-                var identityProperty = Conventions.GetIdentityProperty(typeof(TResult));
-                if (identityProperty != null)
-                    fields = queryData.Fields
-                        .Select(x => x == identityProperty.Name ? Constants.Documents.Indexing.Fields.DocumentIdFieldName : x)
-                        .ToArray();
+                if (IsGroupBy == false)
+                {
+                    var identityProperty = Conventions.GetIdentityProperty(typeof(TResult));
+                    if (identityProperty != null)
+                        fields = queryData.Fields
+                            .Select(x => x == identityProperty.Name ? Constants.Documents.Indexing.Fields.DocumentIdFieldName : x)
+                            .ToArray();
+                }
 
                 GetSourceAliasIfExists(queryData, fields, out var sourceAlias);
 
@@ -924,7 +941,7 @@ namespace Raven.Client.Documents.Session
 
             var ravenQueryInspector = new RavenQueryInspector<T>();
             var ravenQueryProvider = new RavenQueryProvider<T>(
-                this,
+                CreateDocumentQueryInternal<T>(), // clone
                 IndexName,
                 CollectionName,
                 type,
@@ -958,7 +975,7 @@ namespace Raven.Client.Documents.Session
                 throw new InvalidOperationException(
                     $"DocumentQuery source has (index name: {IndexName}, collection: {CollectionName}), but got request for (index name: {indexName}, collection: {collectionName}), you cannot change the index name / collection when using DocumentQuery as the source");
 
-            return SelectFields<TResult>();
+            return CreateDocumentQueryInternal<TResult>();
         }
 
         public IAsyncDocumentQuery<TResult> AsyncQuery<TResult>(string indexName, string collectionName, bool isMapReduce)

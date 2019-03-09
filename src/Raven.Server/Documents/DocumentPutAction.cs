@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.CompilerServices;
@@ -13,7 +12,6 @@ using Sparrow.Json.Parsing;
 using Voron;
 using Voron.Data.Tables;
 using System.Linq;
-using Raven.Client.Documents.Operations.Revisions;
 using Raven.Client.Exceptions;
 using Sparrow;
 using static Raven.Server.Documents.DocumentsStorage;
@@ -45,12 +43,8 @@ namespace Raven.Server.Documents
                 return default; // never hit
             }
 
-#if DEBUG
-            var documentDebugHash = document.DebugHash;
-            document.BlittableValidation();
-            BlittableJsonReaderObject.AssertNoModifications(document, id, assertChildren: true);
-            AssertMetadataWasFiltered(document);
-#endif
+            var documentDebugHash = 0UL;
+            ValidateDocument(id, document, ref documentDebugHash);
 
             var newEtag = _documentsStorage.GenerateNextEtag();
             var modifiedTicks = _documentsStorage.GetOrCreateLastModifiedTicks(lastModifiedTicks);
@@ -99,91 +93,76 @@ namespace Raven.Server.Documents
 
                     var oldFlags = TableValueToFlags((int)DocumentsTable.Flags, ref oldValue);
 
-                    if ((nonPersistentFlags & NonPersistentDocumentFlags.FromReplication) != NonPersistentDocumentFlags.FromReplication)
+                    if (nonPersistentFlags.Contain(NonPersistentDocumentFlags.FromReplication) == false)
                     {
-                        if ((nonPersistentFlags & NonPersistentDocumentFlags.ByAttachmentUpdate) != NonPersistentDocumentFlags.ByAttachmentUpdate &&
-                            (oldFlags & DocumentFlags.HasAttachments) == DocumentFlags.HasAttachments)
+                        flags = flags.Strip(DocumentFlags.FromReplication);
+
+                        if (nonPersistentFlags.Contain(NonPersistentDocumentFlags.ByAttachmentUpdate) == false &&
+                            oldFlags.Contain(DocumentFlags.HasAttachments))
                         {
                             flags |= DocumentFlags.HasAttachments;
                         }
 
-                        if ((nonPersistentFlags & NonPersistentDocumentFlags.ByCountersUpdate) != NonPersistentDocumentFlags.ByCountersUpdate &&
-                            (oldFlags & DocumentFlags.HasCounters) == DocumentFlags.HasCounters)
+                        if (nonPersistentFlags.Contain(NonPersistentDocumentFlags.ByCountersUpdate) == false &&
+                            oldFlags.Contain(DocumentFlags.HasCounters))
                         {
                             flags |= DocumentFlags.HasCounters;
                         }
-                    }
 
+                        if (oldFlags.Contain(DocumentFlags.HasRevisions))
+                        {
+                            flags |= DocumentFlags.HasRevisions;
+                        }
+                    }
                 }
 
                 var result = BuildChangeVectorAndResolveConflicts(context, id, lowerId, newEtag, document, changeVector, expectedChangeVector, flags, oldValue);
-
-                if (flags.Contain(DocumentFlags.FromClusterTransaction) == false)
-                {
-                    if (string.IsNullOrEmpty(result.ChangeVector))
-                        ChangeVectorUtils.ThrowConflictingEtag(id, changeVector, newEtag, _documentsStorage.Environment.Base64Id, _documentDatabase.ServerStore.NodeTag);
-
-                    changeVector = result.ChangeVector;
-                }
-
                 nonPersistentFlags |= result.NonPersistentFlags;
+
+                if (UpdateLastDatabaseChangeVector(context, result.ChangeVector, flags, nonPersistentFlags))
+                    changeVector = result.ChangeVector;
+
                 if (nonPersistentFlags.Contain(NonPersistentDocumentFlags.Resolved))
                 {
                     flags |= DocumentFlags.Resolved;
                 }
 
-                if (collectionName.IsHiLo == false &&
-                    (flags & DocumentFlags.Artificial) != DocumentFlags.Artificial)
+                if (collectionName.IsHiLo == false && flags.Contain(DocumentFlags.Artificial) == false)
                 {
                     if (ShouldRecreateAttachments(context, lowerId, oldDoc, document, ref flags, nonPersistentFlags))
                     {
-#if DEBUG
-                        if (document.DebugHash != documentDebugHash)
-                        {
-                            throw new InvalidDataException("The incoming document " + id + " has changed _during_ the put process, " +
-                                                           "this is likely because you are trying to save a document that is already stored and was moved");
-                        }
-#endif
+                        ValidateDocumentHash(id, document, documentDebugHash);
+
                         document = context.ReadObject(document, id, BlittableJsonDocumentBuilder.UsageMode.ToDisk);
-#if DEBUG
-                        documentDebugHash = document.DebugHash;
-                        document.BlittableValidation();
-                        BlittableJsonReaderObject.AssertNoModifications(document, id, assertChildren: true);
-                        AssertMetadataWasFiltered(document);
+                        ValidateDocument(id, document, ref documentDebugHash);
                         AttachmentsStorage.AssertAttachments(document, flags);
-#endif
                     }
 
                     if (ShouldRecreateCounters(context, id, oldDoc, document, ref flags, nonPersistentFlags))
                     {
-#if DEBUG
-                        if (document.DebugHash != documentDebugHash)
-                        {
-                            throw new InvalidDataException("The incoming document " + id + " has changed _during_ the put process, " +
-                                                           "this is likely because you are trying to save a document that is already stored and was moved");
-                        }
-#endif
+                        ValidateDocumentHash(id, document, documentDebugHash);
+
                         document = context.ReadObject(document, id, BlittableJsonDocumentBuilder.UsageMode.ToDisk);
-#if DEBUG
-                        documentDebugHash = document.DebugHash;
-                        document.BlittableValidation();
-                        BlittableJsonReaderObject.AssertNoModifications(document, id, assertChildren: true);
-                        AssertMetadataWasFiltered(document);
+                        ValidateDocument(id, document, ref documentDebugHash);
                         CountersStorage.AssertCounters(document, flags);
-#endif
                     }
 
-                    if (nonPersistentFlags.Contain(NonPersistentDocumentFlags.FromReplication) == false && 
-                        (flags.Contain(DocumentFlags.Resolved) || 
-                        _documentDatabase.DocumentsStorage.RevisionsStorage.Configuration != null
-                        ))
+                    var shouldVersion = _documentDatabase.DocumentsStorage.RevisionsStorage.ShouldVersionDocument(
+                        collectionName, nonPersistentFlags, oldDoc, document, context, id, ref flags, out var configuration);
+                    if (shouldVersion)
                     {
-                        var shouldVersion = _documentDatabase.DocumentsStorage.RevisionsStorage.ShouldVersionDocument(collectionName, nonPersistentFlags, oldDoc, document,
-                            ref flags, out RevisionsCollectionConfiguration configuration);
-                        if (shouldVersion)
+                        if (ShouldVersionOldDocument(flags, oldDoc))
                         {
-                            _documentDatabase.DocumentsStorage.RevisionsStorage.Put(context, id, document, flags, nonPersistentFlags, changeVector, modifiedTicks, configuration, collectionName);
+                            var oldFlags = TableValueToFlags((int)DocumentsTable.Flags, ref oldValue);
+                            var oldChangeVector = TableValueToChangeVector(context, (int)DocumentsTable.ChangeVector, ref oldValue);
+                            var oldTicks = TableValueToDateTime((int)DocumentsTable.LastModified, ref oldValue);
+                            
+                            _documentDatabase.DocumentsStorage.RevisionsStorage.Put(context, id, oldDoc, oldFlags | DocumentFlags.HasRevisions, NonPersistentDocumentFlags.None,
+                                oldChangeVector, oldTicks.Ticks, configuration, collectionName);
                         }
+                        flags |= DocumentFlags.HasRevisions;
+
+                        _documentDatabase.DocumentsStorage.RevisionsStorage.Put(context, id, document, flags, nonPersistentFlags, changeVector, modifiedTicks, configuration, collectionName);
                     }
                 }
 
@@ -214,7 +193,6 @@ namespace Raven.Server.Documents
                     _documentsStorage.ExpirationStorage.Put(context, lowerId, document);
                 }
 
-                context.LastDatabaseChangeVector = changeVector;
                 _documentDatabase.Metrics.Docs.PutsPerSec.MarkSingleThreaded(1);
                 _documentDatabase.Metrics.Docs.BytesPutsPerSec.MarkSingleThreaded(document.Size);
 
@@ -226,17 +204,9 @@ namespace Raven.Server.Documents
                     Type = DocumentChangeTypes.Put,
                 });
 
-#if DEBUG
-                if (document.DebugHash != documentDebugHash)
-                {
-                    throw new InvalidDataException("The incoming document " + id + " has changed _during_ the put process, " +
-                                                   "this is likely because you are trying to save a document that is already stored and was moved");
-                }
-                document.BlittableValidation();
-                BlittableJsonReaderObject.AssertNoModifications(document, id, assertChildren: true);
-                AssertMetadataWasFiltered(document);
-                AttachmentsStorage.AssertAttachments(document, flags);
-#endif
+                ValidateDocumentHash(id, document, documentDebugHash);
+                ValidateDocument(id, document, ref documentDebugHash);
+
                 return new PutOperationResults
                 {
                     Etag = newEtag,
@@ -249,13 +219,59 @@ namespace Raven.Server.Documents
             }
         }
 
+        private void UpdateChangeVectorIfNeeded(DocumentsOperationContext context, NonPersistentDocumentFlags nonPersistentFlags, ref string changeVector, ref long newEtag)
+        {
+            // when having an external replication we must generate a new change vector for the resolved conflict.
+            // in internal replication it will generate a small ping-pong, but will be settled due to the identical content.
+            if (nonPersistentFlags.Contain(NonPersistentDocumentFlags.FromResolver) &&
+                nonPersistentFlags.Contain(NonPersistentDocumentFlags.Resolved))
+            {
+                newEtag = _documentsStorage.GenerateNextEtag();
+                changeVector = ChangeVectorUtils.MergeVectors(changeVector, _documentsStorage.GetNewChangeVector(context, newEtag));
+                context.LastDatabaseChangeVector = changeVector;
+            }
+        }
+
+        [Conditional("DEBUG")]
+        private static void ValidateDocument(string id, BlittableJsonReaderObject document, ref ulong documentDebugHash)
+        {
+            document.BlittableValidation();
+            BlittableJsonReaderObject.AssertNoModifications(document, id, assertChildren: true);
+            AssertMetadataWasFiltered(document);
+            documentDebugHash = document.DebugHash;
+        }
+
+        [Conditional("DEBUG")]
+        private static void ValidateDocumentHash(string id, BlittableJsonReaderObject document, ulong documentDebugHash)
+        {
+            if (document.DebugHash != documentDebugHash)
+            {
+                throw new InvalidDataException("The incoming document " + id + " has changed _during_ the put process, " +
+                                               "this is likely because you are trying to save a document that is already stored and was moved");
+            }
+        }
+
+        private static bool ShouldVersionOldDocument(DocumentFlags flags, BlittableJsonReaderObject oldDoc)
+        {
+            if (oldDoc == null)
+                return false; // no document to version
+
+            if (flags.Contain(DocumentFlags.HasRevisions))
+                return false; // version already exists
+
+            if (flags.Contain(DocumentFlags.Resolved))
+                return false; // we already versioned it with the a conflicted flag
+
+            return true;
+        }
+
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private (string ChangeVector, NonPersistentDocumentFlags NonPersistentFlags) BuildChangeVectorAndResolveConflicts(
             DocumentsOperationContext context, string id, Slice lowerId, long newEtag,
             BlittableJsonReaderObject document, string changeVector, string expectedChangeVector, DocumentFlags flags, TableValueReader oldValue)
         {
             var nonPersistentFlags = NonPersistentDocumentFlags.None;
-            var fromReplication = (flags & DocumentFlags.FromReplication) == DocumentFlags.FromReplication;
+            var fromReplication = flags.Contain(DocumentFlags.FromReplication);
 
             if (_documentsStorage.ConflictsStorage.ConflictsCount != 0)
             {
@@ -271,8 +287,10 @@ namespace Raven.Server.Documents
                 else
                 {
                     var result = _documentsStorage.ConflictsStorage.MergeConflictChangeVectorIfNeededAndDeleteConflicts(changeVector, context, id, newEtag, document);
-                    changeVector = result.ChangeVector;
                     nonPersistentFlags = result.NonPersistentFlags;
+
+                    if (string.IsNullOrEmpty(result.ChangeVector) == false)
+                        return (result.ChangeVector, nonPersistentFlags);
                 }
             }
 
@@ -292,6 +310,31 @@ namespace Raven.Server.Documents
             }
             changeVector = SetDocumentChangeVectorForLocalChange(context, lowerId, oldChangeVector, newEtag);
             return (changeVector, nonPersistentFlags);
+        }
+
+        private static bool UpdateLastDatabaseChangeVector(DocumentsOperationContext context, string changeVector, DocumentFlags flags, NonPersistentDocumentFlags nonPersistentFlags)
+        {
+            // this is raft created document, so it must contain only the RAFT element 
+            if (flags.Contain(DocumentFlags.FromClusterTransaction))
+            {
+                context.LastDatabaseChangeVector = ChangeVectorUtils.MergeVectors(context.LastDatabaseChangeVector ?? GetDatabaseChangeVector(context), changeVector);
+                return false;
+            }
+
+            // the resolved document must preserve the original change vector (without the global change vector) to avoid ping-pong replication.
+            if (nonPersistentFlags.Contain(NonPersistentDocumentFlags.FromResolver))
+            {
+                context.LastDatabaseChangeVector = ChangeVectorUtils.MergeVectors(context.LastDatabaseChangeVector ?? GetDatabaseChangeVector(context), changeVector);
+                return false;
+            }
+
+            // if arrived from replication we keep the document with its original change vector
+            // in that case the updating of the global change vector should happened upper in the stack
+            if (nonPersistentFlags.Contain(NonPersistentDocumentFlags.FromReplication))
+                return false;
+
+            context.LastDatabaseChangeVector = changeVector;
+            return true;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -485,7 +528,7 @@ namespace Raven.Server.Documents
         private bool ShouldRecreateCounters(DocumentsOperationContext context, string id, BlittableJsonReaderObject oldDoc,
             BlittableJsonReaderObject document, ref DocumentFlags flags, NonPersistentDocumentFlags nonPersistentFlags)
         {
-            if ((nonPersistentFlags & NonPersistentDocumentFlags.ResolveCountersConflict) == NonPersistentDocumentFlags.ResolveCountersConflict)
+            if (nonPersistentFlags.Contain(NonPersistentDocumentFlags.ResolveCountersConflict))
             {
                 document.TryGet(Constants.Documents.Metadata.Key, out BlittableJsonReaderObject metadata);
                 RecreateCounters(context, id, document, metadata, ref flags);

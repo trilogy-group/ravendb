@@ -2,6 +2,10 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Net;
+using Jint.Native;
+using Jint.Native.Object;
+using Jint.Runtime;
+using Raven.Client;
 using Raven.Client.Documents.Subscriptions;
 using Raven.Client.Exceptions.Documents.Subscriptions;
 using Raven.Server.Documents.Includes;
@@ -69,7 +73,7 @@ namespace Raven.Server.Documents.TcpHandlers
             long startEtag)
         {
             int size = 0;
-            using (_db.Scripts.GetScriptRunner(_patch,true, out var run))
+            using (_db.Scripts.GetScriptRunner(_patch, true, out var run))
             {
                 foreach (var doc in _db.DocumentsStorage.GetDocumentsFrom(
                     docsContext,
@@ -84,12 +88,10 @@ namespace Raven.Server.Documents.TcpHandlers
                         {
                             if (exception != null)
                             {
-                                yield return (doc, exception);
-                                if (++size >= _maxBatchSize)
-                                    yield break;
+                                yield return (doc, exception);                           
                             }
                             else
-                            {
+                            {                                
                                 doc.Data = null;
                                 yield return (doc, null);
                             }
@@ -97,8 +99,9 @@ namespace Raven.Server.Documents.TcpHandlers
                         }
                         else
                         {
-                            if(run != null)
-                                includesCmd.AddRange(run.Includes);
+                            if (includesCmd != null && run != null)
+                                includesCmd.AddRange(run.Includes, doc.Id);
+
                             using (transformResult)
                             {
                                 if (transformResult == null)
@@ -108,7 +111,7 @@ namespace Raven.Server.Documents.TcpHandlers
                                 }
                                 else
                                 {
-                                    yield return (new Document
+                                    var projection = new Document
                                     {
                                         Id = doc.Id,
                                         Etag = doc.Etag,
@@ -116,13 +119,16 @@ namespace Raven.Server.Documents.TcpHandlers
                                         LowerId = doc.LowerId,
                                         ChangeVector = doc.ChangeVector,
                                         LastModified = doc.LastModified,
-                                    }, null);
+                                    };
+
+                                    yield return (projection, null);
                                 }
-                            }
-                            if (++size >= _maxBatchSize)
-                                yield break;
+                            }                            
                         }
                     }
+
+                    if (++size >= _maxBatchSize)
+                        yield break;
                 }
             }
         }
@@ -133,7 +139,7 @@ namespace Raven.Server.Documents.TcpHandlers
             long startEtag)
         {
             int size = 0;
-            
+
             var collectionName = new CollectionName(_collection);
             using (_db.Scripts.GetScriptRunner(_patch, true, out var run))
             {
@@ -144,8 +150,9 @@ namespace Raven.Server.Documents.TcpHandlers
 
                     if (ShouldSendDocumentWithRevisions(_subscription, run, _patch, docsContext, item, revisionTuple, out var transformResult, out var exception) == false)
                     {
-                        if(run != null)
-                            includesCmd.AddRange(run.Includes);
+                        if (includesCmd != null && run != null)
+                            includesCmd.AddRange(run.Includes, item.Id);
+
                         if (exception != null)
                         {
                             yield return (item, exception);
@@ -172,10 +179,9 @@ namespace Raven.Server.Documents.TcpHandlers
                             {
                                 yield return (revisionTuple.current, null);
                             }
-
                             else
                             {
-                                yield return (new Document
+                                var projection = new Document
                                 {
                                     Id = item.Id,
                                     Etag = item.Etag,
@@ -183,7 +189,9 @@ namespace Raven.Server.Documents.TcpHandlers
                                     LowerId = item.LowerId,
                                     ChangeVector = item.ChangeVector,
                                     LastModified = item.LastModified,
-                                }, null);
+                                };
+
+                                yield return (projection, null);
                             }
                             if (++size >= _maxBatchSize)
                                 yield break;
@@ -215,7 +223,7 @@ namespace Raven.Server.Documents.TcpHandlers
 
             try
             {
-                return patch.MatchCriteria(run, dbContext, doc, ref transformResult);
+                return patch.MatchCriteria(run, dbContext, doc, ProjectionMetadataModifier.Instance, ref transformResult);
             }
             catch (Exception ex)
             {
@@ -229,7 +237,6 @@ namespace Raven.Server.Documents.TcpHandlers
                 return false;
             }
         }
-
 
         private bool ShouldSendDocumentWithRevisions(SubscriptionState subscriptionState,
             ScriptRunner.SingleRun run,
@@ -264,10 +271,10 @@ namespace Raven.Server.Documents.TcpHandlers
 
             revision.Current?.ResetModifications();
             revision.Previous?.ResetModifications();
-         
+
             try
             {
-                return patch.MatchCriteria(run, dbContext, transformResult, ref transformResult);
+                return patch.MatchCriteria(run, dbContext, transformResult, ProjectionMetadataModifier.Instance, ref transformResult);
             }
             catch (Exception ex)
             {
@@ -282,8 +289,28 @@ namespace Raven.Server.Documents.TcpHandlers
             }
         }
 
+        private class ProjectionMetadataModifier : JsBlittableBridge.IResultModifier
+        {
+            public static readonly ProjectionMetadataModifier Instance = new ProjectionMetadataModifier();
 
+            private ProjectionMetadataModifier()
+            {
+            }
 
+            public void Modify(ObjectInstance json)
+            {
+                ObjectInstance metadata;
+                var value = json.Get(Constants.Documents.Metadata.Key);
+                if (value.Type == Types.Object)
+                    metadata = value.AsObject();
+                else
+                {
+                    metadata = json.Engine.Object.Construct(Array.Empty<JsValue>());
+                    json.Put(Constants.Documents.Metadata.Key, metadata, false);
+                }
 
+                metadata.Put(Constants.Documents.Metadata.Projection, JsBoolean.True, false);
+            }
+        }
     }
 }

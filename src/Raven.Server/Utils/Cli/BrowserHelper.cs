@@ -36,7 +36,7 @@ namespace Raven.Server.Utils.Cli
                 {
                     Console.WriteLine(error);
                 }
-                    
+
                 return false;
             }
         }

@@ -433,7 +433,10 @@ namespace Sparrow
         {
             try
             {
-                Dispose();
+                if (Segment == null)
+                    return;
+                NativeMemory.Free(Segment, Size, _thread);
+                Segment = null;
             }
             catch (ObjectDisposedException)
             {
@@ -460,7 +463,7 @@ namespace Sparrow
 
     public interface IByteStringAllocator
     {
-        UnmanagedGlobalSegment Allocate(int size);
+        UnmanagedGlobalSegment Allocate(int size, Action allocationFailure);
         void Free(UnmanagedGlobalSegment memory);
     }
 
@@ -469,9 +472,17 @@ namespace Sparrow
     /// </summary>
     public struct ByteStringDirectAllocator : IByteStringAllocator
     {
-        public UnmanagedGlobalSegment Allocate(int size)
+        public UnmanagedGlobalSegment Allocate(int size, Action allocationFailure)
         {
-            return new UnmanagedGlobalSegment(size);
+            try
+            {
+                return new UnmanagedGlobalSegment(size);
+            }
+            catch 
+            {
+                allocationFailure?.Invoke();
+                throw;
+            }
         }
 
         public void Free(UnmanagedGlobalSegment memory)
@@ -482,11 +493,11 @@ namespace Sparrow
 
     public struct ByteStringMemoryCache : IByteStringAllocator
     {
-        private static readonly ThreadLocal<SegmentStack> SegmentsPool;
+        private static readonly ThreadLocal<StackHeader<UnmanagedGlobalSegment>> SegmentsPool;
         private static readonly SharedMultipleUseFlag LowMemoryFlag;
         private static readonly LowMemoryHandler LowMemoryHandlerInstance = new LowMemoryHandler();
 
-        public static readonly NativeMemoryCleaner<SegmentStack, UnmanagedGlobalSegment> Cleaner;
+        public static readonly NativeMemoryCleaner<StackHeader<UnmanagedGlobalSegment>, UnmanagedGlobalSegment> Cleaner;
 
         private class LowMemoryHandler : ILowMemoryHandler
         {
@@ -504,9 +515,9 @@ namespace Sparrow
 
         static ByteStringMemoryCache()
         {
-            SegmentsPool = new ThreadLocal<SegmentStack>(() => new SegmentStack(), trackAllValues: true);
+            SegmentsPool = new ThreadLocal<StackHeader<UnmanagedGlobalSegment>>(() => new StackHeader<UnmanagedGlobalSegment>(), trackAllValues: true);
             LowMemoryFlag = new SharedMultipleUseFlag();
-            Cleaner = new NativeMemoryCleaner<SegmentStack, UnmanagedGlobalSegment>(SegmentsPool, LowMemoryFlag, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
+            Cleaner = new NativeMemoryCleaner<StackHeader<UnmanagedGlobalSegment>, UnmanagedGlobalSegment>(SegmentsPool, LowMemoryFlag, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
 
             ThreadLocalCleanup.ReleaseThreadLocalState += CleanForCurrentThread;
 
@@ -516,7 +527,7 @@ namespace Sparrow
         [ThreadStatic]
         private static int _minSize;
 
-        public UnmanagedGlobalSegment Allocate(int size)
+        public UnmanagedGlobalSegment Allocate(int size, Action allocationFailure)
         {
             if (_minSize < size)
                 _minSize = size;
@@ -550,7 +561,15 @@ namespace Sparrow
             }
 
             // have to allocate it directly
-            return new UnmanagedGlobalSegment(size);
+            try
+            {
+                return new UnmanagedGlobalSegment(size);
+            }
+            catch 
+            {
+                allocationFailure?.Invoke();
+                throw;
+            }
         }
 
         public unsafe void Free(UnmanagedGlobalSegment memory)
@@ -596,35 +615,7 @@ namespace Sparrow
                 current.Value?.Dispose();
                 current = current.Next;
             }
-        }
-      
-        public class SegmentStack : StackHeader<UnmanagedGlobalSegment>
-        {
-            ~SegmentStack()
-            {
-                if (Environment.HasShutdownStarted)
-                    return; // no need
-
-                var current = Interlocked.Exchange(ref Head, HeaderDisposed);
-                try
-                {
-                    while (current != null)
-                    {
-                        var segment = current.Value;
-                        current = current.Next;
-                        if (segment == null)
-                            continue;
-                        if (!segment.InUse.Raise())
-                            continue;
-                        segment.Dispose();
-                    }
-                }
-                catch (ObjectDisposedException)
-                {
-                    // in case that in the future we will throw that exception
-                }
-            }
-        }
+        }        
     }
 
     public sealed class ByteStringContext : ByteStringContext<ByteStringMemoryCache>
@@ -641,6 +632,8 @@ namespace Sparrow
     public unsafe class ByteStringContext<TAllocator> : IDisposable where TAllocator : struct, IByteStringAllocator
     {
         public static TAllocator Allocator;
+
+        public event Action AllocationFailed;
 
         private class SegmentInformation
         {
@@ -1133,7 +1126,7 @@ namespace Sparrow
 
         private SegmentInformation AllocateSegment(int size)
         {
-            var memorySegment = Allocator.Allocate(size);
+            var memorySegment = Allocator.Allocate(size, AllocationFailed);
             if(memorySegment.Segment == null)
                 ThrowInvalidMemorySegmentOnAllocation();
 
@@ -1148,19 +1141,21 @@ namespace Sparrow
             return segment;
         }
 
-        private static void ThrowInvalidMemorySegmentOnAllocation()
+        private void ThrowInvalidMemorySegmentOnAllocation()
         {
+            AllocationFailed?.Invoke();
             throw new InvalidOperationException("Allocate gave us a segment that was already disposed.");
         }
 
-        private static void ThrowObjectDisposed()
+        private void ThrowObjectDisposed()
         {
+            AllocationFailed?.Invoke();
             throw new ObjectDisposedException("ByteStringContext");
         }
 
         private void AllocateExternalSegment(int size)
         {
-            var memorySegment = Allocator.Allocate(size);
+            var memorySegment = Allocator.Allocate(size, AllocationFailed);
 
             _totalAllocated += memorySegment.Size;
 
@@ -1557,21 +1552,7 @@ namespace Sparrow
 
 #endif
 
-        private bool _disposed;
-
-        ~ByteStringContext()
-        {
-            _isFinalizerThread = true;
-            try
-            {
-                Dispose();
-            }
-            catch (ObjectDisposedException)
-            {
-                // This is expected, we might be calling the finalizer on an object that
-                // was already disposed, we don't want to error here because of this
-            }
-        }
+        private bool _disposed;       
 
         public void Dispose()
         {
@@ -1594,7 +1575,6 @@ namespace Sparrow
             }
         }
 
-        [ThreadStatic] private static bool _isFinalizerThread;
         private readonly SharedMultipleUseFlag _lowMemoryFlag;
 
         private void ReleaseSegment(SegmentInformation segment)
@@ -1605,9 +1585,7 @@ namespace Sparrow
             _totalAllocated -= segment.Size;
 
             // Check if we can release this memory segment back to the pool.
-            if (_isFinalizerThread || 
-                segment.Memory.Size > ByteStringContext.MaxAllocationBlockSizeInBytes ||
-                _lowMemoryFlag)
+            if (segment.Memory.Size > ByteStringContext.MaxAllocationBlockSizeInBytes || _lowMemoryFlag)
             {
                 segment.Memory.Dispose();
             }

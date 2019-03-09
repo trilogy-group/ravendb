@@ -66,6 +66,8 @@ namespace Raven.Client.Documents.Linq
         private const string DefaultLoadAlias = "__load";
         private const string DefaultAliasPrefix = "__alias";
         private bool _addedDefaultAlias;
+        private Type _ofType;
+        private bool _isSelectArg;
 
         private readonly HashSet<string> _aliasKeywords = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
@@ -577,11 +579,26 @@ namespace Raven.Client.Documents.Linq
                 selectPath += ".Length";
             }
 
-            var propertyName = IndexName == null && _collectionName != null
-                ? QueryGenerator.Conventions.FindPropertyNameForDynamicIndex(typeof(T), IndexName, CurrentPath,
-                    selectPath)
-                : QueryGenerator.Conventions.FindPropertyNameForIndex(typeof(T), IndexName, CurrentPath,
+            string propertyName = null;
+            if (IndexName == null && _collectionName != null)
+            {
+                propertyName = QueryGenerator.Conventions.FindPropertyNameForDynamicIndex(typeof(T), IndexName, CurrentPath, 
                     selectPath);
+            }
+            else 
+            {
+                if (_insideSelect > 0 && QueryGenerator.Conventions.FindProjectedPropertyNameForIndex != null)                    
+                {
+                    propertyName = QueryGenerator.Conventions.FindProjectedPropertyNameForIndex(typeof(T), IndexName, CurrentPath,
+                        selectPath);
+                }
+
+                if (propertyName == null)
+                {
+                    propertyName = QueryGenerator.Conventions.FindPropertyNameForIndex(typeof(T), IndexName, CurrentPath,
+                        selectPath);
+                }
+            }
 
             return AddAliasToPathIfNeeded(alias, propertyName);
         }
@@ -655,8 +672,10 @@ namespace Raven.Client.Documents.Linq
                         constant = expression.Object;
                         break;
                     case ExpressionType.Parameter:
-                        fieldInfo = new ExpressionInfo(_currentPath.Substring(0, _currentPath.Length - 1), expression.Object.Type,
-                                                       false);
+                        fieldInfo = new ExpressionInfo(_currentPath.EndsWith("[].")
+                            ? _currentPath.Substring(0, _currentPath.Length - 3)
+                            : _currentPath.Substring(0, _currentPath.Length - 1), 
+                            expression.Object.Type, false);
                         constant = expression.Arguments[0];
                         break;
                     default:
@@ -1467,6 +1486,13 @@ The recommended method is to use full text search (mark the field as Analyzed an
                         var type = expression.Arguments[0].Type.GetGenericArguments()[0];
                         _documentQuery.AddRootType(type);
                     }
+
+                    //set the _ofType variable only if OfType call precedes the projection
+                    if (_isSelectArg && expression.Type.GetTypeInfo().IsGenericType) 
+                    {
+                        _ofType = expression.Type.GetGenericArguments()[0];
+                    }
+
                     VisitExpression(expression.Arguments[0]);
                     break;
                 case "Where":
@@ -1510,7 +1536,10 @@ The recommended method is to use full text search (mark the field as Analyzed an
                             CheckForLetOrLoadFromSelect(expression, lambdaExpression);
                         }
 
+                        _isSelectArg = true;
                         VisitExpression(expression.Arguments[0]);
+
+                        _isSelectArg = false;
 
                         var operand = ((UnaryExpression)expression.Arguments[1]).Operand;
 
@@ -1526,7 +1555,11 @@ The recommended method is to use full text search (mark the field as Analyzed an
                         }
 
                         else
+                        {
+                            _insideSelect++;
                             VisitSelect(operand);
+                            _insideSelect--;
+                        }
                         break;
                     }
                 case "Skip":
@@ -2014,7 +2047,7 @@ The recommended method is to use full text search (mark the field as Analyzed an
                 _documentQuery.OrderBy(fieldName, ordering);
         }
 
-        private bool _insideSelect;
+        private int _insideSelect;
         private readonly bool _isMapReduce;
         private readonly Type _originalQueryType;
         private readonly DocumentConventions _conventions;
@@ -2026,14 +2059,14 @@ The recommended method is to use full text search (mark the field as Analyzed an
             switch (body.NodeType)
             {
                 case ExpressionType.Convert:
-                    _insideSelect = true;
+                    _insideSelect++;
                     try
                     {
                         VisitSelect(((UnaryExpression)body).Operand);
                     }
                     finally
                     {
-                        _insideSelect = false;
+                        _insideSelect--;
                     }
                     break;
                 case ExpressionType.MemberAccess:
@@ -2042,7 +2075,7 @@ The recommended method is to use full text search (mark the field as Analyzed an
                     var selectPath = GetSelectPath(memberExpression);
                     AddToFieldsToFetch(selectPath, selectPath);
 
-                    if (_insideSelect == false)
+                    if (_insideSelect == 1)
                     {
                         foreach (var fieldToFetch in FieldsToFetch)
                         {
@@ -2246,9 +2279,10 @@ The recommended method is to use full text search (mark the field as Analyzed an
         {
             if (value is string || value is char)
             {
-                value = $"\"{value}\"";
+                return $"\"{value}\"";
             }
-            return value.ToString();
+
+            return value?.ToString();
         }
 
         private void AddReturnStatementToOutputFunction(Expression expression)
@@ -2305,10 +2339,11 @@ The recommended method is to use full text search (mark the field as Analyzed an
             if (IsRaw(expression, name))
                 return;
 
-            var loadSupport = new JavascriptConversionExtensions.LoadSupport { DoNotTranslate = true };
+            var isConditionalExpression = expression.Arguments[1].NodeType == ExpressionType.Conditional;
+            var loadSupport = new JavascriptConversionExtensions.LoadSupport { DoNotTranslate = isConditionalExpression == false };
             var js = ToJs(expression.Arguments[1], false, loadSupport);
 
-            if (loadSupport.HasLoad == false)
+            if (loadSupport.HasLoad == false || isConditionalExpression)
             {
                 AppendLineToOutputFunction(name, js);
             }
@@ -2582,17 +2617,19 @@ The recommended method is to use full text search (mark the field as Analyzed an
 
         private string ToJs(Expression expression, bool loadArg = false, JavascriptConversionExtensions.LoadSupport loadSupport = null)
         {
+            var dateTimeSupport = new JavascriptConversionExtensions.DateTimeSupport();
+
             var extensions = new JavascriptConversionExtension[]
             {
                 new JavascriptConversionExtensions.DictionarySupport(),
                 JavascriptConversionExtensions.LinqMethodsSupport.Instance,
-                new JavascriptConversionExtensions.WrappedConstantSupport<T>(_documentQuery, _projectionParameters),
+                new JavascriptConversionExtensions.WrappedConstantSupport<T>(_documentQuery, _projectionParameters, dateTimeSupport),
                 JavascriptConversionExtensions.MathSupport.Instance,
                 new JavascriptConversionExtensions.TransparentIdentifierSupport(),
                 JavascriptConversionExtensions.ReservedWordsSupport.Instance,
                 JavascriptConversionExtensions.InvokeSupport.Instance,
                 JavascriptConversionExtensions.ToStringSupport.Instance,
-                JavascriptConversionExtensions.DateTimeSupport.Instance,
+                dateTimeSupport,
                 JavascriptConversionExtensions.NullCoalescingSupport.Instance,
                 JavascriptConversionExtensions.NestedConditionalSupport.Instance,
                 JavascriptConversionExtensions.StringSupport.Instance,
@@ -2610,29 +2647,34 @@ The recommended method is to use full text search (mark the field as Analyzed an
                 MemberInitAsJson.ForAllTypes
             };
 
-            if (loadArg == false)
+            if (loadArg == false && (_isMapReduce == false || ShouldConvertDueToLoad()))
             {
                 Array.Resize(ref extensions, extensions.Length + 1);
 
                 extensions[extensions.Length - 1] = new JavascriptConversionExtensions.IdentityPropertySupport(_documentQuery.Conventions);
             }
             
-            var js = expression.CompileToJavascript(new JavascriptCompilationOptions(extensions)
+            return expression.CompileToJavascript(new JavascriptCompilationOptions(extensions)
             {
                 CustomMetadataProvider = new PropertyNameConventionJSMetadataProvider(_conventions)
             });
 
-            if (expression.Type == typeof(TimeSpan) && expression.NodeType != ExpressionType.MemberAccess)
+            bool ShouldConvertDueToLoad()
             {
-                //convert milliseconds to a TimeSpan string
-                js = $"convertJsTimeToTimeSpanString({js})";
+                return _loadAliases != null &&
+                       JavascriptConversionExtensions.IdentityPropertySupport.CanConvert(expression, _documentQuery.Conventions, out var alias) &&
+                       _loadAliases.Contains(alias);
             }
-
-            return js;
         }
 
         private static bool HasComputation(MemberExpression memberExpression)
         {
+            if (memberExpression.Member.Name == "HasValue" &&
+                memberExpression.Expression.Type.IsNullableType())
+            {
+                return true;
+            }
+
             var cur = memberExpression;
 
             while (cur != null)
@@ -2904,8 +2946,8 @@ The recommended method is to use full text search (mark the field as Analyzed an
         {
             HandleKeywordsIfNeeded(ref field, ref alias);
 
-            var identityProperty = _documentQuery.Conventions.GetIdentityProperty(_originalQueryType);
-            if (identityProperty != null && identityProperty.Name == field)
+            var identityProperty = _documentQuery.Conventions.GetIdentityProperty(_ofType ?? _originalQueryType);
+            if (identityProperty != null && identityProperty.Name == field && _isMapReduce == false)
             {
                 FieldsToFetch.Add(new FieldToFetch(Constants.Documents.Indexing.Fields.DocumentIdFieldName, alias));
                 return;
@@ -2916,29 +2958,32 @@ The recommended method is to use full text search (mark the field as Analyzed an
 
         private void HandleKeywordsIfNeeded(ref string field, ref string alias)
         {
-            if (NeedToAddFromAliasToField(field))
+            if (field != null)
             {
-                AddFromAliasToFieldToFetch(ref field, ref alias);
-            }
-            else if (_aliasKeywords.Contains(field))
-            {
-                AddDefaultAliasToQuery();
-                AddFromAliasToFieldToFetch(ref field, ref alias, true);
-            }
-
-            var indexOf = field.IndexOf(".", StringComparison.OrdinalIgnoreCase);
-            if (indexOf != -1)
-            {
-                var parameter = field.Substring(0, indexOf);
-                if (_aliasKeywords.Contains(parameter))
+                if (NeedToAddFromAliasToField(field))
                 {
-                    // field is a nested path that starts with RQL keyword,
-                    // need to quote the keyword
-
-                    var nestedPath = field.Substring(indexOf + 1);
+                    AddFromAliasToFieldToFetch(ref field, ref alias);
+                }
+                else if (_aliasKeywords.Contains(field))
+                {
                     AddDefaultAliasToQuery();
-                    AddFromAliasToFieldToFetch(ref parameter, ref alias, true);
-                    field = $"{parameter}.{nestedPath}";
+                    AddFromAliasToFieldToFetch(ref field, ref alias, true);
+                }
+
+                var indexOf = field.IndexOf(".", StringComparison.OrdinalIgnoreCase);
+                if (indexOf != -1)
+                {
+                    var parameter = field.Substring(0, indexOf);
+                    if (_aliasKeywords.Contains(parameter))
+                    {
+                        // field is a nested path that starts with RQL keyword,
+                        // need to quote the keyword
+
+                        var nestedPath = field.Substring(indexOf + 1);
+                        AddDefaultAliasToQuery();
+                        AddFromAliasToFieldToFetch(ref parameter, ref alias, true);
+                        field = $"{parameter}.{nestedPath}";
+                    }
                 }
             }
 
@@ -2948,7 +2993,6 @@ The recommended method is to use full text search (mark the field as Analyzed an
                 alias = "'" + alias + "'";
             }
         }
-
         private bool NeedToAddFromAliasToField(string field)
         {
             return _addedDefaultAlias &&

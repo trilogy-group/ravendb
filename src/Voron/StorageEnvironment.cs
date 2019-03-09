@@ -45,14 +45,14 @@ namespace Voron
 
         internal IndirectReference SelfReference = new IndirectReference();
 
-        public void QueueForSyncDataFile()
+        public void SuggestSyncDataFile()
         {
-            GlobalFlushingBehavior.GlobalFlusher.Value.MaybeSyncEnvironment(this);
+            GlobalFlushingBehavior.GlobalFlusher.Value.SuggestSyncEnvironment(this);
         }
 
         public void ForceSyncDataFile()
         {
-            GlobalFlushingBehavior.GlobalFlusher.Value.ForceFlushAndSyncEnvironment(this);
+            GlobalFlushingBehavior.GlobalFlusher.Value.ForceSyncEnvironment(this);
         }
 
         /// <summary>
@@ -97,9 +97,6 @@ namespace Voron
         private EndOfDiskSpaceEvent _endOfDiskSpace;
         internal int SizeOfUnflushedTransactionsInJournalFile;
 
-        public long LastSyncCounter;
-        public long LastSyncTimeInTicks = DateTime.MinValue.Ticks;
-
         internal DateTime LastFlushTime;
 
         public DateTime LastWorkTime;
@@ -140,6 +137,9 @@ namespace Voron
                 _validPages[_validPages.Length - 1] |= unchecked(((long)ulong.MaxValue << (int)remainingBits));
 
                 _decompressionBuffers = new DecompressionBuffersPool(options);
+
+                options.InvokeOnDirectoryInitialize();
+
                 var isNew = _headerAccessor.Initialize();
 
                 _scratchBufferPool = new ScratchBufferPool(this);
@@ -155,6 +155,9 @@ namespace Voron
 
                 if (_options.ManualFlushing == false)
                     Task.Run(IdleFlushTimer);
+
+                if (isNew == false && _options.ManualSyncing == false)
+                    SuggestSyncDataFile(); // let's suggest syncing data file after the recovery
             }
             catch (Exception)
             {
@@ -248,7 +251,7 @@ namespace Voron
                             GlobalFlushingBehavior.GlobalFlusher.Value.MaybeFlushEnvironment(this);
 
                         else if (Journal.Applicator.TotalWrittenButUnsyncedBytes != 0)
-                            QueueForSyncDataFile();
+                            SuggestSyncDataFile();
                     }
                     else
                     {
@@ -303,14 +306,14 @@ namespace Voron
 
                 var metadataTree = writeTx.ReadTree(Constants.MetadataTreeNameSlice);
                 if (metadataTree == null)
-                    VoronUnrecoverableErrorException.Raise(this,
+                    VoronUnrecoverableErrorException.Raise(tx,
                         "Could not find metadata tree in database, possible mismatch / corruption?");
 
                 Debug.Assert(metadataTree != null);
                 // ReSharper disable once PossibleNullReferenceException
                 var dbId = metadataTree.Read("db-id");
                 if (dbId == null)
-                    VoronUnrecoverableErrorException.Raise(this,
+                    VoronUnrecoverableErrorException.Raise(tx,
                         "Could not find db id in metadata tree, possible mismatch / corruption?");
 
                 var buffer = new byte[16];
@@ -318,7 +321,7 @@ namespace Voron
                 // ReSharper disable once PossibleNullReferenceException
                 var dbIdBytes = dbId.Reader.Read(buffer, 0, 16);
                 if (dbIdBytes != 16)
-                    VoronUnrecoverableErrorException.Raise(this,
+                    VoronUnrecoverableErrorException.Raise(tx,
                         "The db id value in metadata tree wasn't 16 bytes in size, possible mismatch / corruption?");
 
                 var databaseGuidId = _options.GenerateNewDatabaseId == false ? new Guid(buffer) : Guid.NewGuid();
@@ -351,7 +354,7 @@ namespace Voron
 
                     var schemaVersion = metadataTree.Read("schema-version");
                     if (schemaVersion == null)
-                        VoronUnrecoverableErrorException.Raise(this, "Could not find schema version in metadata tree, possible mismatch / corruption?");
+                        SchemaErrorException.Raise(this, "Could not find schema version in metadata tree, possible mismatch / corruption?");
 
                     schemaVersionVal = schemaVersion.Reader.ReadLittleEndianInt32();
                 }
@@ -371,6 +374,8 @@ namespace Voron
             }
             catch (Exception e)
             {
+                if (e is SchemaErrorException)
+                    throw;
                 VoronUnrecoverableErrorException.Raise(this, e.Message, e);
                 throw;
             }
@@ -405,7 +410,7 @@ namespace Voron
 
         private void ThrowSchemaUpgradeRequired(int schemaVersionVal, string message)
         {
-            VoronUnrecoverableErrorException.Raise(this,
+            SchemaErrorException.Raise(this,
                 "The schema version of this database is expected to be " +
                 Options.SchemaVersion + " but is actually " + schemaVersionVal +
                 ". " + message);
@@ -432,6 +437,9 @@ namespace Voron
             {
                 Options = Options
             };
+
+            if (Options.SimulateFailureOnDbCreation)
+                ThrowSimulateFailureOnDbCreation();
 
             var transactionPersistentContext = new TransactionPersistentContext();
             using (var tx = NewLowLevelTransaction(transactionPersistentContext, TransactionFlags.ReadWrite))
@@ -523,6 +531,9 @@ namespace Voron
             finally
             {
                 var errors = new List<Exception>();
+
+                OnLogsApplied = null;
+
                 foreach (var disposable in new IDisposable[]
                 {
                     _journal,
@@ -767,6 +778,7 @@ namespace Voron
 
         public long CurrentReadTransactionId => Interlocked.Read(ref _transactionsCounter);
         public long NextWriteTransactionId => Interlocked.Read(ref _transactionsCounter) + 1;
+        public CancellationToken Token => _cancellationTokenSource.Token;
 
         public long PossibleOldestReadTransaction(LowLevelTransaction tx)
         {
@@ -909,11 +921,12 @@ namespace Voron
                 CountOfTrees = countOfTrees,
                 CountOfTables = countOfTables,
                 Journals = Journal.Files.ToList(),
-                TempPath = Options.TempPath
+                TempPath = Options.TempPath,
+                JournalPath = (Options as StorageEnvironmentOptions.DirectoryStorageEnvironmentOptions)?.JournalPath
             });
         }
 
-        public unsafe DetailedStorageReport GenerateDetailedReport(Transaction tx, bool calculateExactSizes = false)
+        public unsafe DetailedStorageReport GenerateDetailedReport(Transaction tx, bool includeDetails = false)
         {
             var numberOfAllocatedPages = Math.Max(_dataPager.NumberOfAllocatedPages, NextPageNumber - 1); // async apply to data file task
             var numberOfFreePages = _freeSpaceHandling.AllPages(tx.LowLevelTransaction).Count;
@@ -969,12 +982,16 @@ namespace Voron
                 NumberOfFreePages = numberOfFreePages,
                 NextPageNumber = NextPageNumber,
                 Journals = Journal.Files.ToList(),
+                LastFlushedTransactionId = Journal.Applicator.LastFlushedTransactionId,
+                LastFlushedJournalId = Journal.Applicator.LastFlushedJournalId,
+                TotalWrittenButUnsyncedBytes = Journal.Applicator.TotalWrittenButUnsyncedBytes,
                 Trees = trees,
                 FixedSizeTrees = fixedSizeTrees,
                 Tables = tables,
-                CalculateExactSizes = calculateExactSizes,
+                IncludeDetails = includeDetails,
                 ScratchBufferPoolInfo = _scratchBufferPool.InfoForDebug(PossibleOldestReadTransaction(tx.LowLevelTransaction)),
-                TempPath = Options.TempPath
+                TempPath = Options.TempPath,
+                JournalPath = (Options as StorageEnvironmentOptions.DirectoryStorageEnvironmentOptions)?.JournalPath
             });
         }
 
@@ -1078,6 +1095,9 @@ namespace Voron
             // No need to call EnsureMapped here. ValidatePageChecksum is only called for pages in the datafile, 
             // which we already got using AcquirePagePointerWithOverflowHandling()
 
+            if (pageNumber != current->PageNumber)
+                ThrowInvalidPageNumber(pageNumber, current);
+
             ulong checksum = CalculatePageChecksum((byte*)current, current->PageNumber, current->Flags, current->OverflowSize);
 
             if (checksum == current->Checksum)
@@ -1086,10 +1106,35 @@ namespace Voron
             ThrowInvalidChecksum(pageNumber, current, checksum);
         }
 
+        private static unsafe void ThrowInvalidPageNumber(long pageNumber, PageHeader* current)
+        {
+            var message = $"When reading page {pageNumber}, we read a page with header of page {current->PageNumber}. ";
+
+            message += $"Page flags: {current->Flags}. ";
+
+            if ((current->Flags & PageFlags.Overflow) == PageFlags.Overflow)
+                message += $"Overflow size: {current->OverflowSize}. ";
+
+            throw new InvalidDataException(message);
+        }
+
         private unsafe void ThrowInvalidChecksum(long pageNumber, PageHeader* current, ulong checksum)
         {
-            throw new InvalidDataException(
-                $"Invalid checksum for page {pageNumber}, data file {_options.DataPager} might be corrupted, expected hash to be {current->Checksum} but was {checksum}");
+            var message = $"Invalid checksum for page {pageNumber}, data file {_options.DataPager} might be corrupted, expected hash to be {current->Checksum} but was {checksum}. ";
+
+            message += $"Page flags: {current->Flags}. ";
+
+            if ((current->Flags & PageFlags.Overflow) == PageFlags.Overflow)
+                message += $"Overflow size: {current->OverflowSize}. ";
+
+            throw new InvalidDataException(message);
+        }
+
+        public static unsafe ulong CalculatePageChecksum(byte* ptr, long pageNumber, out ulong expectedChecksum)
+        {
+            var header = (PageHeader*)(ptr);
+            expectedChecksum = header->Checksum;
+            return CalculatePageChecksum(ptr, pageNumber, header->Flags, header->OverflowSize);
         }
 
         public static unsafe ulong CalculatePageChecksum(byte* ptr, long pageNumber, PageFlags flags, int overflowSize)
@@ -1243,6 +1288,11 @@ namespace Voron
             Debug.Assert(tx.Flags == TransactionFlags.Read);
             _envDispose.Signal();
             tx.AlreadyAllowedDisposeWithLazyTransactionRunning = true;
+        }
+
+        private static void ThrowSimulateFailureOnDbCreation()
+        {
+            throw new InvalidOperationException("Simulation of db creation failure");
         }
     }
 }

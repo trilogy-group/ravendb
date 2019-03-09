@@ -21,6 +21,7 @@ using Raven.Server.Web.System;
 using Sparrow;
 using Sparrow.Logging;
 using Sparrow.Utils;
+using Voron.Exceptions;
 
 namespace Raven.Server.Documents
 {
@@ -68,8 +69,8 @@ namespace Raven.Server.Documents
                 var record = _serverStore.LoadDatabaseRecord(databaseName, out long _);
                 if (record == null)
                 {
-                    // was removed, need to make sure that it isn't loaded 
-                    DatabasesCache.RemoveLockAndReturn(databaseName, CompleteDatabaseUnloading, out var _).Dispose();
+                    // was removed, need to make sure that it isn't loaded
+                    UnloadDatabase(databaseName);
                     return;
                 }
 
@@ -81,7 +82,7 @@ namespace Raven.Server.Documents
 
                 if (record.Disabled)
                 {
-                    DatabasesCache.RemoveLockAndReturn(databaseName, CompleteDatabaseUnloading, out var _).Dispose();
+                    UnloadDatabase(databaseName);
                     return;
                 }
 
@@ -105,7 +106,7 @@ namespace Raven.Server.Documents
                             NotifyDatabaseAboutStateChange(databaseName, task, index);
                             if (type == ClusterStateMachine.SnapshotInstalled)
                             {
-                                NotifyPendingClusterTransaction(databaseName, task);
+                                NotifyPendingClusterTransaction(databaseName, task, index, changeType);
                             }
                             return;
                         }
@@ -114,7 +115,7 @@ namespace Raven.Server.Documents
                             NotifyDatabaseAboutStateChange(databaseName, done, index);
                             if (type == ClusterStateMachine.SnapshotInstalled)
                             {
-                                NotifyPendingClusterTransaction(databaseName, done);
+                                NotifyPendingClusterTransaction(databaseName, done, index, changeType);
                             }
                         });
                         break;
@@ -131,16 +132,17 @@ namespace Raven.Server.Documents
                         });
                         break;
                     case ClusterDatabaseChangeType.PendingClusterTransactions:
+                    case ClusterDatabaseChangeType.ClusterTransactionCompleted:
                         if (task.IsCompleted)
                         {
                             task.Result.DatabaseGroupId = record.Topology.DatabaseTopologyIdBase64;
-                            NotifyPendingClusterTransaction(databaseName, task);
+                            NotifyPendingClusterTransaction(databaseName, task, index, changeType);
                             return;
                         }
                         task.ContinueWith(done =>
                         {
                             done.Result.DatabaseGroupId = record.Topology.DatabaseTopologyIdBase64;
-                            NotifyPendingClusterTransaction(databaseName, done);
+                            NotifyPendingClusterTransaction(databaseName, done, index, changeType);
                         });
 
                         break;
@@ -165,11 +167,23 @@ namespace Raven.Server.Documents
             }
         }
 
-        public void NotifyPendingClusterTransaction(string name, Task<DocumentDatabase> task)
+        private void UnloadDatabase(string databaseName)
         {
             try
             {
-                task.Result.NotifyOnPendingClusterTransaction();
+                DatabasesCache.RemoveLockAndReturn(databaseName, CompleteDatabaseUnloading, out _).Dispose();
+            }
+            catch (AggregateException ae) when (nameof(DeleteDatabase).Equals(ae.InnerException.Data["Source"]))
+            {
+                // this is already in the process of being deleted, we can just exit and let the other thread handle it
+            }
+        }
+
+        public void NotifyPendingClusterTransaction(string name, Task<DocumentDatabase> task, long index, ClusterDatabaseChangeType changeType)
+        {
+            try
+            {
+                task.Result.NotifyOnPendingClusterTransaction(index, changeType);
             }
             catch (Exception e)
             {
@@ -195,6 +209,7 @@ namespace Raven.Server.Documents
                 DeleteDatabase(dbName, deletionInProgress, record);
                 return true;
             }
+
             return false;
         }
 
@@ -232,17 +247,17 @@ namespace Raven.Server.Documents
                     {
                         DatabaseHelper.DeleteDatabaseFiles(configuration);
                     }
+                }
 
-                    // At this point the db record still exists but the db was effectively deleted 
-                    // from this node so we can also remove its secret key from this node.
-                    if (record.Encrypted)
+                // At this point the db record still exists but the db was effectively deleted 
+                // from this node so we can also remove its secret key from this node.
+                if (record.Encrypted)
+                {
+                    using (_serverStore.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
+                    using (var tx = context.OpenWriteTransaction())
                     {
-                        using (_serverStore.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
-                        using (var tx = context.OpenWriteTransaction())
-                        {
-                            _serverStore.DeleteSecretKey(context, dbName);
-                            tx.Commit();
-                        }
+                        _serverStore.DeleteSecretKey(context, dbName);
+                        tx.Commit();
                     }
                 }
 
@@ -590,6 +605,8 @@ namespace Raven.Server.Documents
                     _logger.Info(msg);
             }
 
+            DocumentDatabase documentDatabase = null;
+
             try
             {
                 // force this to have a new value if one already exists
@@ -597,11 +614,10 @@ namespace Raven.Server.Documents
                     s => new ConcurrentQueue<string>(),
                     (s, existing) => new ConcurrentQueue<string>());
 
-
                 AddToInitLog("Starting database initialization");
 
                 var sp = Stopwatch.StartNew();
-                var documentDatabase = new DocumentDatabase(config.ResourceName, config, _serverStore, AddToInitLog);
+                documentDatabase = new DocumentDatabase(config.ResourceName, config, _serverStore, AddToInitLog);
                 documentDatabase.Initialize();
 
                 AddToInitLog("Finish database initialization");
@@ -614,13 +630,20 @@ namespace Raven.Server.Documents
                 // if we have a very long init process, make sure that we reset the last idle time for this db.
                 LastRecentlyUsed.AddOrUpdate(databaseName, SystemTime.UtcNow, (_, time) => SystemTime.UtcNow);
 
-
                 return documentDatabase;
             }
             catch (Exception e)
             {
+                documentDatabase?.Dispose();
+
                 if (_logger.IsInfoEnabled)
                     _logger.Info($"Failed to start database {config.ResourceName}", e);
+
+                if (e is SchemaErrorException)
+                {
+                    throw new DatabaseSchemaErrorException($"Failed to start database {config.ResourceName}" + Environment.NewLine +
+                                                           $"At {config.Core.DataDirectory}", e);
+                }
                 throw new DatabaseLoadFailureException($"Failed to start database {config.ResourceName}" + Environment.NewLine +
                                                        $"At {config.Core.DataDirectory}", e);
             }
@@ -689,7 +712,7 @@ namespace Raven.Server.Documents
         protected RavenConfiguration CreateConfiguration(DatabaseRecord record)
         {
             Debug.Assert(_serverStore.Disposed == false);
-            var config = RavenConfiguration.CreateFrom(_serverStore.Configuration, record.DatabaseName, ResourceType.Database);
+            var config = RavenConfiguration.CreateForDatabase(_serverStore.Configuration, record.DatabaseName);
 
             foreach (var setting in record.Settings)
                 config.SetSetting(setting.Key, setting.Value);
@@ -730,6 +753,8 @@ namespace Raven.Server.Documents
                 }
             });
 
+            var t = tcs.IgnoreUnobservedExceptions();
+
             try
             {
                 var existing = DatabasesCache.Replace(dbName, tcs);
@@ -752,7 +777,8 @@ namespace Raven.Server.Documents
         {
             RecordChanged,
             ValueChanged,
-            PendingClusterTransactions
+            PendingClusterTransactions,
+            ClusterTransactionCompleted
         }
 
         public void UnloadDirectly(StringSegment databaseName, DateTime? wakeup = null, [CallerMemberName] string caller = null)

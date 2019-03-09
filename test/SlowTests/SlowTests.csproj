@@ -1,7 +1,7 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>netcoreapp2.1</TargetFramework>
-    <RuntimeFrameworkVersion>2.1.5</RuntimeFrameworkVersion>
+    <RuntimeFrameworkVersion>2.1.8</RuntimeFrameworkVersion>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <AssemblyName>SlowTests</AssemblyName>
     <PackageId>SlowTests</PackageId>
@@ -22,6 +22,14 @@
     <Content Include="..\xunit.runner.json" Link="xunit.runner.json">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </Content>
+    <EmbeddedResource Include="Data\npgsql.basic.create.sql" />
+    <EmbeddedResource Include="Data\npgsql.basic.insert.sql" />
+    <EmbeddedResource Include="Data\npgsql.northwind.create.sql" />
+    <EmbeddedResource Include="Data\npgsql.northwind.insert.sql" />
+    <EmbeddedResource Include="Data\oraclesql.basic.create.sql" />
+    <EmbeddedResource Include="Data\oraclesql.basic.insert.sql" />
+    <EmbeddedResource Include="Data\oraclesql.northwind.create.sql" />
+    <EmbeddedResource Include="Data\oraclesql.northwind.insert.sql" />
     <EmbeddedResource Include="Data\RavenDB_10958.txt" />
     <EmbeddedResource Include="Data\RavenDB_10958.json" />
     <EmbeddedResource Include="Data\mssql.northwind.create.sql" />
@@ -45,6 +53,7 @@
     <EmbeddedResource Include="Data\data.txt" />
     <EmbeddedResource Include="Data\data2.txt" />
     <EmbeddedResource Include="MailingList\Everett\DocumentWithBytes.txt" />
+    <EmbeddedResource Include="Smuggler\Document_Without_Attachment_Stream.ravendbdump" />
     <EmbeddedResource Include="Smuggler\Indexes_And_Transformers_3.5.ravendbdump" />
     <EmbeddedResource Include="Smuggler\Northwind_3.5.35168.ravendbdump" />
     <EmbeddedResource Include="Smuggler\Revisions_3.5.35220.ravendbdump" />
@@ -58,9 +67,12 @@
     <ProjectReference Include="..\Tests.Infrastructure\Tests.Infrastructure.csproj" />
   </ItemGroup>
   <ItemGroup>
-    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="15.8.0" />
-    <PackageReference Include="xunit.runner.visualstudio" Version="2.4.0" />
-    <PackageReference Include="xunit" Version="2.4.0" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="16.0.0" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.4.1">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers</IncludeAssets>
+    </PackageReference>
+    <PackageReference Include="xunit" Version="2.4.1" />
     <DotNetCliToolReference Include="dotnet-xunit" Version="2.4.0-beta.1.build9999" />
   </ItemGroup>
   <ItemGroup>
@@ -69,7 +81,58 @@
   <ItemGroup>
     <Folder Include="Client\Indexing" />
     <Folder Include="Core\AdminConsole" />
+    <Folder Include="SchemaUpgrade\Issues\VoronCurrentVersion\" />
     <Folder Include="Server\Basic" />
     <Folder Include="Server\Documents\Notifications" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Update="SchemaUpgrade\Issues\DocumentsVersion\schema_999\headers.one">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="SchemaUpgrade\Issues\DocumentsVersion\schema_999\headers.two">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="SchemaUpgrade\Issues\DocumentsVersion\schema_999\Journals\0000000000000000000.journal">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="SchemaUpgrade\Issues\DocumentsVersion\schema_999\Journals\0000000000000000001.journal">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="SchemaUpgrade\Issues\DocumentsVersion\schema_999\Raven.voron">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="SchemaUpgrade\Issues\DocumentsVersion\schema_9\headers.one">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="SchemaUpgrade\Issues\DocumentsVersion\schema_9\headers.two">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="SchemaUpgrade\Issues\DocumentsVersion\schema_9\Journals\0000000000000000000.journal">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="SchemaUpgrade\Issues\DocumentsVersion\schema_9\Journals\0000000000000000001.journal">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="SchemaUpgrade\Issues\DocumentsVersion\schema_9\Raven.voron">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="SchemaUpgrade\Issues\VoronCurrentVersion\schema_999\headers.one">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="SchemaUpgrade\Issues\VoronCurrentVersion\schema_999\headers.two">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="SchemaUpgrade\Issues\VoronCurrentVersion\schema_999\Journals\0000000000000000000.journal">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="SchemaUpgrade\Issues\VoronCurrentVersion\schema_999\Journals\0000000000000000001.journal">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="SchemaUpgrade\Issues\VoronCurrentVersion\schema_999\Raven.voron">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="Voron\LeafsCompression\Data\RavenDB-12700-page-1278-compressed">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
   </ItemGroup>
 </Project>

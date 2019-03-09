@@ -128,21 +128,27 @@ class indexingSpeedSection {
         const grid = this.gridController();
 
         grid.headerVisible(true);
+        grid.setDefaultSortBy(0);
 
         grid.init((s, t) => $.when({
             totalResultCount: this.table.length,
             items: this.table
         }), () => {
             return [
-                new hyperlinkColumn<indexingSpeed>(grid, x => x.database(), x => appUrl.forIndexPerformance(x.database()), "Database", "30%"),
+                new hyperlinkColumn<indexingSpeed>(grid, x => x.database(), x => appUrl.forIndexPerformance(x.database()), "Database", "30%", {
+                    sortable: "string"
+                }),
                 new textColumn<indexingSpeed>(grid, x => x.indexedPerSecond() != null ? x.indexedPerSecond() : "n/a", "Indexed / sec", "15%", {
-                    extraClass: item => item.indexedPerSecond() != null ? "" : "na"
+                    extraClass: item => item.indexedPerSecond() != null ? "" : "na",
+                    sortable: x => x.indexedPerSecond() || 0
                 }),
                 new textColumn<indexingSpeed>(grid, x => x.mappedPerSecond() != null ? x.mappedPerSecond() : "n/a", "Mapped / sec", "15%", {
-                    extraClass: item => item.mappedPerSecond() != null ? "" : "na"
+                    extraClass: item => item.mappedPerSecond() != null ? "" : "na",
+                    sortable: x => x.mappedPerSecond() || 0
                 }),
                 new textColumn<indexingSpeed>(grid, x => x.reducedPerSecond() != null ? x.reducedPerSecond() : "n/a", "Entries reduced / sec", "15%", {
-                    extraClass: item => item.reducedPerSecond() != null ? "" : "na"
+                    extraClass: item => item.reducedPerSecond() != null ? "" : "na",
+                    sortable: x => x.reducedPerSecond() || 0
                 })
             ];
         });
@@ -182,8 +188,6 @@ class indexingSpeedSection {
     
     onData(data: Raven.Server.Dashboard.IndexingSpeed) {
         const items = data.Items;
-        items.sort((a, b) => generalUtils.sortAlphaNumeric(a.Database, b.Database));
-
         const newDbs = items.map(x => x.Database);
         const oldDbs = this.table.map(x => x.database());
 
@@ -260,35 +264,46 @@ class databasesSection {
                 return '<i class="icon-database-cutout icon-addon-clock"></i>';
             }
         };
-        
+        grid.setDefaultSortBy(0);
         grid.init((s, t) => $.when({
             totalResultCount: this.table.length,
             items: this.table
         }), () => {
             return [ 
-                new hyperlinkColumn<databaseItem>(grid, x => iconProvider(x) + '<span>' + utils.escape(x.database()) + '</span>', x => appUrl.forDocuments(null, x.database()), "Database", "30%", {
+                new hyperlinkColumn<databaseItem>(grid, x => iconProvider(x) + '<span>' + generalUtils.escapeHtml(x.database()) + '</span>', x => appUrl.forDocuments(null, x.database()), "Database", "30%", {
                     extraClass: x => x.disabled() ? "disabled" : "",
-                    useRawValue: () => true
+                    useRawValue: () => true,
+                    sortable: x => x.database()
                 }), 
-                new textColumn<databaseItem>(grid, x => x.documentsCount(), "Docs #", "25%"),
+                new textColumn<databaseItem>(grid, x => x.documentsCount(), "Docs #", "25%", {
+                    sortable: "number",
+                    defaultSortOrder: "desc"
+                }),
                 new textColumn<databaseItem>(grid, 
                         x => x.indexesCount() + ( x.erroredIndexesCount() ? ' (<span class=\'text-danger\'>' + x.erroredIndexesCount() + '</span>)' : '' ), 
                         "Index # (Error #)", 
                         "20%",
                         {
-                            useRawValue: () => true
+                            useRawValue: () => true,
+                            sortable: x => 1e6 * x.erroredIndexesCount() + x.indexesCount(),
+                            defaultSortOrder: "desc"
+                            
                         }),
                 new textColumn<databaseItem>(grid, x => x.alertsCount(), "Alerts #", "12%", {
-                    extraClass: item => item.alertsCount() ? 'has-alerts' : ''
+                    extraClass: item => item.alertsCount() ? 'has-alerts' : '',
+                    sortable: "number",
+                    defaultSortOrder: "desc"
                 }), 
-                new textColumn<databaseItem>(grid, x => x.replicationFactor(), "Replica factor", "12%")
+                new textColumn<databaseItem>(grid, x => x.replicationFactor(), "Replica factor", "12%", {
+                    sortable: "number",
+                    defaultSortOrder: "desc"
+                })
             ];
         });
     }
     
     onData(data: Raven.Server.Dashboard.DatabasesInfo) {
         const items = data.Items;
-        items.sort((a, b) => generalUtils.sortAlphaNumeric(a.Database, b.Database));
 
         const newDbs = items.map(x => x.Database);
         const oldDbs = this.table.map(x => x.database());
@@ -345,21 +360,74 @@ class trafficSection {
     totalRequestsPerSecond = ko.observable<number>(0);
     totalWritesPerSecond = ko.observable<number>(0);
     totalDataWritesPerSecond = ko.observable<number>(0);
-    
-    init()  {
+
+    totalDocsWritesPerSecond = ko.observable<number>(0);
+    totalAttachmentsWritesPerSecond = ko.observable<number>(0);
+    totalCountersWritesPerSecond = ko.observable<number>(0);
+    totalDocsWriteBytesPerSecond = ko.observable<number>(0);
+    totalAttachmentsWriteBytesPerSecond = ko.observable<number>(0);
+    totalCountersWriteBytesPerSecond = ko.observable<number>(0);
+
+    writesPerSecondTooltip: KnockoutComputed<string>;
+    writeBytesPerSecondTooltip: KnockoutComputed<string>;
+
+    constructor() {
+        this.writesPerSecondTooltip = ko.pureComputed(() => {
+            return `<div>
+                    Documents: <strong>${this.totalDocsWritesPerSecond().toLocaleString()}</strong><br />
+                    Attachments: <strong>${this.totalAttachmentsWritesPerSecond().toLocaleString()}</strong><br />
+                    Counters: <strong>${this.totalCountersWritesPerSecond().toLocaleString()}</strong>
+                    </div>`;
+        });
+
+        this.writeBytesPerSecondTooltip = ko.pureComputed(() => {
+            return `<div>
+                    Documents: <strong>${this.sizeFormatter(this.totalDocsWriteBytesPerSecond())}/s</strong><br />
+                    Attachments: <strong>${this.sizeFormatter(this.totalAttachmentsWriteBytesPerSecond())}/s</strong><br />
+                    Counters: <strong>${this.sizeFormatter(this.totalCountersWriteBytesPerSecond())}/s</strong>
+                    </div>`;
+        });
+    }
+
+    init() {
         const grid = this.gridController();
 
         grid.headerVisible(true);
+        grid.setDefaultSortBy(0);
         
         grid.init((s, t) => $.when({
             totalResultCount: this.table.length,
             items: this.table
         }), () => {
             return [
-                new hyperlinkColumn<trafficItem>(grid, x => x.database(), x => appUrl.forTrafficWatch(x.database()), "Database", "30%"),
-                new textColumn<trafficItem>(grid, x => x.requestsPerSecond(), "Requests / s", "20%"),
-                new textColumn<trafficItem>(grid, x => x.writesPerSecond(), "Writes / s", "25%"),
-                new textColumn<trafficItem>(grid, x => this.sizeFormatter(x.dataWritesPerSecond()), "Data written / s", "25%")
+                new hyperlinkColumn<trafficItem>(grid, x => x.database(), 
+                    x => appUrl.forTrafficWatch(x.database()), 
+                    "Database", 
+                    "30%", 
+                    {
+                        sortable: "string"
+                    }),
+                new textColumn<trafficItem>(grid, 
+                    x => x.requestsPerSecond(), 
+                    "Requests / s", 
+                    "20%", {
+                        sortable: "number",
+                        defaultSortOrder: "desc"
+                    }),
+                new textColumn<trafficItem>(grid, 
+                    x => x.writesPerSecond(), 
+                    "Writes / s", 
+                    "25%", {
+                        sortable: "number",
+                        defaultSortOrder: "desc"
+                    }),
+                new textColumn<trafficItem>(grid, 
+                    x => this.sizeFormatter(x.dataWritesPerSecond()), 
+                    "Data written / s", 
+                    "25%", {
+                        sortable: x => x.dataWritesPerSecond(),
+                        defaultSortOrder: "desc"
+                    })
             ];
         });
         
@@ -377,6 +445,8 @@ class trafficSection {
             },
             tooltipProvider: data => this.trafficTooltip(data)
         });
+
+        $('.dashboard-traffic [data-toggle="tooltip"]').tooltip();
     }
     
     onResize() {
@@ -403,7 +473,6 @@ class trafficSection {
     
     onData(data: Raven.Server.Dashboard.TrafficWatch) {
         const items = data.Items;
-        items.sort((a, b) => generalUtils.sortAlphaNumeric(a.Database, b.Database));
 
         const newDbs = items.map(x => x.Database);
         const oldDbs = this.table.map(x => x.database());
@@ -443,13 +512,33 @@ class trafficSection {
         let totalRequests = 0;
         let writesPerSecond = 0;
         let dataWritesPerSecond = 0;
+        let docsWritesPerSeconds = 0;
+        let attachmentsWritesPerSecond = 0;
+        let countersWritesPerSecond = 0;
+        let docsWriteBytesPerSeconds = 0;
+        let attachmentsWriteBytesPerSecond = 0;
+        let countersWriteBytesPerSecond = 0;
 
         this.table.forEach(item => {
             totalRequests += item.requestsPerSecond();
             writesPerSecond += item.writesPerSecond();
             dataWritesPerSecond += item.dataWritesPerSecond();
+
+            docsWritesPerSeconds += item.docsWritesPerSeconds();
+            attachmentsWritesPerSecond += item.attachmentsWritesPerSecond();
+            countersWritesPerSecond += item.countersWritesPerSecond();
+            docsWriteBytesPerSeconds += item.docsWriteBytesPerSeconds();
+            attachmentsWriteBytesPerSecond += item.attachmentsWriteBytesPerSecond();
+            countersWriteBytesPerSecond += item.countersWriteBytesPerSecond();
         });
 
+        this.totalDocsWritesPerSecond(docsWritesPerSeconds);
+        this.totalAttachmentsWritesPerSecond(attachmentsWritesPerSecond);
+        this.totalCountersWritesPerSecond(countersWritesPerSecond);
+        this.totalDocsWriteBytesPerSecond(docsWriteBytesPerSeconds);
+        this.totalAttachmentsWriteBytesPerSecond(attachmentsWriteBytesPerSecond);
+        this.totalCountersWriteBytesPerSecond(countersWriteBytesPerSecond);
+        
         this.totalRequestsPerSecond(totalRequests);
         this.totalWritesPerSecond(writesPerSecond);
         this.totalDataWritesPerSecond(dataWritesPerSecond);
@@ -588,6 +677,15 @@ class serverDashboard extends viewModelBase {
     
     clusterManager = clusterTopologyManager.default;
     accessManager = accessManager.default.dashboardView;
+    
+    osIcon = ko.pureComputed(() => {
+        const nodeInfo = this.clusterManager.nodeInfo();
+        if (nodeInfo) {
+            const type = nodeInfo.OsInfo.Type;
+            return clusterNode.osIcon(type);    
+        }
+        return null;
+    });
     
     formattedUpTime: KnockoutComputed<string>;
     formattedStartTime: KnockoutComputed<string>;

@@ -1,4 +1,5 @@
-﻿using System.Collections.Generic;
+﻿using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using FastTests;
@@ -10,6 +11,7 @@ using Raven.Server.Documents.Indexes.Debugging;
 using Raven.Server.Documents.Indexes.MapReduce.Static;
 using Raven.Server.ServerWide.Context;
 using Sparrow.Json.Parsing;
+using Tests.Infrastructure;
 using Xunit;
 
 namespace SlowTests.Server.Documents.Indexing.Debugging
@@ -96,7 +98,14 @@ select new
             }
         }
 
-        [Theory]
+        [Theory32Bit]
+        [InlineData(10, 1, 1)]
+        public void Getting_trees32(int numberOfDocs, int expectedTreeDepth, int expectedPageCount)
+        {
+            Getting_trees(numberOfDocs, expectedTreeDepth, expectedPageCount);
+        }
+
+        [Theory64Bit]
         [InlineData(1000, 2, 3)]
         [InlineData(10, 1, 1)] // nested section
         public void Getting_trees(int numberOfDocs, int expectedTreeDepth, int expectedPageCount)
@@ -129,7 +138,9 @@ select new
 
                         var firstRunStats = new IndexingRunStats();
                         var scope = new IndexingStatsScope(firstRunStats);
-                        index.DoIndexingWork(scope, CancellationToken.None);
+
+                        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+                        while (index.DoIndexingWork(scope, cts.Token));
 
                         foreach (var documentId in new[] {"orders/1", "orderS/1"})
                         {
@@ -139,11 +150,9 @@ select new
                                 var result = trees.ToList();
 
                                 Assert.Equal(2, result.Count);
-
                                 for (int i = 0; i < 2; i++)
                                 {
                                     var tree = result[i];
-
                                     Assert.Equal(expectedTreeDepth, tree.Depth);
                                     Assert.Equal(numberOfDocs, tree.NumberOfEntries);
                                     Assert.Equal(expectedPageCount, tree.PageCount);

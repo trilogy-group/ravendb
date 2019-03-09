@@ -1,15 +1,36 @@
 using System;
+using System.Runtime.CompilerServices;
 using Sparrow.Compression;
 
 namespace Sparrow.Json
 {
-    public unsafe class LazyCompressedStringValue 
+    public unsafe class LazyCompressedStringValue
     {
         private readonly JsonOperationContext _context;
         public readonly byte* Buffer;
         public readonly int UncompressedSize;
         public readonly int CompressedSize;
         public string String;
+
+        public override bool Equals(object obj)
+        {
+            if (ReferenceEquals(null, obj))
+                return false;
+            if (ReferenceEquals(this, obj))
+                return true;
+
+            switch (obj)
+            {
+                case LazyCompressedStringValue lcsv:
+                    return Equals(lcsv);
+                case LazyStringValue lsv:
+                    return lsv.Equals(ToLazyStringValue());
+                case string str:
+                    return str.Equals(ToString());
+            }
+
+            return false;
+        }
 
         /// <summary>
         /// Returns uncompressed data in form of LazyStringValue
@@ -39,8 +60,7 @@ namespace Sparrow.Json
             if (self.String != null)
                 return self.String;
 
-            AllocatedMemoryData allocated;
-            var tempBuffer = self.DecompressToTempBuffer(out allocated);
+            var tempBuffer = self.DecompressToTempBuffer(out var allocated);
 
             try
             {
@@ -55,7 +75,7 @@ namespace Sparrow.Json
             }
             finally
             {
-                if(allocated != null) //precaution
+                if (allocated != null) //precaution
                     self._context.ReturnMemory(allocated);
             }
         }
@@ -63,7 +83,7 @@ namespace Sparrow.Json
         public byte* DecompressToTempBuffer(out AllocatedMemoryData allocatedData, JsonOperationContext externalContext = null)
         {
             var sizeOfEscapePositions = GetSizeOfEscapePositions();
-            allocatedData = (externalContext??_context).GetMemory(UncompressedSize + sizeOfEscapePositions);
+            allocatedData = (externalContext ?? _context).GetMemory(UncompressedSize + sizeOfEscapePositions);
             return DecompressToBuffer(allocatedData.Address, sizeOfEscapePositions);
         }
 
@@ -119,12 +139,49 @@ namespace Sparrow.Json
 
         public override string ToString()
         {
-            return (string) this;
+            return (string)this;
         }
 
         public string Substring(int startIndex, int length)
         {
             return ToString().Substring(startIndex, length);
+        }
+
+        public override int GetHashCode()
+        {
+            if (IntPtr.Size == 4)
+                return (int)Hashing.XXHash32.CalculateInline(Buffer, CompressedSize);
+
+            return (int)Hashing.XXHash64.CalculateInline(Buffer, (ulong)CompressedSize);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public bool Equals(LazyCompressedStringValue other)
+        {
+            if (other.UncompressedSize != UncompressedSize)
+                return false;
+
+            if (other.CompressedSize == CompressedSize)
+                return Memory.Compare(Buffer, other.Buffer, CompressedSize) == 0;
+
+            AllocatedMemoryData otherAllocated = null;
+            AllocatedMemoryData allocated = null;
+
+            try
+            {
+                var otherTempBuffer = other.DecompressToTempBuffer(out otherAllocated);
+                var tempBuffer = DecompressToTempBuffer(out allocated);
+
+                return Memory.Compare(tempBuffer, otherTempBuffer, UncompressedSize) == 0;
+            }
+            finally
+            {
+                if (otherAllocated != null)
+                    other._context.ReturnMemory(otherAllocated);
+
+                if (allocated != null)
+                    _context.ReturnMemory(allocated);
+            }
         }
     }
 }

@@ -26,6 +26,7 @@ using Raven.Server.ServerWide.Commands;
 using Raven.Server.ServerWide.Context;
 using Sparrow.Json;
 using Sparrow.Json.Parsing;
+using Sparrow.Utils;
 using StudioConfiguration = Raven.Client.Documents.Operations.Configuration.StudioConfiguration;
 
 namespace Raven.Server.Web.System
@@ -72,7 +73,7 @@ namespace Raven.Server.Web.System
                         HttpContext.Response.StatusCode = (int)response.StatusCode;
                         responseString = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
 
-                        if (response.StatusCode == HttpStatusCode.InternalServerError)
+                        if ((int)response.StatusCode >= 500 && (int)response.StatusCode <= 599)
                         {
                             error = responseString;
                             errorMessage = GeneralDomainRegistrationError;
@@ -82,8 +83,11 @@ namespace Raven.Server.Web.System
                             result = JsonConvert.DeserializeObject<JObject>(responseString);
                             if (result != null)
                             {
-                                if (((JObject)result).TryGetValue("Error", out var err))
+                                if (((JObject)result).TryGetValue(nameof(ExceptionDispatcher.ExceptionSchema.Error), out var err))
                                     error = err.ToString();
+
+                                if (((JObject)result).TryGetValue(nameof(ExceptionDispatcher.ExceptionSchema.Message), out var msg))
+                                    errorMessage = msg.ToString();
                             }
                         }
                     }
@@ -307,6 +311,10 @@ namespace Raven.Server.Web.System
 
                 writer.WritePropertyName(nameof(SetupParameters.IsDocker));
                 writer.WriteBool(setupParameters.IsDocker);
+                writer.WriteComma();
+                
+                writer.WritePropertyName(nameof(SetupParameters.RunningOnMacOsx));
+                writer.WriteBool(setupParameters.RunningOnMacOsx);
 
                 writer.WriteEndObject();
             }
@@ -534,8 +542,11 @@ namespace Raven.Server.Web.System
                 {
                     settingsJson.Modifications[RavenConfiguration.GetKey(x => x.Core.FeaturesAvailability)] = FeaturesAvailability.Experimental;
                 }
-                
-                ServerStore.EnsureNotPassive(nodeTag: setupInfo.LocalNodeTag);
+
+                if (!string.IsNullOrEmpty(setupInfo.LocalNodeTag))
+                {
+                    ServerStore.EnsureNotPassive(nodeTag: setupInfo.LocalNodeTag);    
+                }
                 
                 if (setupInfo.Environment != StudioConfiguration.StudioEnvironment.None)
                 {

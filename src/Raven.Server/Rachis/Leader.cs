@@ -791,21 +791,17 @@ namespace Raven.Server.Rachis
             using (_disposerLock.StartDisposing())
             {
                 bool lockTaken = false;
-                Monitor.TryEnter(this, ref lockTaken);
+                Monitor.TryEnter(this, TimeSpan.FromSeconds(15), ref lockTaken);
                 try
                 {
                     if (lockTaken == false)
                     {
-                        //We need to wait that refresh ambassador finish
-                        if (Monitor.Wait(this, TimeSpan.FromSeconds(15)) == false)
+                        var message = $"{ToString()}: Refresh ambassador is taking the lock for 15 sec giving up on leader dispose";
+                        if (_engine.Log.IsInfoEnabled)
                         {
-                            var message = $"{ToString()}: Refresh ambassador is taking the lock for 15 sec giving up on leader dispose";
-                            if (_engine.Log.IsInfoEnabled)
-                            {
-                                _engine.Log.Info(message);
-                            }
-                            throw new TimeoutException(message);
+                            _engine.Log.Info(message);
                         }
+                        throw new TimeoutException(message);
                     }
                     if (_engine.Log.IsInfoEnabled)
                     {
@@ -1064,11 +1060,11 @@ namespace Raven.Server.Rachis
                 return;
 
             if (result is BlittableJsonReaderObject || result is BlittableJsonReaderArray)
-                throw new InvalidOperationException("You cannot return a blittable here, it is bound to the context of the state machine, and cannot leak outside");
+                throw new RachisApplyException("You cannot return a blittable here, it is bound to the context of the state machine, and cannot leak outside");
 
             if (TypeConverter.IsSupportedType(result) == false)
             {
-                throw new InvalidOperationException("We don't support type " + result.GetType().FullName + ".");
+                throw new RachisApplyException("We don't support type " + result.GetType().FullName + ".");
             }
         }
 

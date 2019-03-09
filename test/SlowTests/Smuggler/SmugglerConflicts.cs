@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using FastTests;
 using FastTests.Server.Replication;
@@ -16,12 +17,12 @@ namespace SlowTests.Smuggler
 {
     public class SmugglerConflicts : ReplicationTestBase
     {
-        private readonly string _file;
-        private readonly DocumentStore _store1, _store2;
+        private string _file;
+        private DocumentStore _store1, _store2;
 
-        public SmugglerConflicts()
+        public void Initialize([CallerMemberName] string caller = null)
         {
-            _file = Path.GetTempFileName();
+            _file = GetTempFileName();
 
             _store1 = GetDocumentStore(new Options
             {
@@ -34,7 +35,7 @@ namespace SlowTests.Smuggler
                         ResolveByCollection = new Dictionary<string, ScriptResolver>()
                     };
                 }
-            });
+            },caller: caller);
             _store2 = GetDocumentStore(new Options
             {
                 ModifyDatabaseName = s => $"{s}_store2",
@@ -46,7 +47,7 @@ namespace SlowTests.Smuggler
                         ResolveByCollection = new Dictionary<string, ScriptResolver>()
                     };
                 }
-            });
+            }, caller: caller);
         }
         public override void Dispose()
         {
@@ -59,9 +60,11 @@ namespace SlowTests.Smuggler
         [Fact]
         public async Task CanExportAndImportWithConflicts_ToTheSameDatabase()
         {
+            Initialize();
             await GenerateConflict(_store1, _store2);
 
-            await _store1.Smuggler.ExportAsync(new DatabaseSmugglerExportOptions(), _file);
+            var operation = await _store1.Smuggler.ExportAsync(new DatabaseSmugglerExportOptions(), _file);
+            await operation.WaitForCompletionAsync(TimeSpan.FromMinutes(1));
 
             await AssertImport(_store1);
         }
@@ -69,9 +72,11 @@ namespace SlowTests.Smuggler
         [Fact]
         public async Task CanExportAndImportWithConflicts_ToNewDatabase()
         {
+            Initialize();
             await GenerateConflict(_store1, _store2);
 
-            await _store1.Smuggler.ExportAsync(new DatabaseSmugglerExportOptions(), _file);
+            var operation = await _store1.Smuggler.ExportAsync(new DatabaseSmugglerExportOptions(), _file);
+            await operation.WaitForCompletionAsync(TimeSpan.FromMinutes(1));
 
             using (var store3 = GetDocumentStore(new Options
             {
@@ -85,9 +90,11 @@ namespace SlowTests.Smuggler
         [Fact]
         public async Task ToDatabaseWithSameDocumentWithoutConflicts_DeleteTheDocumentAndGenerateTheSameConflicts()
         {
+            Initialize();
             await GenerateConflict(_store1, _store2);
 
-            await _store1.Smuggler.ExportAsync(new DatabaseSmugglerExportOptions(), _file);
+            var operation = await _store1.Smuggler.ExportAsync(new DatabaseSmugglerExportOptions(), _file);
+            await operation.WaitForCompletionAsync(TimeSpan.FromMinutes(1));
 
             using (var store3 = GetDocumentStore(new Options
             {
@@ -110,9 +117,11 @@ namespace SlowTests.Smuggler
         [Fact]
         public async Task CanExportAndImportWithConflicts_ToDatabaseWithDifferentDocument_DeleteTheDocumentWithoutCreatingConflictForIt()
         {
+            Initialize();
             await GenerateConflict(_store1, _store2);
 
-            await _store1.Smuggler.ExportAsync(new DatabaseSmugglerExportOptions(), _file);
+            var operation = await _store1.Smuggler.ExportAsync(new DatabaseSmugglerExportOptions(), _file);
+            await operation.WaitForCompletionAsync(TimeSpan.FromMinutes(1));
 
             using (var session = _store2.OpenAsyncSession())
             {
@@ -128,9 +137,11 @@ namespace SlowTests.Smuggler
         [Fact]
         public async Task ToDatabaseWithDifferentConflicts_AndTheImportedConflictsInAdditionToTheExistingConflicts()
         {
+            Initialize();
             await GenerateConflict(_store1, _store2);
 
-            await _store1.Smuggler.ExportAsync(new DatabaseSmugglerExportOptions(), _file);
+            var operation = await _store1.Smuggler.ExportAsync(new DatabaseSmugglerExportOptions(), _file);
+            await operation.WaitForCompletionAsync(TimeSpan.FromMinutes(1));
 
             using (var store3 = GetDocumentStore(new Options
             {
@@ -295,7 +306,8 @@ namespace SlowTests.Smuggler
         {
             for (int i = 0; i < 3; i++)
             {
-                await store.Smuggler.ImportAsync(new DatabaseSmugglerImportOptions(), _file);
+                var operation = await store.Smuggler.ImportAsync(new DatabaseSmugglerImportOptions(), _file);
+                await operation.WaitForCompletionAsync(TimeSpan.FromMinutes(1));
 
                 var stats = await store.Maintenance.SendAsync(new GetStatisticsOperation());
                 Assert.Equal(3, stats.CountOfDocuments);
@@ -320,7 +332,8 @@ namespace SlowTests.Smuggler
         {
             for (int i = 0; i < 3; i++)
             {
-                await store.Smuggler.ImportAsync(new DatabaseSmugglerImportOptions(), _file);
+                var operation = await store.Smuggler.ImportAsync(new DatabaseSmugglerImportOptions(), _file);
+                await operation.WaitForCompletionAsync(TimeSpan.FromMinutes(1));
 
                 var stats = await store.Maintenance.SendAsync(new GetStatisticsOperation());
                 Assert.Equal(3, stats.CountOfDocuments);

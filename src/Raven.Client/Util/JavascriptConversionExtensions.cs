@@ -217,7 +217,7 @@ namespace Raven.Client.Util
                 }
 
                 // Now we translate the memberExpression
-                if (_innerCallExpected != default
+                else if (_innerCallExpected != default
                     && _innerCallExpected != DictionaryInnerCall.Map
                     && typeof(IDictionary).IsAssignableFrom(context.Node.Type))
                 {
@@ -280,14 +280,22 @@ namespace Raven.Client.Util
         public class LinqMethodsSupport : JavascriptConversionExtension
         {
             public static readonly LinqMethodsSupport Instance = new LinqMethodsSupport();
-
+            private static HashSet<Type> _numericTypes = new HashSet<Type>
+            {
+                typeof(decimal), typeof(byte), typeof(sbyte),
+                typeof(short), typeof(ushort), typeof(uint),
+                typeof(int), typeof(long), typeof(ulong),
+                typeof(double), typeof(float)
+            };
             private LinqMethodsSupport()
             {
             }
 
             public override void ConvertToJavascript(JavascriptConversionContext context)
             {
-                if (context.Node is MemberExpression node && node.Member.Name == "Count" && IsCollection(node.Member.DeclaringType))
+                if (context.Node is MemberExpression node && 
+                    node.Member.Name == "Count" && 
+                    IsCollection(node.Member.DeclaringType))
                 {
                     HandleCount(context, node.Expression);
                     return;
@@ -299,7 +307,7 @@ namespace Raven.Client.Util
                     return;
 
                 var methodName = method.Name;
-                if (methodName == null || IsCollection(methodCallExpression.Method.DeclaringType) == false)
+                if (IsCollection(methodCallExpression.Method.DeclaringType) == false)
                     return;
 
                 string newName;
@@ -606,8 +614,36 @@ namespace Raven.Client.Util
                             }
                         }
                     case "Count":
-                        HandleCount(context, methodCallExpression.Arguments[0]);
+                    {
+                        context.PreventDefault();
+                        context.Visitor.Visit(methodCallExpression.Arguments[0]);
+                        var writer = context.GetWriter();
+                        using (writer.Operation(methodCallExpression))
+                        {
+                            if (methodCallExpression.Arguments.Count > 1)
+                            {
+                                writer.Write(".filter");
+                                context.Visitor.Visit(methodCallExpression.Arguments[1]);
+                            }
+
+                            writer.Write(".length");
+                            return;
+                        }
+                    }
+                    case "OrderBy":
+                    {
+                        OrderByToSort(context, methodCallExpression);
                         return;
+                    }
+                    case "OrderByDescending":
+                    {
+                        OrderByToSort(context, methodCallExpression, true);
+                        return;
+                    }
+                    case "ContainsKey":
+                    {
+                        return;
+                    }
                     default:
                         throw new NotSupportedException($"Unable to translate '{methodName}' to RQL operation because this method is not familiar to the RavenDB query provider.")
                         {
@@ -653,6 +689,57 @@ namespace Raven.Client.Util
                 if (methodName == "Contains")
                 {
                     javascriptWriter.Write(">=0");
+                }
+            }
+
+            private static void OrderByToSort(JavascriptConversionContext context, MethodCallExpression methodCallExpression, bool desc = false)
+            {
+                context.PreventDefault();
+                context.Visitor.Visit(methodCallExpression.Arguments[0]);
+                var writer = context.GetWriter();
+                using (writer.Operation(methodCallExpression))
+                {
+                    string path = null;
+                    var isNumber = false;
+                    if (methodCallExpression.Arguments.Count == 2 &&
+                        methodCallExpression.Arguments[1] is LambdaExpression lambda &&
+                        lambda.Body is MemberExpression memberExpression)
+                    {
+                        path = memberExpression.Member.Name;
+
+                        if (memberExpression.Expression is ParameterExpression == false)
+                        {
+                            GetInnermostExpression(memberExpression, out var nestedPath);
+                            if (nestedPath != string.Empty)
+                            {
+                                path = $"{nestedPath}.{path}";
+                            }
+                        }
+
+                        isNumber = _numericTypes.Contains(memberExpression.Type);
+                    }
+
+                    writer.Write(".sort(");
+                    if (path != null)
+                    {
+                        writer.Write("function (a, b){ return ");
+
+                        if (isNumber)
+                        {
+                            writer.Write(desc
+                                ? $"b.{path} - a.{path}"
+                                : $"a.{path} - b.{path}");
+                        }
+                        else
+                        {
+                            writer.Write(desc
+                                ? $"((a.{path} < b.{path}) ? 1 : (a.{path} > b.{path})? -1 : 0)"
+                                : $"((a.{path} < b.{path}) ? -1 : (a.{path} > b.{path})? 1 : 0)");
+                        }
+                        writer.Write(";}");
+
+                    }
+                    writer.Write(")");
                 }
             }
 
@@ -733,12 +820,45 @@ namespace Raven.Client.Util
 
             public override void ConvertToJavascript(JavascriptConversionContext context)
             {
-                if (context.Node is MemberExpression memberExpression &&
-                    memberExpression.Member.Name == "Value" &&
-                    memberExpression.Expression.Type.IsNullableType())
+                if (context.Node is BinaryExpression binaryExpression &&
+                    (binaryExpression.NodeType == ExpressionType.GreaterThanOrEqual ||
+                     binaryExpression.NodeType == ExpressionType.LessThanOrEqual) &&
+                    (binaryExpression.Left.Type.IsNullableType() ||
+                     binaryExpression.Right.Type.IsNullableType()))
+                {
+                    // RavenDB-12359
+                    // In order to avoid null >= 0  (and null<=0)
+                    // we translate x>=y  to x>y||x===y 
+                    //https://blog.campvanilla.com/javascript-the-curious-case-of-null-0-7b131644e274
+
+                    var expr = Expression.OrElse(binaryExpression.NodeType == ExpressionType.GreaterThanOrEqual
+                            ? Expression.GreaterThan(binaryExpression.Left, binaryExpression.Right)
+                            : Expression.LessThan(binaryExpression.Left, binaryExpression.Right), 
+                        Expression.Equal(binaryExpression.Left, binaryExpression.Right));
+                    context.PreventDefault();
+                    context.Visitor.Visit(expr);
+                    return;
+                }   
+
+
+                if (!(context.Node is MemberExpression memberExpression) || 
+                    memberExpression.Expression.Type.IsNullableType() == false)
+                    return;
+
+                if (memberExpression.Member.Name == "Value")
                 {
                     context.PreventDefault();
                     context.Visitor.Visit(memberExpression.Expression);
+                }
+                else if (memberExpression.Member.Name == "HasValue")
+                {
+                    context.PreventDefault();
+                    var writer = context.GetWriter();
+                    using (writer.Operation(memberExpression))
+                    {
+                        context.Visitor.Visit(memberExpression.Expression);
+                        writer.Write(" != null");
+                    }
                 }
 
             }
@@ -968,11 +1088,14 @@ namespace Raven.Client.Util
         {
             private readonly IAbstractDocumentQuery<T> _documentQuery;
             private readonly List<string> _projectionParameters;
+            private readonly DateTimeSupport _dateTimeSupportExtension;
 
-            public WrappedConstantSupport(IAbstractDocumentQuery<T> documentQuery, List<string> projectionParameters)
+
+            public WrappedConstantSupport(IAbstractDocumentQuery<T> documentQuery, List<string> projectionParameters, DateTimeSupport dateTimeSupportExtension)
             {
                 _documentQuery = documentQuery;
                 _projectionParameters = projectionParameters;
+                _dateTimeSupportExtension = dateTimeSupportExtension;
             }
 
             private static bool IsWrappedConstantExpression(Expression expression)
@@ -1000,16 +1123,10 @@ namespace Raven.Client.Util
 
                 using (writer.Operation(memberExpression))
                 {
-                    if (memberExpression.Type == typeof(DateTime))
-                    {
-                        writer.Write("new Date(Date.parse(");
-                        writer.Write(parameter);
-                        writer.Write("))");
-                    }
-                    else
-                    {                        
-                        writer.Write(parameter);
-                    }
+                    writer.Write(memberExpression.Type == typeof(DateTime) &&
+                                 _dateTimeSupportExtension.InsideBinaryOperationOnDates
+                        ? $"new Date(Date.parse({parameter}))"
+                        : parameter);
                 }
             }
         }
@@ -1299,11 +1416,7 @@ namespace Raven.Client.Util
 
         public class DateTimeSupport : JavascriptConversionExtension
         {
-            public static readonly DateTimeSupport Instance = new DateTimeSupport();
-
-            private DateTimeSupport()
-            {
-            }
+            public bool InsideBinaryOperationOnDates;
 
             public override void ConvertToJavascript(JavascriptConversionContext context)
             {
@@ -1338,22 +1451,64 @@ namespace Raven.Client.Util
                     return;
                 }
 
+                if (context.Node is BinaryExpression binaryExpression &&
+                    binaryExpression.Left.Type == typeof(DateTime))
+                {
+                    InsideBinaryOperationOnDates = true;
+
+                    var writer = context.GetWriter();
+                    context.PreventDefault();
+
+                    if (context.Node.Type == typeof(TimeSpan) && 
+                        context.Node.NodeType == ExpressionType.Subtract)
+                    {
+                        using (writer.Operation(context.Node))
+                        {
+                            writer.Write("convertJsTimeToTimeSpanString(");
+
+                            context.Visitor.Visit(binaryExpression.Left);
+                            writer.Write("-");
+
+                            context.Visitor.Visit(binaryExpression.Right);
+
+                            writer.Write(")");
+
+                        }
+
+                        InsideBinaryOperationOnDates = false;
+                        return;
+                    }
+
+                    using (writer.Operation(context.Node))
+                    {
+                        context.Visitor.Visit(binaryExpression.Left);
+                        writer.WriteOperator(binaryExpression.NodeType, binaryExpression.Type);
+                        context.Visitor.Visit(binaryExpression.Right);
+                    }
+
+                    InsideBinaryOperationOnDates = false;
+                    return;                   
+                }
+
                 if (!(context.Node is MemberExpression node))
                     return;
 
-                if (node.Type == typeof(DateTime))
+                if (node.Type == typeof(DateTime) && 
+                    (node.Expression == null || InsideBinaryOperationOnDates))
                 {
                     var writer = context.GetWriter();
                     context.PreventDefault();
 
                     using (writer.Operation(node))
                     {
-                        //match DateTime expressions like user.DateOfBirth, order.ShipmentInfo.DeliveryDate, etc
                         if (node.Expression != null)
                         {
+                            //inside a binary operation on dates, translate to JS date object
+
                             writer.Write("new Date(Date.parse(");
-                            context.Visitor.Visit(node.Expression); //visit inner expression (user ,order.ShipmentInfo, etc)
+                            context.Visitor.Visit(node.Expression);
                             writer.Write($".{node.Member.Name}))");
+
                             return;
                         }
 
@@ -1661,10 +1816,12 @@ namespace Raven.Client.Util
                     binaryExpression.Left, 
                     Expression.Convert(binaryExpression.Right, binaryExpression.Left.Type));
 
+                var writer = context.GetWriter();
+                writer.Write('(');
                 context.Visitor.Visit(condition);
+                writer.Write(')');
             }
         }
-
 
         public class ListInitSupport : JavascriptConversionExtension
         {
@@ -1870,7 +2027,6 @@ namespace Raven.Client.Util
             }
 
         }
-
 
         public class NullComparisonSupport : JavascriptConversionExtension
         {
@@ -2191,40 +2347,53 @@ namespace Raven.Client.Util
 
             public override void ConvertToJavascript(JavascriptConversionContext context)
             {
-                if (!(context.Node is MemberExpression member))
+                if (CanConvert(context.Node, _conventions, out var alias, out var member) == false)
                     return;
+
+                var writer = context.GetWriter();
+                context.PreventDefault();
+
+                using (writer.Operation(member))
+                {
+                    writer.Write($"id({alias})");
+                }
+            }
+
+            internal static bool CanConvert(Expression expression, DocumentConventions conventions, out string aliasName)
+            {
+                return CanConvert(expression, conventions, out aliasName, out _);
+            }
+
+            private static bool CanConvert(Expression expression, DocumentConventions conventions, out string aliasName, out MemberExpression memberExpression)
+            {
+                aliasName = null;
+                memberExpression = null;
+
+                if (!(expression is MemberExpression member))
+                    return false;
+
+                memberExpression = member;
 
                 if (member.Expression is ParameterExpression parameter
-                    && _conventions.GetIdentityProperty(member.Member.DeclaringType) == member.Member)
+                    && conventions.GetIdentityProperty(member.Member.DeclaringType) == member.Member)
                 {
-                    var writer = context.GetWriter();
-                    context.PreventDefault();
-
-                    using (writer.Operation(member))
-                    {
-                        writer.Write($"id({parameter.Name})");
-                    }
-                    return;
+                    aliasName = parameter.Name;
+                    return true;
                 }
 
                 if (!(member.Expression is MemberExpression innerMember))
-                    return;
+                    return false;
 
                 var p = GetParameter(innerMember)?.Name;
 
                 if (p != null && p.StartsWith(TransparentIdentifier)
-                    && _conventions.GetIdentityProperty(member.Member.DeclaringType) == member.Member)
+                              && conventions.GetIdentityProperty(member.Member.DeclaringType) == member.Member)
                 {
-                    var writer = context.GetWriter();
-                    context.PreventDefault();
-
-                    using (writer.Operation(member))
-                    {
-                        writer.Write("id(");
-                        context.Visitor.Visit(innerMember);
-                        writer.Write(")");
-                    }
+                    aliasName = innerMember.Member.Name;
+                    return true;
                 }
+
+                return false;
             }
         }
 

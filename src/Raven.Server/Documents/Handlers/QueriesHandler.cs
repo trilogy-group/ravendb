@@ -1,4 +1,5 @@
 ﻿using System;
+using System.IO;
 using System.Net;
 using System.Net.Http;
 using System.Text;
@@ -43,17 +44,43 @@ namespace Raven.Server.Documents.Handlers
         public async Task HandleQuery(HttpMethod httpMethod)
         {
             using (var tracker = new RequestTimeTracker(HttpContext, Logger, Database, "Query"))
-            using (var token = CreateTimeLimitedQueryToken())
-            using (Database.DocumentsStorage.ContextPool.AllocateOperationContext(out DocumentsOperationContext context))
             {
-                var debug = GetStringQueryString("debug", required: false);
-                if (string.IsNullOrWhiteSpace(debug) == false)
+                try
                 {
-                    await Debug(context, debug, token, tracker, httpMethod);
-                    return;
-                }
+                    using (var token = CreateTimeLimitedQueryToken())
+                    using (Database.DocumentsStorage.ContextPool.AllocateOperationContext(out DocumentsOperationContext context))
+                    {
+                        var debug = GetStringQueryString("debug", required: false);
+                        if (string.IsNullOrWhiteSpace(debug) == false)
+                        {
+                            await Debug(context, debug, token, tracker, httpMethod);
+                            return;
+                        }
 
-                await Query(context, token, tracker, httpMethod);
+                        await Query(context, token, tracker, httpMethod);
+                    }
+                }
+                catch (Exception e)
+                {
+                    if (tracker.Query == null)
+                    {
+                        string errorMessage;
+                        if (e is EndOfStreamException || e is ArgumentException)
+                        {
+                            errorMessage = "Failed: " + e.Message;
+                        }
+                        else
+                        {
+                            errorMessage = "Failed: " +
+                                           HttpContext.Request.Path.Value +
+                                           e.ToString();
+                        }
+                        tracker.Query = errorMessage;
+                        if (TrafficWatchManager.HasRegisteredClients)
+                            AddStringToHttpContext(errorMessage, TrafficWatchChangeType.Queries);
+                    }
+                    throw;
+                }
             }
         }
 
@@ -83,8 +110,8 @@ namespace Raven.Server.Documents.Handlers
 
         private async Task Query(DocumentsOperationContext context, OperationCancelToken token, RequestTimeTracker tracker, HttpMethod method)
         {
-            var indexQuery = await GetIndexQuery(context, method);
-            tracker.Query = indexQuery.Query;
+            var indexQuery = await GetIndexQuery(context, method, tracker);
+
             if (TrafficWatchManager.HasRegisteredClients)
                 TrafficWatchQuery(indexQuery);
 
@@ -135,14 +162,14 @@ namespace Raven.Server.Documents.Handlers
             AddPagingPerformanceHint(PagingOperationType.Queries, $"{nameof(Query)} ({result.IndexName})", indexQuery.Query, numberOfResults, indexQuery.PageSize, result.DurationInMs);
         }
 
-        private async Task<IndexQueryServerSide> GetIndexQuery(JsonOperationContext context, HttpMethod method)
+        private async Task<IndexQueryServerSide> GetIndexQuery(JsonOperationContext context, HttpMethod method, RequestTimeTracker tracker)
         {
             if (method == HttpMethod.Get)
-                return IndexQueryServerSide.Create(HttpContext, GetStart(), GetPageSize(), context);
+                return IndexQueryServerSide.Create(HttpContext, GetStart(), GetPageSize(), context, tracker);
 
             var json = await context.ReadForMemoryAsync(RequestBodyStream(), "index/query");
 
-            return IndexQueryServerSide.Create(json, Database.QueryMetadataCache);
+            return IndexQueryServerSide.Create(HttpContext, json, Database.QueryMetadataCache, tracker);
         }
 
         private async Task SuggestQuery(IndexQueryServerSide indexQuery, DocumentsOperationContext context, OperationCancelToken token)
@@ -169,9 +196,7 @@ namespace Raven.Server.Documents.Handlers
 
         private async Task Explain(DocumentsOperationContext context, RequestTimeTracker tracker, HttpMethod method)
         {
-            var indexQuery = await GetIndexQuery(context, method);
-
-            tracker.Query = indexQuery.Query;
+            var indexQuery = await GetIndexQuery(context, method, tracker);
 
             var explanations = Database.QueryRunner.ExplainDynamicIndexSelection(indexQuery, context, out string indexName);
 
@@ -201,9 +226,7 @@ namespace Raven.Server.Documents.Handlers
                 using (var tracker = new RequestTimeTracker(HttpContext, Logger, Database, "DeleteByQuery"))
                 {
                     var reader = context.Read(RequestBodyStream(), "queries/delete");
-                    var query = IndexQueryServerSide.Create(reader, Database.QueryMetadataCache);
-
-                    tracker.Query = query.Query;
+                    var query = IndexQueryServerSide.Create(HttpContext, reader, Database.QueryMetadataCache, tracker);
 
                     if (TrafficWatchManager.HasRegisteredClients)
                         TrafficWatchQuery(query);
@@ -233,7 +256,7 @@ namespace Raven.Server.Documents.Handlers
                 if (reader.TryGet("Query", out BlittableJsonReaderObject queryJson) == false || queryJson == null)
                     throw new BadRequestException("Missing 'Query' property.");
 
-                var query = IndexQueryServerSide.Create(queryJson, Database.QueryMetadataCache, QueryType.Update);
+                var query = IndexQueryServerSide.Create(HttpContext, queryJson, Database.QueryMetadataCache, null, QueryType.Update);
 
                 if (TrafficWatchManager.HasRegisteredClients)
                     TrafficWatchQuery(query);
@@ -250,7 +273,8 @@ namespace Raven.Server.Documents.Handlers
                     database: context.DocumentDatabase,
                     debugMode: true,
                     isTest: true,
-                    collectResultsNeeded: true);
+                    collectResultsNeeded: true,
+                    returnDocument: false);
 
                 using (context.OpenWriteTransaction())
                 {
@@ -306,7 +330,7 @@ namespace Raven.Server.Documents.Handlers
                 context.Write(writer, new DynamicJsonValue
                 {
                     ["Info"] = new DynamicJsonArray(command.DebugOutput),
-                    ["Actions"] = command.DebugActions?.GetDebugActions()
+                    ["Actions"] = command.DebugActions
                 });
 
                 writer.WriteEndObject();
@@ -326,7 +350,7 @@ namespace Raven.Server.Documents.Handlers
                 if (reader.TryGet("Query", out BlittableJsonReaderObject queryJson) == false || queryJson == null)
                     throw new BadRequestException("Missing 'Query' property.");
 
-                var query = IndexQueryServerSide.Create(queryJson, Database.QueryMetadataCache, QueryType.Update);
+                var query = IndexQueryServerSide.Create(HttpContext, queryJson, Database.QueryMetadataCache, null, QueryType.Update);
 
                 if (TrafficWatchManager.HasRegisteredClients)
                     TrafficWatchQuery(query);
@@ -418,8 +442,7 @@ namespace Raven.Server.Documents.Handlers
 
         private async Task IndexEntries(DocumentsOperationContext context, OperationCancelToken token, RequestTimeTracker tracker, HttpMethod method)
         {
-            var indexQuery = await GetIndexQuery(context, method);
-            tracker.Query = indexQuery.Query;
+            var indexQuery = await GetIndexQuery(context, method, tracker);
             var existingResultEtag = GetLongFromHeaders("If-None-Match");
 
             var result = await Database.QueryRunner.ExecuteIndexEntriesQuery(indexQuery, context, existingResultEtag, token);

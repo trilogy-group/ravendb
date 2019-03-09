@@ -1,6 +1,5 @@
 ﻿using System;
-using System.Collections.Generic;
-using System.Linq;
+using System.IO;
 using System.Text;
 using Raven.Server.Json;
 using Sparrow.Json;
@@ -58,8 +57,7 @@ namespace FastTests.Server.Documents.Indexing.Lucene
             
             for (int i = 0; i < 10; i++)
             {
-                var bytes = new byte[r.Next(1, 2000)];
-                r.NextBytes(bytes);
+                var bytes = RandomString(2000);
 
                 var expected = Encoding.UTF8.GetString(bytes);
 
@@ -72,9 +70,52 @@ namespace FastTests.Server.Documents.Indexing.Lucene
                 Assert.Equal(expected, readerResult.ReadToEnd());
                 _ctx.ReturnMemory(lazyString.AllocatedMemoryData);
             }
-            
         }
 
+        [Fact]
+        public void CompareLazyCompressedStringValue()
+        {
+            using (var context = JsonOperationContext.ShortTermSingleUse())
+            using (var ms = new MemoryStream())
+            using (var writer = new BlittableJsonTextWriter(context, ms))
+            {
+                writer.WriteStartObject();
+                writer.WritePropertyName("Test");
+                writer.WriteString(new string('c', 1024 * 1024));
+                writer.WriteEndObject();
+                writer.Flush();
+                ms.Flush();
+
+                ms.Position = 0;
+                var json = context.Read(ms, "test");
+
+                ms.Position = 0;
+                var json2 = context.Read(ms, "test");
+
+                Assert.IsType<LazyCompressedStringValue>(json["Test"]);
+                Assert.IsType<LazyCompressedStringValue>(json2["Test"]);
+                Assert.Equal(json["Test"], json2["Test"]);
+            }
+        }
+
+        public byte[] RandomString(int length)
+        {
+            Random random = new Random();
+            var charLength = random.Next(1, 2000);
+            var actualSize = charLength;
+            StringBuilder str = new StringBuilder(length);
+            while (charLength > 0)
+            {
+                char c = (char)random.Next(char.MinValue, char.MaxValue);
+                if (c >= 0xD800 && c <= 0xDFFF || c >= 0xE000)
+                    continue;
+                if (c < 32)
+                    c += (char)32;
+                str.Append(c);
+                charLength--;
+            }
+            return Encoding.UTF8.GetBytes(str.ToString());
+        }
 
         public override void Dispose()
         {

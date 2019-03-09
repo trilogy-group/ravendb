@@ -16,8 +16,6 @@ namespace Sparrow.Utils
 {
     public static unsafe class NativeMemory
     {
-        private static float _minimumFreeCommittedMemory = 0.05f;
-
         private static readonly ThreadLocal<ThreadStats> ThreadAllocations = new ThreadLocal<ThreadStats>(
             () => new ThreadStats(), trackAllValues: true);
 
@@ -32,11 +30,6 @@ namespace Sparrow.Utils
 
         public static ConcurrentDictionary<string, Lazy<FileMappingInfo>> FileMapping = new ConcurrentDictionary<string, Lazy<FileMappingInfo>>();
 
-        public static void SetMinimumFreeCommittedMemory(float min)
-        {
-            _minimumFreeCommittedMemory = min;
-        }
-
         public class ThreadStats
         {
             public int Id;
@@ -48,6 +41,8 @@ namespace Sparrow.Utils
             public string Name => _threadInstance?.Name ?? _lastName;
 
             public long TotalAllocated => Allocations - ReleasesFromOtherThreads;
+
+            public long CurrentlyAllocatedForProcessing;
 
             public bool IsThreadAlive()
             {
@@ -111,7 +106,7 @@ namespace Sparrow.Utils
             // fun, so let's try to avoid it explicitly.
             // This is not expected to be called frequently, since we are caching the memory used here
 
-            MemoryInformation.AssertNotAboutToRunOutOfMemory(_minimumFreeCommittedMemory);
+            MemoryInformation.AssertNotAboutToRunOutOfMemory();
 
             try
             {
@@ -127,7 +122,19 @@ namespace Sparrow.Utils
         
         private static byte* ThrowFailedToAllocate(long size, ThreadStats thread, OutOfMemoryException e)
         {
-            throw new OutOfMemoryException($"Failed to allocate additional {new Size(size, SizeUnit.Bytes)} to already allocated {new Size(thread.Allocations, SizeUnit.Bytes)}", e);
+            long allocated = 0;
+            foreach (var threadAllocationsValue in AllThreadStats)
+            {
+                allocated += threadAllocationsValue.TotalAllocated;
+            }
+
+            var managed = MemoryInformation.GetManagedMemoryInBytes();
+            var unmanagedMemory = MemoryInformation.GetUnManagedAllocationsInBytes();
+            throw new OutOfMemoryException($"Failed to allocate additional {new Size(size, SizeUnit.Bytes)} " +
+                                           $"to already allocated {new Size(thread.TotalAllocated, SizeUnit.Bytes)} by this thread. " +
+                                           $"Total allocated by all threads: {new Size(allocated, SizeUnit.Bytes)}, " +
+                                           $"Managed memory: {new Size(managed, SizeUnit.Bytes)}, " +
+                                           $"Un-managed memory: {new Size(unmanagedMemory, SizeUnit.Bytes)}", e);
         }
 
         private static void FixupReleasesFromOtherThreads(ThreadStats thread)

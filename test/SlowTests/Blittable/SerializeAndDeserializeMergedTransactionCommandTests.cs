@@ -60,7 +60,6 @@ namespace SlowTests.Blittable
                 var fromStream = SerializeTestHelper.SimulateSavingToFileAndLoading(context, blitCommand);
 
                 //Deserialize
-                ResolveConflictOnReplicationConfigurationChange.PutResolvedConflictsCommand actual;
                 using (var reader = new BlittableJsonReader(context))
                 {
                     reader.Init(fromStream);
@@ -233,7 +232,7 @@ namespace SlowTests.Blittable
                     (patchRequest, arg),
                     (null, null),
                     database,
-                    false, false, false);
+                    false, false, false, false);
 
                 //Action
                 var jsonSerializer = GetJsonSerializer();

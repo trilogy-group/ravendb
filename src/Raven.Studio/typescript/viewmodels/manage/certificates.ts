@@ -19,6 +19,8 @@ import messagePublisher = require("common/messagePublisher");
 import eventsCollector = require("common/eventsCollector");
 import changesContext = require("common/changesContext");
 import accessManager = require("common/shell/accessManager");
+import getServerCertificateRenewalDateCommand = require("commands/auth/getServerCertificateRenewalDateCommand");
+import generalUtils = require("common/generalUtils");
 
 interface unifiedCertificateDefinitionWithCache extends unifiedCertificateDefinition {
     expirationClass: string;
@@ -42,6 +44,7 @@ class certificates extends viewModelBase {
     certificates = ko.observableArray<unifiedCertificateDefinition>();
     serverCertificateThumbprint = ko.observable<string>();
     serverCertificateSetupMode = ko.observable<Raven.Server.Commercial.SetupMode>();
+    serverCertificateRenewalDate = ko.observable<string>();
     wellKnownAdminCerts = ko.observableArray<string>([]);
     wellKnownAdminCertsVisible = ko.observable<boolean>(false);
     
@@ -72,7 +75,7 @@ class certificates extends viewModelBase {
 
         this.bindToCurrentInstance("onCloseEdit", "save", "enterEditCertificateMode", 
             "deletePermission", "addNewPermission", "fileSelected", "copyThumbprint",
-            "useDatabase", "deleteCertificate", "renewServerCertificate", "showRenewCertificateButton");
+            "useDatabase", "deleteCertificate", "renewServerCertificate", "canBeAutomaticallyRenewed");
         this.initObservables();
         this.initValidation();
         
@@ -86,7 +89,11 @@ class certificates extends viewModelBase {
         return new getServerCertificateSetupModeCommand()
             .execute()
             .done((setupMode: Raven.Server.Commercial.SetupMode) => {
-                this.serverCertificateSetupMode(setupMode); 
+                this.serverCertificateSetupMode(setupMode);
+                
+                if (setupMode === "LetsEncrypt") {
+                    this.fetchRenewalDate();
+                }
              });
     }
     
@@ -178,15 +185,32 @@ class certificates extends viewModelBase {
         });
     }    
     
-    showRenewCertificateButton(thumbprints: string[]) {
+    private fetchRenewalDate() {
+        return new getServerCertificateRenewalDateCommand()
+            .execute()
+            .done(dateAsString => {
+                const date = moment.utc(dateAsString);
+                const dateFormatted = date.format("YYYY-MM-DD");
+                this.serverCertificateRenewalDate(dateFormatted);
+            })
+    }
+    
+    canBeAutomaticallyRenewed(thumbprints: string[]) {
         return ko.pureComputed(() => {
             return _.includes(thumbprints, this.serverCertificateThumbprint()) && this.serverCertificateSetupMode() === 'LetsEncrypt';
         });
     }
     
     renewServerCertificate() {
-        return new forceRenewServerCertificateCommand()
-            .execute();
+        this.confirmationMessage("Server certificate renewal", "Do you want to renew the server certificate?", {
+            buttons: ["No", "Yes, renew"]
+        })
+            .done(result => {
+                if (result.can) {
+                    new forceRenewServerCertificateCommand()
+                        .execute();
+                }
+            });
     }
     
     enterEditCertificateMode(itemToEdit: unifiedCertificateDefinition) {
@@ -195,7 +219,10 @@ class certificates extends viewModelBase {
     }
 
     deleteCertificate(certificate: Raven.Client.ServerWide.Operations.Certificates.CertificateDefinition) {
-        this.confirmationMessage("Are you sure?", "Do you want to delete certificate with thumbprint: " + certificate.Thumbprint + "", ["No", "Yes, delete"])
+        this.confirmationMessage("Are you sure?", "Do you want to delete certificate with thumbprint: " + generalUtils.escapeHtml(certificate.Thumbprint) + "", {
+            buttons: ["No", "Yes, delete"],
+            html: true
+        })
             .done(result => {
                 if (result.can) {
                     eventsCollector.default.reportEvent("certificates", "delete");
@@ -268,8 +295,10 @@ class certificates extends viewModelBase {
         if (this.model().mode() !== "replace" && model.securityClearance() === "ValidUser" && model.permissions().length === 0) {
             this.confirmationMessage("Did you forget about assigning database privileges?",
             "Leaving the database privileges section empty is going to prevent users from accessing the database.",
-            ["I want to assign privileges", "Save anyway"],
-                true)
+                {
+                    buttons: ["I want to assign privileges", "Save anyway"],
+                    forceRejectWithResolve: true
+                })
             .done(result => {
                 if (result.can) {
                     maybeWarnTask.resolve();
@@ -390,11 +419,11 @@ class certificates extends viewModelBase {
                 cert.expirationIcon = "icon-danger";
                 cert.expirationClass = "text-danger"
             } else if (date.isAfter(nowPlusMonth)) {
-                cert.expirationText = "Expiring " +  dateFormatted;
+                cert.expirationText = dateFormatted;
                 cert.expirationIcon =  "icon-clock";
                 cert.expirationClass = "";
             } else {
-                cert.expirationText = "Expiring " + dateFormatted;
+                cert.expirationText = dateFormatted;
                 cert.expirationIcon =  "icon-warning";
                 cert.expirationClass = "text-warning";
             }

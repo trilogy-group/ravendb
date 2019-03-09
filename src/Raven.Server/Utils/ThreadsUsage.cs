@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using Raven.Server.Dashboard;
+using Raven.Server.Utils.Cpu;
 using Sparrow.Logging;
 using Sparrow.Utils;
 
@@ -18,7 +19,12 @@ namespace Raven.Server.Utils
         {
             using (var process = Process.GetCurrentProcess())
             {
-                _processTimes = CpuUsage.GetProcessTimes(process);
+                foreach (var thread in GetProcessThreads(process))
+                {
+                    _threadTimesInfo[thread.Id] = thread.TotalProcessorTime.Ticks;
+                }
+
+                _processTimes = CpuHelper.GetProcessTimes(process);
             }
         }
 
@@ -32,12 +38,13 @@ namespace Raven.Server.Utils
 
             using (var process = Process.GetCurrentProcess())
             {
+                var processThreads = GetProcessThreads(process);
                 var previousProcessTimes = _processTimes;
-                _processTimes = CpuUsage.GetProcessTimes(process);
+                _processTimes = CpuHelper.GetProcessTimes(process);
 
                 var processorTimeDiff = _processTimes.TotalProcessorTimeTicks - previousProcessTimes.TotalProcessorTimeTicks;
                 var timeDiff = _processTimes.TimeTicks - previousProcessTimes.TimeTicks;
-                var activeCores = CpuUsage.GetNumberOfActiveCores(process);
+                var activeCores = CpuHelper.GetNumberOfActiveCores(process);
                 threadsInfo.ActiveCores = activeCores;
 
                 if (timeDiff == 0 || activeCores == 0)
@@ -48,7 +55,7 @@ namespace Raven.Server.Utils
 
                 var threadTimesInfo = new Dictionary<int, long>();
                 double totalCpuUsage = 0;
-                foreach (var thread in GetProcessThreads(process))
+                foreach (var thread in processThreads)
                 {
                     try
                     {
@@ -78,9 +85,13 @@ namespace Raven.Server.Utils
                             Name = threadName ?? "Unmanaged Thread",
                             ManagedThreadId = managedThreadId,
                             StartingTime = GetThreadInfoOrDefault<DateTime?>(() => thread.StartTime.ToUniversalTime()),
+                            Duration = thread.TotalProcessorTime.TotalMilliseconds,
+                            TotalProcessorTime = thread.TotalProcessorTime,
+                            PrivilegedProcessorTime = thread.PrivilegedProcessorTime,
+                            UserProcessorTime = thread.UserProcessorTime,
                             State = threadState,
                             Priority = GetThreadInfoOrDefault<ThreadPriorityLevel?>(() => thread.PriorityLevel),
-                            ThreadWaitReason = GetThreadInfoOrDefault(() => threadState == ThreadState.Wait ? thread.WaitReason : (ThreadWaitReason?)null)
+                            WaitReason = GetThreadInfoOrDefault(() => threadState == ThreadState.Wait ? thread.WaitReason : (ThreadWaitReason?)null)
                         });
                     }
                     catch (InvalidOperationException)
@@ -98,6 +109,7 @@ namespace Raven.Server.Utils
                     }
                 }
 
+                threadsInfo.List.Sort();
                 _threadTimesInfo = threadTimesInfo;
                 threadsInfo.CpuUsage = Math.Min(totalCpuUsage, 100);
 
@@ -117,15 +129,15 @@ namespace Raven.Server.Utils
             }
         }
 
-        private static IEnumerable<ProcessThread> GetProcessThreads(Process process)
+        private static List<ProcessThread> GetProcessThreads(Process process)
         {
             try
             {
-                return process.Threads.Cast<ProcessThread>();
+                return process.Threads.Cast<ProcessThread>().ToList();
             }
             catch (PlatformNotSupportedException)
             {
-                return Enumerable.Empty<ProcessThread>();
+                return new List<ProcessThread>();
             }
         }
 

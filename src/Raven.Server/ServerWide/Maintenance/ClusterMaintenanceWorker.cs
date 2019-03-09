@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Threading;
 using Raven.Client;
+using Raven.Client.Extensions;
 using Raven.Client.ServerWide;
 using Raven.Client.ServerWide.Tcp;
 using Raven.Server.Documents;
@@ -134,7 +135,7 @@ namespace Raven.Server.ServerWide.Maintenance
 
                 if (_server.DatabasesLandlord.DatabasesCache.TryGetValue(dbName, out var dbTask) == false)
                 {
-                    var record = _server.Cluster.Read(ctx, dbName);
+                    var record = _server.Cluster.ReadRawDatabase(ctx, dbName, out _);
                     if (record == null)
                     {
                         continue; // Database does not exists in this server
@@ -201,11 +202,11 @@ namespace Raven.Server.ServerWide.Maintenance
                 {
                     var now = dbInstance.Time.GetUtcNow();
                     report.UpTime = now - dbInstance.StartTime;
-                    
+
                     FillReplicationInfo(dbInstance, report);
 
                     prevReport.TryGetValue(dbName, out var prevDatabaseReport);
-                    if (SupportedFeatures.Heartbeats.SendChangesOnly && 
+                    if (SupportedFeatures.Heartbeats.SendChangesOnly &&
                         prevDatabaseReport != null && prevDatabaseReport.EnvironmentsHash == currentHash)
                     {
                         report.Status = DatabaseStatus.NoChange;

@@ -67,7 +67,7 @@ namespace Raven.Server
                 File.Copy(destinationSettingsFile.FullPath, targetSettingsFile.FullPath);
             }
 
-            var configuration = new RavenConfiguration(null, ResourceType.Server, CommandLineSwitches.CustomConfigPath);
+            var configuration = RavenConfiguration.CreateForServer(null, CommandLineSwitches.CustomConfigPath);
 
             if (configurationArgs != null)
                 configuration.AddCommandLine(configurationArgs);
@@ -115,7 +115,7 @@ namespace Raven.Server
                     Console.WriteLine("\nRestarting Server...");
                     rerun = false;
 
-                    configuration = new RavenConfiguration(null, ResourceType.Server, CommandLineSwitches.CustomConfigPath);
+                    configuration = RavenConfiguration.CreateForServer(null, CommandLineSwitches.CustomConfigPath);
 
                     if (configurationArgs != null)
                     {
@@ -178,6 +178,24 @@ namespace Raven.Server
                             Console.WriteLine("TIP: type 'help' to list the available commands.");
                             Console.ForegroundColor = prevColor;
 
+                            if (configuration.Storage.IgnoreInvalidJournalErrors == true)
+                            {
+                                var message =
+                                    $"Server is running in dangerous mode because {RavenConfiguration.GetKey(x => x.Storage.IgnoreInvalidJournalErrors)} was set. " +
+                                    "It means that storages of databases, indexes and system one will be loaded regardless missing or corrupted journal files which " +
+                                    "are mandatory to properly load the storage. " +
+                                    "This switch is meant to be use only for recovery purposes. Please make sure that you won't use it on regular basis. ";
+
+                                if (Logger.IsOperationsEnabled)
+                                    Logger.Operations(message);
+
+                                prevColor = Console.ForegroundColor;
+                                Console.ForegroundColor = ConsoleColor.Red;
+                                Console.WriteLine(message);
+                                Console.ForegroundColor = prevColor;
+
+                            }
+
                             IsRunningNonInteractive = false;
                             rerun = CommandLineSwitches.NonInteractive ||
                                     configuration.Core.SetupMode == SetupMode.Initial
@@ -200,11 +218,17 @@ namespace Raven.Server
                                     $"2) Run the server from the command line with --ServerUrl option.{Environment.NewLine}" +
                                     $"3) Add RAVEN_ServerUrl to the Environment Variables.{Environment.NewLine}" +
                                     "For more information go to https://ravendb.net/l/EJS81M/4.1";
-                            }else if (e is SocketException && PlatformDetails.RunningOnPosix)
+                            }
+                            else if (e is SocketException && PlatformDetails.RunningOnPosix)
                             {
+                                var ravenPath = typeof(RavenServer).Assembly.Location;
+                                if (ravenPath.EndsWith(".dll", StringComparison.OrdinalIgnoreCase))
+                                    ravenPath = ravenPath.Substring(ravenPath.Length - 4);
+
                                 message =
-                                    $"{Environment.NewLine}In Linux low-level port (below 1024) will need a special permission, if this is your case please run{Environment.NewLine}" +
-                                    $"sudo setcap CAP_NET_BIND_SERVICE=+eip {typeof(RavenServer).Assembly.Location}";
+                                    $"{Environment.NewLine}In Linux low-level port (below 1024) will need a special permission, " +
+                                    $"if this is your case please run{Environment.NewLine}" +
+                                    $"sudo setcap CAP_NET_BIND_SERVICE=+eip {ravenPath}";
                             }
 
                             if (Logger.IsOperationsEnabled)
@@ -307,11 +331,13 @@ namespace Raven.Server
 
             bool consoleColoring = true;
             if (server.Configuration.Embedded.ParentProcessId.HasValue)
+            {
                 //When opening an embedded server we must disable console coloring to avoid exceptions,
                 //due to the fact, we redirect standard input from the console.
                 consoleColoring = false;
-
-            return new RavenCli().Start(server, Console.Out, Console.In, consoleColoring);
+            }
+            
+            return new RavenCli().Start(server, Console.Out, Console.In, consoleColoring, false);
         }
 
         public static void WriteServerStatsAndWaitForEsc(RavenServer server)
@@ -335,14 +361,15 @@ namespace Raven.Server
                 Console.Write($"| {Math.Round(reqCounter.OneSecondRate, 1),-14:#,#.#;;0} ");
 
                 long allDocs = 0;
-                foreach (var value in server.ServerStore.DatabasesLandlord.DatabasesCache.Values)
+                foreach (var kvp in server.ServerStore.DatabasesLandlord.DatabasesCache)
                 {
-                    if (value.Status != TaskStatus.RanToCompletion)
+                    var task = kvp.Value;
+                    if (task.Status != TaskStatus.RanToCompletion)
                         continue;
 
                     try
                     {
-                        allDocs += value.Result.DocumentsStorage.GetNumberOfDocuments();
+                        allDocs += task.Result.DocumentsStorage.GetNumberOfDocuments();
                     }
                     catch (Exception)
                     {
@@ -382,15 +409,16 @@ namespace Raven.Server
                 var threadsInfo = threadsUsage.Calculate();
                 Console.Write($"{(i++ % 2 == 0 ? "*" : "+")} ");
                 Console.WriteLine($"CPU usage: {threadsInfo.CpuUsage:0.00}% (total threads: {threadsInfo.List.Count:#,#0}, active cores: {threadsInfo.ActiveCores})   ");
-                
+                var printedLines = 1;
+
                 var count = 0;
                 var isFirst = true;
                 foreach (var threadInfo in threadsInfo.List
-                    .Where(x => x.CpuUsage >= cpuUsageThreshold)
-                    .OrderByDescending(x => x.CpuUsage))
+                    .Where(x => x.CpuUsage >= cpuUsageThreshold))
                 {
                     if (isFirst)
                     {
+                        printedLines++;
                         Console.WriteLine("  thread id  |  cpu usage  |   priority    |     thread name       ");
                         isFirst = false;
                     }
@@ -409,11 +437,21 @@ namespace Raven.Server
                     Console.Write($" | {threadInfo.Name}{emptySpaces}");
 
                     Console.WriteLine();
+                    printedLines++;
                 }
 
                 for (var j = 0; j < waitIntervals && Console.KeyAvailable == false; j++)
                 {
                     Thread.Sleep(100);
+                }
+
+                if (PlatformDetails.RunningOnPosix)
+                {
+                    var newTop = Console.BufferHeight - cursorTop - printedLines - 1;
+                    if (newTop < 0)
+                    {
+                        cursorTop = Math.Max(0, cursorTop + newTop);
+                    }
                 }
             }
 

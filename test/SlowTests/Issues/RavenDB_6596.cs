@@ -95,6 +95,8 @@ namespace SlowTests.Issues
                     CultureInfo.DefaultThreadCurrentCulture = culture;
                     CultureInfo.DefaultThreadCurrentUICulture = culture;
 
+                    Console.WriteLine($"\t\t{test.Name}");
+
                     try
                     {
                         var @class = Activator.CreateInstance(test.DeclaringType);
@@ -129,6 +131,8 @@ namespace SlowTests.Issues
                     CultureInfo.CurrentUICulture = culture;
                     CultureInfo.DefaultThreadCurrentCulture = culture;
                     CultureInfo.DefaultThreadCurrentUICulture = culture;
+
+                    Console.WriteLine($"\t\t{test.Name}");
 
                     try
                     {

@@ -15,6 +15,7 @@ using Voron.Global;
 using Voron.Impl.FileHeaders;
 using Voron.Impl.Journal;
 using Voron.Impl.Paging;
+using Voron.Impl.Scratch;
 using Voron.Platform.Posix;
 using Voron.Platform.Win32;
 using Voron.Util;
@@ -34,9 +35,13 @@ namespace Voron
 
         public VoronPathSetting TempPath { get; }
 
+        public VoronPathSetting JournalPath { get; private set; }
+
         public IoMetrics IoMetrics { get; set; }
 
         public bool GenerateNewDatabaseId { get; set; }
+
+        public Lazy<DriveInfoByPath> DriveInfoByPath { get; private set; }
 
         public event EventHandler<RecoveryErrorEventArgs> OnRecoveryError;
         public event EventHandler<NonDurabilitySupportEventArgs> OnNonDurableFileSystemError;
@@ -45,9 +50,9 @@ namespace Voron
 
         public void SetLastReusedJournalCountOnSync(long journalNum)
         {
-            _lastReusedJournalCountOnSync = journalNum; 
+            _lastReusedJournalCountOnSync = journalNum;
         }
-        
+
         public abstract override string ToString();
 
         private bool _forceUsing32BitsPager;
@@ -127,6 +132,8 @@ namespace Voron
 
         public UpgraderDelegate SchemaUpgrader { get; set; }
 
+        public ScratchSpaceUsageMonitor ScratchSpaceUsage { get; }
+
         public long MaxScratchBufferSize
         {
             get => _maxScratchBufferSize;
@@ -178,6 +185,8 @@ namespace Voron
 
         public Action<string> AddToInitLog;
 
+        public event Action<StorageEnvironmentOptions> OnDirectoryInitialize;
+
         protected StorageEnvironmentOptions(VoronPathSetting tempPath, IoChangesNotifications ioChangesNotifications, CatastrophicFailureNotification catastrophicFailureNotification)
         {
             SafePosixOpenFlags = SafePosixOpenFlags | DefaultPosixFlags;
@@ -221,6 +230,9 @@ namespace Voron
 
             PrefetchSegmentSize = 4 * Constants.Size.Megabyte;
             PrefetchResetThreshold = 8 * (long)Constants.Size.Gigabyte;
+            SyncJournalsCountThreshold = 2;
+
+            ScratchSpaceUsage = new ScratchSpaceUsageMonitor();
         }
 
         public void SetCatastrophicFailure(ExceptionDispatchInfo exception)
@@ -314,7 +326,6 @@ namespace Voron
 
         public class DirectoryStorageEnvironmentOptions : StorageEnvironmentOptions
         {
-            private readonly VoronPathSetting _journalPath;
             private readonly VoronPathSetting _basePath;
 
             private readonly Lazy<AbstractPager> _dataPager;
@@ -330,7 +341,7 @@ namespace Voron
                 Debug.Assert(journalPath != null);
 
                 _basePath = basePath;
-                _journalPath = journalPath;
+                JournalPath = journalPath;
 
                 if (Directory.Exists(_basePath.FullPath) == false)
                     Directory.CreateDirectory(_basePath.FullPath);
@@ -338,8 +349,8 @@ namespace Voron
                 if (Equals(_basePath, TempPath) == false && Directory.Exists(TempPath.FullPath) == false)
                     Directory.CreateDirectory(TempPath.FullPath);
 
-                if (Equals(_journalPath, TempPath) == false && Directory.Exists(_journalPath.FullPath) == false)
-                    Directory.CreateDirectory(_journalPath.FullPath);
+                if (Equals(JournalPath, TempPath) == false && Directory.Exists(JournalPath.FullPath) == false)
+                    Directory.CreateDirectory(JournalPath.FullPath);
 
                 _dataPager = new Lazy<AbstractPager>(() =>
                 {
@@ -351,9 +362,23 @@ namespace Voron
                 // have to be before the journal check, so we'll fail on files in use
                 DeleteAllTempBuffers();
 
-
                 GatherRecyclableJournalFiles(); // if there are any (e.g. after a rude db shut down) let us reuse them
 
+                InitializePathsInfo();
+            }
+
+            private void InitializePathsInfo()
+            {
+                DriveInfoByPath = new Lazy<DriveInfoByPath>(() =>
+                {
+                    var drivesInfo = PlatformDetails.RunningOnPosix ? DriveInfo.GetDrives() : null;
+                    return new DriveInfoByPath
+                    {
+                        BasePath = DiskSpaceChecker.GetDriveInfo(BasePath.FullPath, drivesInfo),
+                        JournalPath = DiskSpaceChecker.GetDriveInfo(JournalPath.FullPath, drivesInfo),
+                        TempPath = DiskSpaceChecker.GetDriveInfo(TempPath.FullPath, drivesInfo)
+                    };
+                });
             }
 
             private void GatherRecyclableJournalFiles()
@@ -392,7 +417,7 @@ namespace Voron
             {
                 try
                 {
-                    return Directory.GetFiles(_journalPath.FullPath, $"{RecyclableJournalFileNamePrefix}.*");
+                    return Directory.GetFiles(JournalPath.FullPath, $"{RecyclableJournalFileNamePrefix}.*");
                 }
                 catch (Exception)
                 {
@@ -411,18 +436,15 @@ namespace Voron
 
             public override VoronPathSetting BasePath => _basePath;
 
-            public VoronPathSetting JournalPath => _journalPath;
-
             public override AbstractPager OpenPager(VoronPathSetting filename)
             {
                 return GetMemoryMapPagerInternal(this, null, filename);
             }
-
-
+            
             public override IJournalWriter CreateJournalWriter(long journalNumber, long journalSize)
             {
                 var name = JournalName(journalNumber);
-                var path = _journalPath.Combine(name);
+                var path = JournalPath.Combine(name);
                 if (File.Exists(path.FullPath) == false)
                     AttemptToReuseJournal(path, journalSize);
 
@@ -466,10 +488,55 @@ namespace Voron
             public override VoronPathSetting GetJournalPath(long journalNumber)
             {
                 var name = JournalName(journalNumber);
-                return _journalPath.Combine(name);
+                return JournalPath.Combine(name);
             }
 
             private static readonly long TickInHour = TimeSpan.FromHours(1).Ticks;
+
+            public override void TryStoreJournalForReuse(VoronPathSetting filename)
+            {
+                var reusedCount = 0;
+                try
+                {
+                    var fileModifiedDate = new FileInfo(filename.FullPath).LastWriteTimeUtc;
+                    var counter = Interlocked.Increment(ref _reuseCounter);
+                    var newName = Path.Combine(Path.GetDirectoryName(filename.FullPath), RecyclableJournalName(counter));
+
+                    File.Move(filename.FullPath, newName);
+                    lock (_journalsForReuse)
+                    {
+                        reusedCount = _journalsForReuse.Count;
+
+                        if (reusedCount > _lastReusedJournalCountOnSync)
+                        {
+                            if (File.Exists(newName))
+                                File.Delete(newName);
+                            return;
+                        }
+
+                        var ticks = fileModifiedDate.Ticks;
+
+                        while (_journalsForReuse.ContainsKey(ticks))
+                            ticks++;
+
+                        _journalsForReuse[ticks] = newName;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    if (_log.IsInfoEnabled)
+                        _log.Info(reusedCount > _lastReusedJournalCountOnSync ? "Can't remove" : "Can't store" + " journal for reuse : " + filename, ex);
+                    try
+                    {
+                        if (File.Exists(filename.FullPath))
+                            File.Delete(filename.FullPath);
+                    }
+                    catch
+                    {
+                        // nothing we can do about it
+                    }
+                }
+            }
 
             private void AttemptToReuseJournal(VoronPathSetting desiredPath, long desiredSize)
             {
@@ -538,19 +605,6 @@ namespace Voron
                 }
             }
 
-            private void TryDelete(string file)
-            {
-                try
-                {
-                    File.Delete(file);
-                }
-                catch (Exception ex)
-                {
-                    if (_log.IsInfoEnabled)
-                        _log.Info("Failed to delete " + file, ex);
-                }
-            }
-
             protected override void Disposing()
             {
                 if (Disposed)
@@ -569,16 +623,16 @@ namespace Voron
                 {
                     foreach (var reusableFile in _journalsForReuse.Values)
                     {
-                        try
-                        {
-                            File.Delete(reusableFile);
-                        }
-                        catch (Exception)
-                        {
-                            // ignored
-                        }
+                        TryDelete(reusableFile);
                     }
                 }
+            }
+
+            public override bool JournalExists(long number)
+            {
+                var name = JournalName(number);
+                var file = JournalPath.Combine(name);
+                return File.Exists(file.FullPath);
             }
 
             public override bool TryDeleteJournal(long number)
@@ -589,7 +643,7 @@ namespace Voron
                 if (_journals.TryRemove(name, out lazy) && lazy.IsValueCreated)
                     lazy.Value.Dispose();
 
-                var file = _journalPath.Combine(name);
+                var file = JournalPath.Combine(name);
                 if (File.Exists(file.FullPath) == false)
                     return false;
 
@@ -696,12 +750,13 @@ namespace Voron
 
                 if (EncryptionEnabled)
                 {
-                    // even though we don't care need encryption here, we still need to ensure that this
+                    // even though we don't need encryption here, we still need to ensure that this
                     // isn't paged to disk
                     pager.LockMemory = true;
                     pager.DoNotConsiderMemoryLockFailureAsCatastrophicError = DoNotConsiderMemoryLockFailureAsCatastrophicError;
 
-                    pager.SetPagerState(pager.PagerState); // with LockMemory = true set
+                    // We need to call SetPagerState after setting LockMemory = true to ensure the initial temp buffer is protected.
+                    pager.SetPagerState(pager.PagerState);
                 }
                 return pager;
             }
@@ -746,13 +801,13 @@ namespace Voron
                 return new WindowsMemoryMapPager(options, file, initialSize, attributes, usePageProtection: usePageProtection);
             }
 
-            public override AbstractPager OpenJournalPager(long journalNumber)
+            public override AbstractPager OpenJournalPager(long journalNumber, JournalInfo journalInfo)
             {
                 var name = JournalName(journalNumber);
-                var path = _journalPath.Combine(name);
+                var path = JournalPath.Combine(name);
                 var fileInfo = new FileInfo(path.FullPath);
                 if (fileInfo.Exists == false)
-                    throw new InvalidJournalException(journalNumber, path.FullPath);
+                    throw new InvalidJournalException(journalNumber, path.FullPath, journalInfo);
 
                 if (fileInfo.Length < InitialLogFileSize)
                 {
@@ -812,6 +867,8 @@ namespace Voron
             {
                 PosixOpenFlags = DefaultPosixFlags;
             }
+
+            
 
             public PureMemoryStorageEnvironmentOptions(string name, VoronPathSetting tempPath,
                 IoChangesNotifications ioChangesNotifications, CatastrophicFailureNotification catastrophicFailureNotification)
@@ -879,6 +936,10 @@ namespace Voron
                 }
             }
 
+            public override void TryStoreJournalForReuse(VoronPathSetting filename)
+            {
+            }
+
             protected override void Disposing()
             {
                 if (Disposed)
@@ -897,6 +958,12 @@ namespace Voron
                 }
 
                 _headers.Clear();
+            }
+
+            public override bool JournalExists(long number)
+            {
+                var name = JournalName(number);
+                return _logs.ContainsKey(name);
             }
 
             public override bool TryDeleteJournal(long number)
@@ -1010,13 +1077,13 @@ namespace Voron
                 return new WindowsMemoryMapPager(this, filename);
             }
 
-            public override AbstractPager OpenJournalPager(long journalNumber)
+            public override AbstractPager OpenJournalPager(long journalNumber, JournalInfo journalInfo)
             {
                 var name = JournalName(journalNumber);
                 IJournalWriter value;
                 if (_logs.TryGetValue(name, out value))
                     return value.CreatePager();
-                throw new InvalidJournalException(journalNumber);
+                throw new InvalidJournalException(journalNumber, journalInfo);
             }
         }
 
@@ -1051,10 +1118,15 @@ namespace Voron
                     MasterKey = null;
                 }
             }
+
+            ScratchSpaceUsage?.Dispose();
+
             Disposing();
         }
 
         protected abstract void Disposing();
+
+        public abstract bool JournalExists(long number);
 
         public abstract bool TryDeleteJournal(long number);
 
@@ -1067,7 +1139,7 @@ namespace Voron
         // Used for special temporary pagers (compression, recovery, lazyTX...) which should not be wrapped by the crypto pager.
         public abstract AbstractPager CreateTemporaryBufferPager(string name, long initialSize);
 
-        public abstract AbstractPager OpenJournalPager(long journalNumber);
+        public abstract AbstractPager OpenJournalPager(long journalNumber, JournalInfo journalInfo);
 
         public abstract AbstractPager OpenPager(VoronPathSetting filename);
 
@@ -1112,16 +1184,20 @@ namespace Voron
 
         public long PrefetchSegmentSize { get; set; }
         public long PrefetchResetThreshold { get; set; }
-
+        public long SyncJournalsCountThreshold { get; set; }
         public byte[] MasterKey;
+
+        internal bool SimulateFailureOnDbCreation { get; set; }
+        internal bool ManualSyncing { get; set; } = false;
+        public bool? IgnoreInvalidJournalErrors { get; set; }
+        public bool SkipChecksumValidationOnDatabaseLoading { get; set; }
 
         public const Win32NativeFileAttributes SafeWin32OpenFlags = Win32NativeFileAttributes.Write_Through | Win32NativeFileAttributes.NoBuffering;
         public OpenFlags DefaultPosixFlags = PlatformDetails.Is32Bits ? PerPlatformValues.OpenFlags.O_LARGEFILE : 0;
         public OpenFlags SafePosixOpenFlags = PerPlatformValues.OpenFlags.O_DSYNC | PerPlatformValues.OpenFlags.O_DIRECT;
         private readonly Logger _log;
 
-        private readonly SortedList<long, string> _journalsForReuse =
-            new SortedList<long, string>();
+        private readonly SortedList<long, string> _journalsForReuse = new SortedList<long, string>();
 
         private int _numOfConcurrentSyncsPerPhysDrive;
         private int _timeToSyncAfterFlashInSec;
@@ -1133,7 +1209,8 @@ namespace Voron
         {
             if (PlatformDetails.RunningOnPosix == false)
                 return;
-            if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+
+            if (PlatformDetails.RunningOnMacOsx)
                 return; // osx supports F_NOCACHE
 
             if (BasePath != null && StorageEnvironment.IsStorageSupportingO_Direct(_log, BasePath.FullPath) == false)
@@ -1148,48 +1225,49 @@ namespace Voron
             PosixOpenFlags = SafePosixOpenFlags;
         }
 
-        public void TryStoreJournalForReuse(VoronPathSetting filename)
+        public abstract void TryStoreJournalForReuse(VoronPathSetting filename);
+
+        private void TryDelete(string file)
         {
-            var reusedCount = 0;
             try
             {
-                var fileModifiedDate = new FileInfo(filename.FullPath).LastWriteTimeUtc;
-                var counter = Interlocked.Increment(ref _reuseCounter);
-                var newName = Path.Combine(Path.GetDirectoryName(filename.FullPath), RecyclableJournalName(counter));
-
-                File.Move(filename.FullPath, newName);
-                lock (_journalsForReuse)
-                {
-                    reusedCount = _journalsForReuse.Count;
-                    
-                    if ( reusedCount > _lastReusedJournalCountOnSync)
-                    {
-                        if (File.Exists(newName))
-                            File.Delete(newName);
-                        return;
-                    }
-
-                    var ticks = fileModifiedDate.Ticks;
-
-                    while (_journalsForReuse.ContainsKey(ticks))
-                        ticks++;
-
-                    _journalsForReuse[ticks] = newName;
-                }
+                File.Delete(file);
             }
             catch (Exception ex)
             {
                 if (_log.IsInfoEnabled)
-                    _log.Info(reusedCount > _lastReusedJournalCountOnSync ? "Can't remove" : "Can't store" + " journal for reuse : " + filename, ex);
-                try
+                    _log.Info("Failed to delete " + file, ex);
+            }
+        }
+
+        public void TryCleanupRecycledJournals()
+        {
+            if (Monitor.TryEnter(_journalsForReuse, 10) == false)
+                return;
+
+            try
+            {
+                foreach (var recyclableJournal in _journalsForReuse)
                 {
-                    if (File.Exists(filename.FullPath))
-                        File.Delete(filename.FullPath);
+                    try
+                    {
+                        var fileInfo = new FileInfo(recyclableJournal.Value);
+
+                        if (fileInfo.Exists)
+                            TryDelete(fileInfo.FullName);
+                    }
+                    catch (Exception ex)
+                    {
+                        if (_log.IsInfoEnabled)
+                            _log.Info($"Couldn't delete recyclable journal: {recyclableJournal.Value}", ex);
+                    }
                 }
-                catch
-                {
-                    // nothing we can do about it
-                }
+
+                _journalsForReuse.Clear();
+            }
+            finally
+            {
+                Monitor.Exit(_journalsForReuse);
             }
         }
 
@@ -1197,5 +1275,12 @@ namespace Voron
         {
             _environmentId = environmentId;
         }
+
+        public void InvokeOnDirectoryInitialize()
+        {
+            OnDirectoryInitialize?.Invoke(this);
+        }
     }
+
+
 }

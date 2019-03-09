@@ -19,9 +19,9 @@ namespace Sparrow.Json
         public DynamicJsonArray Modifications;
 
         public BlittableJsonReaderObject Parent => _parent;
-      
+
         public BlittableJsonReaderArray(int pos, BlittableJsonReaderObject parent, BlittableJsonToken type)
-            : base (parent._context)
+            : base(parent._context)
         {
             _parent = parent;
 
@@ -39,24 +39,29 @@ namespace Sparrow.Json
 
         public override string ToString()
         {
+            AssertContextNotDisposed();
+
             using (var memoryStream = new MemoryStream())
-            using(var tw = new BlittableJsonTextWriter(_context,memoryStream))
+            using (var tw = new BlittableJsonTextWriter(_context, memoryStream))
             {
-                tw.WriteValue(BlittableJsonToken.StartArray,this);
+                tw.WriteValue(BlittableJsonToken.StartArray, this);
                 tw.Flush();
                 memoryStream.Position = 0;
 
                 return new StreamReader(memoryStream).ReadToEnd();
             }
         }
+
         public void BlittableValidation()
         {
+            AssertContextNotDisposed();
             _parent?.BlittableValidation();
         }
 
         //Todo Fixing the clone implementation to support this situation or throw clear error
         public BlittableJsonReaderArray Clone(JsonOperationContext context, BlittableJsonDocumentBuilder.UsageMode usageMode = BlittableJsonDocumentBuilder.UsageMode.None)
         {
+            AssertContextNotDisposed();
             using (var builder = new ManualBlittableJsonDocumentBuilder<UnmanagedWriteBuffer>(context))
             {
                 builder.Reset(usageMode);
@@ -97,12 +102,14 @@ namespace Sparrow.Json
         }
 
         public void Dispose()
-        {            
+        {
+            AssertContextNotDisposed();
             _parent?.Dispose();
         }
 
         public BlittableJsonToken GetArrayType()
         {
+            AssertContextNotDisposed();
             var blittableJsonToken = (BlittableJsonToken)(*(_metadataPtr + _currentOffsetSize)) & TypesMask;
             Debug.Assert(blittableJsonToken != 0);
             return blittableJsonToken;
@@ -112,9 +119,10 @@ namespace Sparrow.Json
 
         public int BinarySearch(string key, StringComparison comparison)
         {
+            AssertContextNotDisposed();
             int min = 0;
             int max = Length - 1;
-            
+
             while (min <= max)
             {
                 int mid = (min + max) >> 1;
@@ -138,6 +146,7 @@ namespace Sparrow.Json
 
         public T GetByIndex<T>(int index)
         {
+            AssertContextNotDisposed();
             var obj = GetValueTokenTupleByIndex(index).Item1;
             BlittableJsonReaderObject.ConvertType(obj, out T result);
             return result;
@@ -145,6 +154,7 @@ namespace Sparrow.Json
 
         public string GetStringByIndex(int index)
         {
+            AssertContextNotDisposed();
             var obj = GetValueTokenTupleByIndex(index).Item1;
             if (obj == null)
                 return null;
@@ -160,15 +170,18 @@ namespace Sparrow.Json
 
         public void AddItemsToStream<T>(ManualBlittableJsonDocumentBuilder<T> writer) where T : struct, IUnmanagedWriteBuffer
         {
+            AssertContextNotDisposed();
             for (var i = 0; i < _count; i++)
             {
-                var tuple = GetValueTokenTupleByIndex(i);
-                writer.WriteValue(tuple.Item2, tuple.Item1);
+                var (value, token) = GetValueTokenTupleByIndex(i);
+                writer.WriteValue(ProcessTokenTypeFlags(token), value);
             }
         }
 
         public Tuple<object, BlittableJsonToken> GetValueTokenTupleByIndex(int index)
         {
+            AssertContextNotDisposed();
+
             // try get value from cache, works only with Blittable types, other objects are not stored for now
             Tuple<object, BlittableJsonToken> result;
             if (NoCache == false && _cache != null && _cache.TryGetValue(index, out result))
@@ -202,6 +215,8 @@ namespace Sparrow.Json
         {
             get
             {
+                AssertContextNotDisposed();
+
                 for (int i = 0; i < _count; i++)
                     yield return this[i];
             }
@@ -210,6 +225,8 @@ namespace Sparrow.Json
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public IEnumerator<object> GetEnumerator()
         {
+            AssertContextNotDisposed();
+
             return Items.GetEnumerator();
         }
 
@@ -221,6 +238,8 @@ namespace Sparrow.Json
 
         public override bool Equals(object obj)
         {
+            AssertContextNotDisposed();
+
             if (ReferenceEquals(null, obj))
                 return false;
 
@@ -237,6 +256,8 @@ namespace Sparrow.Json
 
         protected bool Equals(BlittableJsonReaderArray other)
         {
+            AssertContextNotDisposed();
+
             if (_count != other._count)
                 return false;
 
@@ -257,6 +278,7 @@ namespace Sparrow.Json
 
         public override int GetHashCode()
         {
+            AssertContextNotDisposed();
             return _count;
         }
     }

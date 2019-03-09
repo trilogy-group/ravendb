@@ -77,6 +77,8 @@ namespace Raven.Server.Config
 
         public TransactionMergerConfiguration TransactionMergerConfiguration { get; }
 
+        public NotificationConfiguration Notifications { get; }
+
         internal IConfigurationRoot ServerWideSettings { get; set; }
 
         protected IConfigurationRoot Settings { get; set; }
@@ -87,7 +89,7 @@ namespace Raven.Server.Config
         internal CommandLineConfigurationSource CommandLineSettings =>
             _configBuilder.Sources.OfType<CommandLineConfigurationSource>().FirstOrDefault();
 
-        public RavenConfiguration(string resourceName, ResourceType resourceType, string customConfigPath = null)
+        private RavenConfiguration(string resourceName, ResourceType resourceType, string customConfigPath = null)
         {
             ResourceName = resourceName;
             ResourceType = resourceType;
@@ -123,6 +125,7 @@ namespace Raven.Server.Config
             Tombstones = new TombstoneConfiguration();
             Subscriptions = new SubscriptionConfiguration();
             TransactionMergerConfiguration = new TransactionMergerConfiguration(Storage.ForceUsing32BitsPager);
+            Notifications = new NotificationConfiguration();
         }
 
         private void AddJsonConfigurationVariables(string customConfigPath = null)
@@ -176,6 +179,7 @@ namespace Raven.Server.Config
             Tombstones.Initialize(Settings, ServerWideSettings, ResourceType, ResourceName);
             Subscriptions.Initialize(Settings, ServerWideSettings, ResourceType, ResourceName);
             TransactionMergerConfiguration.Initialize(Settings, ServerWideSettings, ResourceType, ResourceName);
+            Notifications.Initialize(Settings, ServerWideSettings, ResourceType, ResourceName);
 
             PostInit();
 
@@ -306,11 +310,16 @@ namespace Raven.Server.Config
             return dataDirectoryPath;
         }
 
-        public static RavenConfiguration CreateFrom(RavenConfiguration parent, string name, ResourceType type)
+        public static RavenConfiguration CreateForServer(string name, string customConfigPath = null)
         {
-            var dataDirectoryPath = GetDataDirectoryPath(parent.Core, name, type);
+            return new RavenConfiguration(name, ResourceType.Server, customConfigPath);
+        }
 
-            var result = new RavenConfiguration(name, type)
+        public static RavenConfiguration CreateForDatabase(RavenConfiguration parent, string name)
+        {
+            var dataDirectoryPath = GetDataDirectoryPath(parent.Core, name, ResourceType.Database);
+
+            var result = new RavenConfiguration(name, ResourceType.Database)
             {
                 ServerWideSettings = parent.Settings,
                 Settings = new ConfigurationRoot(new List<IConfigurationProvider> { new MemoryConfigurationProvider(new MemoryConfigurationSource()) })
@@ -321,6 +330,14 @@ namespace Raven.Server.Config
             };
 
             return result;
+        }
+
+        /// <summary>
+        /// This method should only be used for testing purposes
+        /// </summary>
+        internal static RavenConfiguration CreateForTesting(string name, ResourceType resourceType, string customConfigPath = null)
+        {
+            return new RavenConfiguration(name, resourceType, customConfigPath);
         }
 
         private static string GenerateDefaultDataDirectory(string template, ResourceType type, string name)
@@ -447,7 +464,7 @@ namespace Raven.Server.Config
 
             public override void Load()
             {
-                Data = new Dictionary<string, string>();
+                Data = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
                 var envs = Environment.GetEnvironmentVariables().Cast<DictionaryEntry>();
                 foreach (var env in envs)

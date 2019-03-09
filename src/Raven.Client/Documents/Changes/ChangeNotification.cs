@@ -10,6 +10,33 @@ using Sparrow.Json.Parsing;
 
 namespace Raven.Client.Documents.Changes
 {
+    public class TopologyChange : DatabaseChange
+    {
+        public string Url;
+        public string Database;
+
+        public DynamicJsonValue ToJson()
+        {
+            return new DynamicJsonValue
+            {
+                [nameof(Url)] = Url,
+                [nameof(Database)] = Database
+            };
+        }
+
+        internal static TopologyChange FromJson(BlittableJsonReaderObject value)
+        {
+            value.TryGet(nameof(Url), out string url);
+            value.TryGet(nameof(Database), out string database);
+
+            return new TopologyChange
+            {
+                Url = url,
+                Database = database
+            };
+        }
+    }
+
     public class DocumentChange : DatabaseChange
     {
         /// <summary>
@@ -242,8 +269,6 @@ namespace Raven.Client.Documents.Changes
         public string DatabaseName { get; set; }
         public string CustomInfo { get; set; }
         public TrafficWatchChangeType Type { get; set; }
-        public int InnerRequestsCount { get; set; }
-        public object QueryTimings { get; set; }
     }
 
     public enum TrafficWatchChangeType

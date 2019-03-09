@@ -4,12 +4,14 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
+using System.Linq.Expressions;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading;
 using Jint;
 using Jint.Native;
 using Jint.Native.Array;
+using Jint.Native.Date;
 using Jint.Native.Function;
 using Jint.Native.Object;
 using Jint.Runtime.Interop;
@@ -21,6 +23,7 @@ using Raven.Client.Extensions;
 using Raven.Server.Config;
 using Raven.Server.Config.Categories;
 using Raven.Server.Documents.Indexes;
+using Raven.Server.Documents.Queries;
 using Raven.Server.Exceptions;
 using Raven.Server.Extensions;
 using Raven.Server.ServerWide.Commands;
@@ -700,7 +703,6 @@ namespace Raven.Server.Documents.Patch
 
                 var signature = args.Length == 2 ? "incrementCounter(doc, name)" : "incrementCounter(doc, name, value)";
 
-                BlittableJsonReaderObject metadata = null;
                 BlittableJsonReaderObject docBlittable = null;
                 string id = null;
 
@@ -708,7 +710,6 @@ namespace Raven.Server.Documents.Patch
                 {
                     id = doc.DocumentId;
                     docBlittable = doc.Blittable;
-                    metadata = docBlittable.GetMetadata();
                 }
                 else if (args[0].IsString())
                 {
@@ -721,14 +722,13 @@ namespace Raven.Server.Documents.Patch
                     }
 
                     docBlittable = document.Data;
-                    metadata = docBlittable.GetMetadata();
                 }
                 else
                 {
                     ThrowInvalidDocumentArgsType(signature);
                 }
 
-                Debug.Assert(id != null && metadata != null && docBlittable != null);
+                Debug.Assert(id != null && docBlittable != null);
 
                 if (args[1].IsString() == false)
                 {
@@ -744,10 +744,9 @@ namespace Raven.Server.Documents.Patch
                     value = args[2].AsNumber();
                 }
 
-                _database.DocumentsStorage.CountersStorage.IncrementCounter(_docsCtx, id, CollectionName.GetCollectionName(docBlittable), name, (long)value);
+                _database.DocumentsStorage.CountersStorage.IncrementCounter(_docsCtx, id, CollectionName.GetCollectionName(docBlittable), name, (long)value, out var exists);
 
-                if (metadata.TryGet(Constants.Documents.Metadata.Counters, out BlittableJsonReaderArray counters) == false ||
-                    counters.BinarySearch(name, StringComparison.OrdinalIgnoreCase) < 0)
+                if (exists == false)
                 {
                     if (UpdatedDocumentCounterIds == null)
                         UpdatedDocumentCounterIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -881,7 +880,7 @@ namespace Raven.Server.Documents.Patch
                 return asTimeSpan.ToString();
             }
 
-            private static JsValue ToStringWithFormat(JsValue self, JsValue[] args)
+            private static unsafe JsValue ToStringWithFormat(JsValue self, JsValue[] args)
             {
                 if (args.Length < 1 || args.Length > 3)
                 {
@@ -924,6 +923,24 @@ namespace Raven.Server.Documents.Patch
                     return format != null ?
                         num.ToString(format, cultureInfo) :
                         num.ToString(cultureInfo);
+                }
+
+                if (args[0].IsString())
+                {
+                    var s = args[0].AsString();
+                    fixed (char* pValue = s)
+                    {
+                        var result = LazyStringParser.TryParseDateTime(pValue, s.Length, out DateTime dt, out _);
+                        switch (result)
+                        {
+                            case LazyStringParser.Result.DateTime:
+                                return format != null ?
+                                    dt.ToString(format, cultureInfo) :
+                                    dt.ToString(cultureInfo);
+                            default:
+                                throw new InvalidOperationException("toStringWithFormat(dateString) : 'dateString' is not a valid DateTime string");
+                        }
+                    }
                 }
 
                 if (args[0].IsBoolean() == false)
@@ -1034,18 +1051,17 @@ namespace Raven.Server.Documents.Patch
             {
                 if (string.IsNullOrEmpty(key))
                     return JsValue.Undefined;
-                BlittableJsonReaderObject value = null;
+
                 using (_database.ServerStore.ContextPool.AllocateOperationContext(out TransactionOperationContext ctx))
                 using (ctx.OpenReadTransaction())
                 {
-                    value = _database.ServerStore.Cluster.GetCompareExchangeValue(ctx, key).Value;
+                    var value = _database.ServerStore.Cluster.GetCompareExchangeValue(ctx, key).Value;
+                    if (value == null)
+                        return null;
+
+                    var jsValue = TranslateToJs(ScriptEngine, _jsonCtx, value.Clone(_jsonCtx));
+                    return jsValue.AsObject().Get("Object");
                 }
-
-                if (value == null)
-                    return null;
-
-                var jsValue = TranslateToJs(ScriptEngine, _jsonCtx, value);
-                return jsValue.AsObject().Get("Object");
             }
 
             private JsValue LoadDocumentInternal(string id)
@@ -1081,10 +1097,8 @@ namespace Raven.Server.Documents.Patch
                 Reset();
                 OriginalDocumentId = documentId;
 
-                if (_args.Length != args.Length)
-                    _args = new JsValue[args.Length];
-                for (var i = 0; i < args.Length; i++)
-                    _args[i] = TranslateToJs(ScriptEngine, jsonCtx, args[i]);
+                SetArgs(jsonCtx, method, args);
+
                 try
                 {
                     var call = ScriptEngine.GetValue(method).TryCast<ICallable>();
@@ -1100,6 +1114,22 @@ namespace Raven.Server.Documents.Patch
                     _refResolver.ExplodeArgsOn(null, null);
                     _docsCtx = null;
                     _jsonCtx = null;
+                }
+            }
+
+            private void SetArgs(JsonOperationContext jsonCtx, string method, object[] args)
+            {
+                if (_args.Length != args.Length)
+                    _args = new JsValue[args.Length];
+                for (var i = 0; i < args.Length; i++)
+                    _args[i] = TranslateToJs(ScriptEngine, jsonCtx, args[i]);
+
+                if (method != QueryMetadata.SelectOutput &&
+                    _args.Length == 2 &&
+                    _args[1].IsObject() &&
+                    _args[1].AsObject() is BlittableObjectInstance boi)
+                {
+                    _refResolver.ExplodeArgsOn(null, boi);
                 }
             }
 
@@ -1170,6 +1200,7 @@ namespace Raven.Server.Documents.Patch
                 origin.NoCache = noCache;
                 return cloned;
             }
+
             private JsValue TranslateToJs(Engine engine, JsonOperationContext context, object o)
             {
                 if (o is Tuple<Document, Lucene.Net.Documents.Document, IState> t)
@@ -1192,7 +1223,7 @@ namespace Raven.Server.Documents.Patch
 
                 if (o is BlittableJsonReaderObject json)
                 {
-                    return new BlittableObjectInstance(engine, null, json, null, null);
+                    return new BlittableObjectInstance(engine, null, Clone(json, context), null, null);
                 }
 
                 if (o == null)
@@ -1308,7 +1339,7 @@ namespace Raven.Server.Documents.Patch
                 _run.RefreshOriginalDocument = false;
 
                 _run.UpdatedDocumentCounterIds?.Clear();
-                
+
                 _parent._cache.Enqueue(_run);
 
                 _run = null;

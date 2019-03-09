@@ -85,16 +85,14 @@ namespace Raven.Server.Documents.Replication
                     {
                         conflictedDoc.Clone()
                     };
-                    conflicts.AddRange(documentsContext.DocumentDatabase.DocumentsStorage.ConflictsStorage.GetConflictsFor(
-                        documentsContext, id));
-                    var localDocumentTuple =
-                        documentsContext.DocumentDatabase.DocumentsStorage.GetDocumentOrTombstone(documentsContext,
-                            id, false);
+                    conflicts.AddRange(_database.DocumentsStorage.ConflictsStorage.GetConflictsFor(documentsContext, id));
+
+                    var localDocumentTuple = _database.DocumentsStorage.GetDocumentOrTombstone(documentsContext, id, false);
                     var local = DocumentConflict.From(documentsContext, localDocumentTuple.Document) ?? DocumentConflict.From(localDocumentTuple.Tombstone);
                     if (local != null)
                         conflicts.Add(local);
 
-                    var resolved = _conflictResolver.ResolveToLatest(documentsContext, conflicts);
+                    var resolved = _conflictResolver.ResolveToLatest(conflicts);
                     _conflictResolver.PutResolvedDocument(documentsContext, resolved, conflictedDoc);
 
                     return;
@@ -184,7 +182,7 @@ namespace Raven.Server.Documents.Replication
                 var merged = ChangeVectorUtils.MergeVectors(conflicts.Select(c => c.ChangeVector).ToList());
                 mergedChangeVector = ChangeVectorUtils.MergeVectors(merged, changeVector);
             }
-            _database.DocumentsStorage.Put(context, id, null, resolvedHiLoDoc,changeVector: mergedChangeVector);
+            _database.DocumentsStorage.Put(context, id, null, resolvedHiLoDoc,changeVector: mergedChangeVector, nonPersistentFlags: NonPersistentDocumentFlags.FromResolver);
         }
 
         private static void InvalidConflictWhenThereIsNone(string id)
@@ -208,14 +206,17 @@ namespace Raven.Server.Documents.Replication
                 if (compareResult == DocumentCompareResult.NotEqual)
                     return false;
 
-                // no real conflict here, both documents have identical content
+                // no real conflict here, both documents have identical content so we only merge the change vector without increasing the local etag to prevent ping-pong replication
                 var mergedChangeVector = ChangeVectorUtils.MergeVectors(incomingChangeVector, existingDoc.ChangeVector);
-                var nonPersistentFlags = (compareResult & DocumentCompareResult.AttachmentsNotEqual) == DocumentCompareResult.AttachmentsNotEqual 
-                    ? NonPersistentDocumentFlags.ResolveAttachmentsConflict : NonPersistentDocumentFlags.None;
 
-                if ((compareResult & DocumentCompareResult.CountersNotEqual) == DocumentCompareResult.CountersNotEqual)                
-                    nonPersistentFlags |= NonPersistentDocumentFlags.ResolveCountersConflict;
+                var nonPersistentFlags = NonPersistentDocumentFlags.FromResolver;
+
+                nonPersistentFlags |= compareResult.HasFlag(DocumentCompareResult.AttachmentsNotEqual)
+                    ? NonPersistentDocumentFlags.ResolveAttachmentsConflict : NonPersistentDocumentFlags.None;
                 
+                if (compareResult.HasFlag(DocumentCompareResult.CountersNotEqual))                
+                    nonPersistentFlags |= NonPersistentDocumentFlags.ResolveCountersConflict;
+
                 _database.DocumentsStorage.Put(context, id, null, incomingDoc, lastModifiedTicks, mergedChangeVector, nonPersistentFlags: nonPersistentFlags);
                 return true;
             }

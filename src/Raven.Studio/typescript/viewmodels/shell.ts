@@ -149,7 +149,7 @@ class shell extends viewModelBase {
 
         const licenseTask = license.fetchLicenseStatus();
         const topologyTask = this.clusterManager.init();
-        const clientCertifiateTask = clientCertificateModel.fetchClientCertificate();
+        const clientCertificateTask = clientCertificateModel.fetchClientCertificate();
         
         licenseTask.done((result) => {
             if (result.Type !== "None") {
@@ -157,7 +157,7 @@ class shell extends viewModelBase {
             }
         });
         
-        $.when<any>(licenseTask, topologyTask, clientCertifiateTask)
+        $.when<any>(licenseTask, topologyTask, clientCertificateTask)
             .done(([license]: [Raven.Server.Commercial.LicenseStatus], 
                    [topology]: [Raven.Server.NotificationCenter.Notifications.Server.ClusterTopologyChanged],
                    [certificate]: [Raven.Client.ServerWide.Operations.Certificates.CertificateDefinition]) => {
@@ -207,7 +207,7 @@ class shell extends viewModelBase {
         this.setupRouting();
         
         // we await here only for certificate task, as downloading license can take longer
-        return clientCertifiateTask;
+        return clientCertificateTask;
     }
     
     private onGlobalConfiguration(settings: globalSettings) {
@@ -423,7 +423,7 @@ class shell extends viewModelBase {
     }
     
     detectBrowser() {
-        const isChrome = !!(window as any).chrome && !!(window as any).chrome.webstore;
+        const isChrome = /Chrome/.test(navigator.userAgent) && /Google Inc/.test(navigator.vendor);
         const isFirefox = navigator.userAgent.toLowerCase().indexOf('firefox') > -1;
 
         if (!isChrome && !isFirefox) {

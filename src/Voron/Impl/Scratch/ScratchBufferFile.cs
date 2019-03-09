@@ -11,6 +11,7 @@ using System.Diagnostics;
 using System.Linq;
 using System.Runtime.CompilerServices;
 using Sparrow.Collections;
+using Sparrow.Threading;
 using Voron.Global;
 using Voron.Impl.Paging;
 
@@ -30,7 +31,8 @@ namespace Voron.Impl.Scratch
         private readonly Dictionary<long, LinkedList<PendingPage>> _freePagesBySize = new Dictionary<long, LinkedList<PendingPage>>(NumericEqualityComparer.BoxedInstanceInt64);
         private readonly Dictionary<long, LinkedList<long>> _freePagesBySizeAvailableImmediately = new Dictionary<long, LinkedList<long>>(NumericEqualityComparer.BoxedInstanceInt64);
         private readonly Dictionary<long, PageFromScratchBuffer> _allocatedPages = new Dictionary<long, PageFromScratchBuffer>(NumericEqualityComparer.BoxedInstanceInt64);
-        
+        private readonly DisposeOnce<SingleAttempt> _disposeOnceRunner;
+
         private long _allocatedPagesCount;
         private long _lastUsedPage;
         private long _txIdAfterWhichLatestFreePagesBecomeAvailable = -1;
@@ -44,12 +46,25 @@ namespace Voron.Impl.Scratch
             _allocatedPagesCount = 0;
 
             scratchPager.AllocatedInBytesFunc = () => AllocatedPagesCount * Constants.Storage.PageSize;
+
+            _disposeOnceRunner = new DisposeOnce<SingleAttempt>(() =>
+            {                
+                _scratchPager.PagerState.DiscardOnTxCopy = true;
+                _scratchPager.Dispose();
+                ClearDictionaries();
+            });
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void ClearDictionaries()
+        {
+            _allocatedPages.Clear();
+            _freePagesBySizeAvailableImmediately.Clear();
+            _freePagesBySize.Clear();
         }
 
         public void Reset()
         {
-            _allocatedPages.Clear();
-
 #if VALIDATE
             foreach (var free in _freePagesBySizeAvailableImmediately)
             {
@@ -62,10 +77,6 @@ namespace Voron.Impl.Scratch
                     _scratchPager.UnprotectPageRange(freeAndAvailablePagePointer, freeAndAvailablePageSize, true);
                 }
             }            
-#endif
-            _freePagesBySizeAvailableImmediately.Clear();
-
-#if VALIDATE
             foreach (var free in _freePagesBySize)
             {
                 foreach (var val in free.Value)
@@ -78,7 +89,7 @@ namespace Voron.Impl.Scratch
                 }
             }
 #endif
-            _freePagesBySize.Clear();
+            ClearDictionaries();
             _txIdAfterWhichLatestFreePagesBecomeAvailable = -1;
             _lastUsedPage = 0;
             _allocatedPagesCount = 0;
@@ -270,7 +281,7 @@ namespace Voron.Impl.Scratch
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public byte* AcquirePagePointerWithOverflowHandling(LowLevelTransaction tx, long p)
+        public byte* AcquirePagePointerWithOverflowHandling(IPagerLevelTransactionState tx, long p)
         {
             return _scratchPager.AcquirePagePointerWithOverflowHandling(tx, p);
         }
@@ -297,9 +308,10 @@ namespace Voron.Impl.Scratch
 
         public void Dispose()
         {
-            _scratchPager.PagerState.DiscardOnTxCopy = true;
-            _scratchPager.Dispose();
+            _disposeOnceRunner.Dispose();
         }
+
+        public bool IsDisposed => _disposeOnceRunner.Disposed;
 
         public void BreakLargeAllocationToSeparatePages(IPagerLevelTransactionState tx, PageFromScratchBuffer value)
         {

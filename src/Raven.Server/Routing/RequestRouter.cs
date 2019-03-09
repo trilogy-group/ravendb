@@ -51,27 +51,25 @@ namespace Raven.Server.Routing
             return tryMatch.Value;
         }
 
-        public async ValueTask<string> HandlePath(HttpContext context, string method, string path)
+        public async ValueTask HandlePath(RequestHandlerContext reqCtx)
         {
-            var tryMatch = _trie.TryMatch(method, path);
+            var context = reqCtx.HttpContext;
+            var tryMatch = _trie.TryMatch(context.Request.Method, context.Request.Path.Value);
             if (tryMatch.Value == null)
             {
-                var exception = new RouteNotFoundException($"There is no handler for path: {method} {path}{context.Request.QueryString}");
+                var exception = new RouteNotFoundException($"There is no handler for path: {context.Request.Method} {context.Request.Path.Value}{context.Request.QueryString}");
                 AssertClientVersion(context, exception);
                 throw exception;
             }
 
-            var reqCtx = new RequestHandlerContext
-            {
-                HttpContext = context,
-                RavenServer = _ravenServer,
-                RouteMatch = tryMatch.Match
-            };
+            reqCtx.RavenServer = _ravenServer;
+            reqCtx.RouteMatch = tryMatch.Match;
 
             var tuple = tryMatch.Value.TryGetHandler(reqCtx);
             var handler = tuple.Item1 ?? await tuple.Item2;
 
             reqCtx.Database?.Metrics?.Requests.RequestsPerSec.Mark();
+
             _serverMetrics.Requests.RequestsPerSec.Mark();
 
             Interlocked.Increment(ref _serverMetrics.Requests.ConcurrentRequestsCount);
@@ -101,25 +99,26 @@ namespace Raven.Server.Routing
                                 ["Message"] = $"There is no handler for {context.Request.Method} {context.Request.Path}"
                             });
                     }
-                    return null;
+
+                    return;
                 }
 
                 if (_ravenServer.Configuration.Security.AuthenticationEnabled)
                 {
                     var authResult = TryAuthorize(tryMatch.Value, context, reqCtx.Database);
                     if (authResult == false)
-                        return reqCtx.Database?.Name;
+                        return;
                 }
 
                 if (reqCtx.Database != null)
                 {
                     using (reqCtx.Database.DatabaseInUse(tryMatch.Value.SkipUsagesCount))
                     {
-                        if (reqCtx.HttpContext.Response.Headers.TryGetValue(Constants.Headers.LastKnownClusterTransactionIndex, out var value)
+                        if (context.Request.Headers.TryGetValue(Constants.Headers.LastKnownClusterTransactionIndex, out var value)
                             && long.TryParse(value, out var index)
-                            && index < reqCtx.Database.RachisLogIndexNotifications.LastModifiedIndex)
+                            && index > reqCtx.Database.RachisLogIndexNotifications.LastModifiedIndex)
                         {
-                            await reqCtx.Database.RachisLogIndexNotifications.WaitForIndexNotification(index, reqCtx.HttpContext.RequestAborted);
+                            await reqCtx.Database.RachisLogIndexNotifications.WaitForIndexNotification(index, context.RequestAborted);
                         }
 
                         await handler(reqCtx);
@@ -134,15 +133,22 @@ namespace Raven.Server.Routing
             {
                 Interlocked.Decrement(ref _serverMetrics.Requests.ConcurrentRequestsCount);
             }
+        }
 
-            return reqCtx.Database?.Name;
+        public static bool TryGetClientVersion(HttpContext context, out Version version)
+        {
+            version = null;
+
+            if (context.Request.Headers.TryGetValue(Constants.Headers.ClientVersion, out var versionHeader) == false)
+                return false;
+
+            return Version.TryParse(versionHeader, out version);
         }
 
         public static void AssertClientVersion(HttpContext context, Exception innerException)
         {
             // client in this context could be also a follower sending a command to his leader.
-            if (context.Request.Headers.TryGetValue(Constants.Headers.ClientVersion, out var versionHeader) &&
-                Version.TryParse(versionHeader, out var clientVersion))
+            if (TryGetClientVersion(context, out var clientVersion))
             {
                 var currentServerVersion = RavenVersionAttribute.Instance;
 

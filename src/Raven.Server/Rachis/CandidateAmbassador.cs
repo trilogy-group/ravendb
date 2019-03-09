@@ -72,7 +72,7 @@ namespace Raven.Server.Rachis
                     {
                         _engine.Log.Info(
                             $"CandidateAmbassador for {_tag}: Waited for a full second for thread {_candidateAmbassadorLongRunningWork.ManagedThreadId} " +
-                            $"({(_candidateAmbassadorLongRunningWork.Join(0) ? "running" : "finished")}) to finish, after the elections were {_candidate.ElectionResult}");
+                            $"({(_candidateAmbassadorLongRunningWork.Join(0) ? "finished" : "running")}) to finish, after the elections were {_candidate.ElectionResult}");
                     }
                     DisposeConnectionIfNeeded();
                 }
@@ -305,14 +305,7 @@ namespace Raven.Server.Rachis
                             }
                         }
                     }
-                    catch (AggregateException ae)
-                        when (ae.InnerException is OperationCanceledException || ae.InnerException is LockAlreadyDisposedException)
-                    {
-                        NotifyAboutAmbassadorClosing(_connection, currentElectionTerm, ae.InnerException);
-                        break;
-                    }
-                    catch (Exception e)
-                        when (e is OperationCanceledException || e is LockAlreadyDisposedException || e is RachisConcurrencyException)
+                    catch (Exception e) when (RachisConsensus.IsExpectedException(e) || e is RachisConcurrencyException)
                     {
                         NotifyAboutAmbassadorClosing(_connection, currentElectionTerm, e);
                         break;

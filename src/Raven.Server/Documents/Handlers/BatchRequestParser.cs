@@ -7,6 +7,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Newtonsoft.Json;
+using Raven.Client.Documents.Attachments;
 using Raven.Client.Documents.Commands.Batches;
 using Raven.Client.Documents.Session;
 using Raven.Client.Documents.Operations.Counters;
@@ -16,6 +17,7 @@ using Raven.Server.ServerWide;
 using Sparrow;
 using Sparrow.Json;
 using Sparrow.Json.Parsing;
+using Sparrow.Threading;
 using Sparrow.Utils;
 
 namespace Raven.Server.Documents.Handlers
@@ -26,6 +28,7 @@ namespace Raven.Server.Documents.Handlers
         {
             public CommandType Type;
             public string Id;
+            public BlittableJsonReaderArray Ids;
             public BlittableJsonReaderObject Document;
             public PatchRequest Patch;
             public BlittableJsonReaderObject PatchArgs;
@@ -38,7 +41,7 @@ namespace Raven.Server.Documents.Handlers
             public bool ReturnDocument;
 
             [JsonIgnore]
-            public PatchDocumentCommand PatchCommand;
+            public PatchDocumentCommandBase PatchCommand;
 
             #region Attachment
 
@@ -46,6 +49,7 @@ namespace Raven.Server.Documents.Handlers
             public string DestinationId;
             public string DestinationName;
             public string ContentType;
+            public AttachmentType AttachmentType;
 
             #endregion
 
@@ -142,15 +146,35 @@ namespace Raven.Server.Documents.Handlers
                     if (commandData.Type == CommandType.PATCH)
                     {
                         commandData.PatchCommand =
-                            new PatchDocumentCommand(ctx, commandData.Id, commandData.ChangeVector,
-                                false,
+                            new PatchDocumentCommand(
+                                ctx,
+                                commandData.Id,
+                                commandData.ChangeVector,
+                                skipPatchIfChangeVectorMismatch: false,
                                 (commandData.Patch, commandData.PatchArgs),
                                 (commandData.PatchIfMissing, commandData.PatchIfMissingArgs),
                                 database,
-                                false,
-                                false,
-                                true
+                                isTest: false,
+                                debugMode: false,
+                                collectResultsNeeded: true,
+                                returnDocument: commandData.ReturnDocument
                             );
+                    }
+
+                    if (commandData.Type == CommandType.BatchPATCH)
+                    {
+                        commandData.PatchCommand =
+                            new BatchPatchDocumentCommand(
+                                ctx,
+                                commandData.Ids,
+                                skipPatchIfChangeVectorMismatch: false,
+                                (commandData.Patch, commandData.PatchArgs),
+                                (commandData.PatchIfMissing, commandData.PatchIfMissingArgs),
+                                database,
+                                isTest: false,
+                                debugMode: false,
+                                collectResultsNeeded: true
+                               );
                     }
 
                     if (commandData.Type == CommandType.PUT && string.IsNullOrEmpty(commandData.Id) == false && commandData.Id[commandData.Id.Length - 1] == '|')
@@ -349,6 +373,9 @@ namespace Raven.Server.Documents.Handlers
                                 break;
                         }
                         break;
+                    case CommandPropertyName.Ids:
+                        commandData.Ids = await ReadJsonArray(ctx, stream, parser, state, buffer, token);
+                        break;
                     case CommandPropertyName.Name:
                         while (parser.Read() == false)
                             await RefillParserBuffer(stream, buffer, parser, token);
@@ -496,6 +523,23 @@ namespace Raven.Server.Documents.Handlers
 
                         commandData.FromEtl = state.CurrentTokenType == JsonParserToken.True;
                         break;
+                    case CommandPropertyName.AttachmentType:
+                        while (parser.Read() == false)
+                            await RefillParserBuffer(stream, buffer, parser, token);
+                        if (state.CurrentTokenType == JsonParserToken.Null)
+                        {
+                            commandData.AttachmentType = AttachmentType.Document;
+                        }
+                        else
+                        {
+                            if (state.CurrentTokenType != JsonParserToken.String)
+                            {
+                                ThrowUnexpectedToken(JsonParserToken.String, state);
+                            }
+
+                            commandData.AttachmentType = GetAttachmentType(state, ctx);
+                        }
+                        break;
                     case CommandPropertyName.NoSuchProperty:
                         // unknown command - ignore it
                         while (parser.Read() == false)
@@ -582,6 +626,36 @@ namespace Raven.Server.Documents.Handlers
             throw new InvalidOperationException($"Attachment PUT command must have a '{nameof(CommandData.Name)}' property");
         }
 
+        private static async Task<BlittableJsonReaderArray> ReadJsonArray(
+            JsonOperationContext ctx,
+            Stream stream,
+            UnmanagedJsonParser parser,
+            JsonParserState state,
+            JsonOperationContext.ManagedPinnedBuffer buffer,
+            CancellationToken token)
+        {
+            BlittableJsonReaderArray reader;
+            using (var builder = new BlittableJsonDocumentBuilder(
+                ctx,
+                BlittableJsonDocumentBuilder.UsageMode.ToDisk,
+                "json/array", parser, state))
+            {
+                ctx.CachedProperties.NewDocument();
+                builder.ReadArrayDocument();
+                while (true)
+                {
+                    if (builder.Read())
+                        break;
+                    await RefillParserBuffer(stream, buffer, parser, token);
+                }
+
+                builder.FinalizeDocument();
+                reader = builder.CreateArrayReader(noCache: true);
+            }
+
+            return reader;
+        }
+
         private static async Task<BlittableJsonReaderObject> ReadJsonObject(JsonOperationContext ctx, Stream stream, string id, UnmanagedJsonParser parser,
             JsonParserState state, JsonOperationContext.ManagedPinnedBuffer buffer, CancellationToken token)
         {
@@ -623,6 +697,7 @@ namespace Raven.Server.Documents.Handlers
             NoSuchProperty,
             Type,
             Id,
+            Ids,
             Document,
             ChangeVector,
             Patch,
@@ -637,6 +712,7 @@ namespace Raven.Server.Documents.Handlers
             DestinationId,
             DestinationName,
             ContentType,
+            AttachmentType,
 
             #endregion
 
@@ -662,6 +738,11 @@ namespace Raven.Server.Documents.Handlers
                         return CommandPropertyName.NoSuchProperty;
                     return CommandPropertyName.Id;
 
+                case 3:
+                    if (*(short*)state.StringBuffer != 25673 || state.StringBuffer[2] != (byte)'s')
+                        return CommandPropertyName.NoSuchProperty;
+                    return CommandPropertyName.Ids;
+
                 case 8:
                     if (*(long*)state.StringBuffer == 8318823012450529091)
                         return CommandPropertyName.Counters;
@@ -685,15 +766,20 @@ namespace Raven.Server.Documents.Handlers
                         return CommandPropertyName.Index;
                     return CommandPropertyName.NoSuchProperty;
                 case 14:
-                    if (*(int*)state.StringBuffer == 1668571472 ||
-                        *(long*)(state.StringBuffer + sizeof(int)) == 7598543892411468136 ||
+                    if (*(int*)state.StringBuffer == 1668571472 &&
+                        *(long*)(state.StringBuffer + sizeof(int)) == 7598543892411468136 &&
                         *(short*)(state.StringBuffer + sizeof(int) + sizeof(long)) == 26478)
                         return CommandPropertyName.PatchIfMissing;
 
-                    if (*(int*)state.StringBuffer == 1970562386 ||
-                        *(long*)(state.StringBuffer + sizeof(int)) == 7308626840221150834 ||
+                    if (*(int*)state.StringBuffer == 1970562386 &&
+                        *(long*)(state.StringBuffer + sizeof(int)) == 7308626840221150834 &&
                         *(short*)(state.StringBuffer + sizeof(int) + sizeof(long)) == 29806)
                         return CommandPropertyName.ReturnDocument;
+
+                    if (*(int*)state.StringBuffer == 1635021889 &&
+                        *(long*)(state.StringBuffer + sizeof(int)) == 8742740794129868899 &&
+                        *(short*)(state.StringBuffer + sizeof(int) + sizeof(long)) == 25968)
+                        return CommandPropertyName.AttachmentType;
 
                     return CommandPropertyName.NoSuchProperty;
                 case 10:
@@ -741,6 +827,28 @@ namespace Raven.Server.Documents.Handlers
             }
         }
 
+        private static unsafe AttachmentType GetAttachmentType(JsonParserState state, JsonOperationContext ctx)
+        {
+            // here we confirm that the value is matching our expectation, in order to save CPU instructions
+            // we compare directly against the precomputed values
+            switch (state.StringSize)
+            {
+                case 8:
+                    if (*(long*)state.StringBuffer == 8389754676633104196)
+                        return AttachmentType.Document;
+                    if (*(long*)state.StringBuffer == 7957695010998478162)
+                        return AttachmentType.Revision;
+
+                    ThrowInvalidProperty(state, ctx);
+                    break;
+                default:
+                    ThrowInvalidProperty(state, ctx);
+                    break;
+            }
+
+            return 0;
+        }
+
         private static unsafe CommandType GetCommandType(JsonParserState state, JsonOperationContext ctx)
         {
             // here we confirm that the value is matching our expectation, in order to save CPU instructions
@@ -768,6 +876,13 @@ namespace Raven.Server.Documents.Handlers
 
                     return CommandType.DELETE;
 
+                case 10:
+                    if (*(long*)state.StringBuffer != 6071222181947531586 ||
+                        *(short*)(state.StringBuffer + sizeof(long)) != 18499)
+                        ThrowInvalidProperty(state, ctx);
+
+                    return CommandType.BatchPATCH;
+
                 case 13:
                     if (*(long*)state.StringBuffer != 7308612546338255937 ||
                         *(int*)(state.StringBuffer + sizeof(long)) != 1431336046 ||
@@ -780,7 +895,7 @@ namespace Raven.Server.Documents.Handlers
                         *(int*)(state.StringBuffer + sizeof(long)) == 1329820782 &&
                         *(short*)(state.StringBuffer + sizeof(long) + sizeof(int)) == 22864)
                         return CommandType.AttachmentCOPY;
-                        
+
                     if (*(long*)state.StringBuffer == 7308612546338255937 &&
                         *(int*)(state.StringBuffer + sizeof(long)) == 1330476142 &&
                         *(short*)(state.StringBuffer + sizeof(long) + sizeof(int)) == 17750)

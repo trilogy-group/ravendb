@@ -50,6 +50,11 @@ namespace Raven.Server.NotificationCenter.Notifications
 
         ClusterTransactionFailure,
 
-        OutOfMemoryException
+        OutOfMemoryException,
+
+        Indexing_UnexpectedIndexingThreadError,
+        Indexing_CouldNotGetStats,
+
+        CpuUsageExtensionPointError
     }
 }

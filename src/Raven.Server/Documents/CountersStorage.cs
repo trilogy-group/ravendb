@@ -251,9 +251,9 @@ namespace Raven.Server.Documents
 
                     if (changeVector == null)
                     {
-                        changeVector = ChangeVectorUtils
-                            .TryUpdateChangeVector(_documentDatabase.ServerStore.NodeTag, _documentsStorage.Environment.Base64Id, etag, string.Empty)
-                            .ChangeVector;
+                        changeVector = ChangeVectorUtils.NewChangeVector(_documentDatabase.ServerStore.NodeTag, etag, _documentsStorage.Environment.Base64Id);
+                        context.LastDatabaseChangeVector =
+                            ChangeVectorUtils.MergeVectors(context.LastDatabaseChangeVector ?? GetDatabaseChangeVector(context), changeVector);
                     }
 
                     using (Slice.From(context.Allocator, changeVector, out var cv))
@@ -338,7 +338,7 @@ namespace Raven.Server.Documents
             return tx.OpenTable(CountersSchema, tableName);
         }
 
-        public string IncrementCounter(DocumentsOperationContext context, string documentId, string collection, string name, long delta)
+        public string IncrementCounter(DocumentsOperationContext context, string documentId, string collection, string name, long delta, out bool exists)
         {
             if (context.Transaction == null)
             {
@@ -352,7 +352,7 @@ namespace Raven.Server.Documents
             using (GetCounterKey(context, documentId, name, context.Environment.Base64Id, out var counterKey))
             {
                 var value = delta;
-                var exists = table.ReadByKey(counterKey, out var existing);
+                exists = table.ReadByKey(counterKey, out var existing);
                 if (exists)
                 {
                     var prev = *(long*)existing.Read((int)CountersTable.Value, out var size);
@@ -370,9 +370,9 @@ namespace Raven.Server.Documents
                 RemoveTombstoneIfExists(context, documentId, name);
 
                 var etag = _documentsStorage.GenerateNextEtag();
-                var result = ChangeVectorUtils.TryUpdateChangeVector(_documentDatabase.ServerStore.NodeTag, _documentsStorage.Environment.Base64Id, etag, string.Empty);
+                var changeVector = ChangeVectorUtils.NewChangeVector(_documentDatabase.ServerStore.NodeTag, etag, _documentsStorage.Environment.Base64Id);
 
-                using (Slice.From(context.Allocator, result.ChangeVector, out var cv))
+                using (Slice.From(context.Allocator, changeVector, out var cv))
                 using (DocumentIdWorker.GetStringPreserveCase(context, name, out Slice nameSlice))
                 using (DocumentIdWorker.GetStringPreserveCase(context, collectionName.Name, out Slice collectionSlice))
                 using (table.Allocate(out TableValueBuilder tvb))
@@ -388,18 +388,18 @@ namespace Raven.Server.Documents
                     table.Set(tvb);
                 }
 
-                UpdateMetrics(counterKey, name, result.ChangeVector, collection);
+                UpdateMetrics(counterKey, name, changeVector, collection);
 
                 context.Transaction.AddAfterCommitNotification(new CounterChange
                 {
-                    ChangeVector = result.ChangeVector,
+                    ChangeVector = changeVector,
                     DocumentId = documentId,
                     Name = name,
                     Type = exists ? CounterChangeTypes.Increment : CounterChangeTypes.Put,
                     Value = value
                 });
 
-                return result.ChangeVector;
+                return changeVector;
             }
         }
 
@@ -409,12 +409,12 @@ namespace Raven.Server.Documents
 
             using (GetCounterPartialKey(context, docId, out var key))
             {
-                var prev = string.Empty;
+                LazyStringValue prev = null;
                 foreach (var result in table.SeekByPrimaryKeyPrefix(key, Slices.Empty, 0))
                 {
                     var current = ExtractCounterName(context, result.Value.Reader);
 
-                    if (prev.Equals(current))
+                    if (prev?.Equals(current) == true)
                     {
                         // already seen this one, skip it 
                         continue;
@@ -422,6 +422,7 @@ namespace Raven.Server.Documents
 
                     yield return current;
 
+                    prev?.Dispose();
                     prev = current;
                 }
             }
@@ -581,13 +582,13 @@ namespace Raven.Server.Documents
             using (GetCounterPartialKey(context, documentId, counterName, out var keyPrefix))
             {
                 var lastModifiedTicks = _documentDatabase.Time.GetUtcNow().Ticks;
-                return DeleteCounter(context, keyPrefix, collection, lastModifiedTicks,
+                return DeleteCounter(context, keyPrefix, collection, null, lastModifiedTicks,
                     // let's avoid creating a tombstone for missing counter if writing locally
                     forceTombstone: false);
             }
         }
 
-        public string DeleteCounter(DocumentsOperationContext context, Slice key, string collection, long lastModifiedTicks, bool forceTombstone)
+        public string DeleteCounter(DocumentsOperationContext context, Slice key, string collection, string changeVector, long lastModifiedTicks, bool forceTombstone)
         {
             var collectionName = _documentsStorage.ExtractCollectionName(context, collection);
             var table = GetCountersTable(context.Transaction.InnerTransaction, collectionName);
@@ -614,19 +615,22 @@ namespace Raven.Server.Documents
             var newEtag = _documentsStorage.GenerateNextEtag();
             _documentsStorage.EnsureLastEtagIsPersisted(context, newEtag);
 
-            var newChangeVector = ChangeVectorUtils.NewChangeVector(_documentDatabase.ServerStore.NodeTag, newEtag, _documentsStorage.Environment.Base64Id);
+            if (changeVector == null)
+            {
+                changeVector = ChangeVectorUtils.NewChangeVector(_documentDatabase.ServerStore.NodeTag, newEtag, _documentsStorage.Environment.Base64Id);
+                context.LastDatabaseChangeVector = ChangeVectorUtils.MergeVectors(context.LastDatabaseChangeVector ?? GetDatabaseChangeVector(context), changeVector);
+            }
 
-            CreateTombstone(context, key, collection, deletedEtag, lastModifiedTicks, newEtag, newChangeVector);
-
+            CreateTombstone(context, key, collection, deletedEtag, lastModifiedTicks, newEtag, changeVector);
             context.Transaction.AddAfterCommitNotification(new CounterChange
             {
-                ChangeVector = newChangeVector,
+                ChangeVector = changeVector,
                 DocumentId = documentId,
                 Name = name,
                 Type = CounterChangeTypes.Delete
             });
 
-            return newChangeVector;
+            return changeVector;
         }
 
         private void CreateTombstone(DocumentsOperationContext context, Slice keySlice, string collectionName, long deletedEtag, long lastModifiedTicks, long newEtag, string newChangeVector)
@@ -649,6 +653,7 @@ namespace Raven.Server.Documents
             }
         }
 
+        [Conditional("DEBUG")]
         public static void AssertCounters(BlittableJsonReaderObject document, DocumentFlags flags)
         {
             if ((flags & DocumentFlags.HasCounters) == DocumentFlags.HasCounters)
@@ -676,55 +681,44 @@ namespace Raven.Server.Documents
             return fst.NumberOfEntries;
         }
 
-        public void UpdateDocumentCounters(DocumentsOperationContext context, BlittableJsonReaderObject doc, string docId, List<CounterOperation> countersOperations)
+        public void UpdateDocumentCounters(DocumentsOperationContext context, Document doc, string docId,
+            SortedSet<string> countersToAdd, HashSet<string> countersToRemove, NonPersistentDocumentFlags nonPersistentDocumentFlags)
         {
+            if (countersToRemove.Count == 0 && countersToAdd.Count == 0)
+                return;
+
+            var data = doc.Data;
             BlittableJsonReaderArray metadataCounters = null;
-            var initCounterListSize = countersOperations.Count;
-            if (doc.TryGet(Constants.Documents.Metadata.Key, out BlittableJsonReaderObject metadata) &&
-                metadata.TryGet(Constants.Documents.Metadata.Counters, out metadataCounters))
+            if (data.TryGet(Constants.Documents.Metadata.Key, out BlittableJsonReaderObject metadata))
             {
-                initCounterListSize += metadataCounters.Length;
+                metadata.TryGet(Constants.Documents.Metadata.Counters, out metadataCounters);
             }
 
-            List<string> counters = null;
-            foreach (var s in GetCountersForDocument(context, docId))
+            var counters = GetCountersForDocument(metadataCounters, countersToAdd, countersToRemove, out var hadModifications);
+            if (hadModifications == false)
+                return;
+
+            var flags = doc.Flags.Strip(DocumentFlags.FromClusterTransaction | DocumentFlags.Resolved);
+            if (counters.Count == 0)
             {
-                if (counters == null)
+                flags = flags.Strip(DocumentFlags.HasCounters);
+                if (metadata != null)
                 {
-                    counters = new List<string>(initCounterListSize);
+                    metadata.Modifications = new DynamicJsonValue(metadata);
+                    metadata.Modifications.Remove(Constants.Documents.Metadata.Counters);
+                    data.Modifications = new DynamicJsonValue(data)
+                    {
+                        [Constants.Documents.Metadata.Key] = metadata
+                    };
                 }
-                counters.Add(s);
-            }
-
-            UpdateCountersListDueToOperations(ref counters, countersOperations);
-
-            var flags = DocumentFlags.None;
-            if (counters == null || counters.Count == 0)
-            {
-                if (null == metadataCounters)
-                {
-                    return;
-                }
-
-                metadata.Modifications = new DynamicJsonValue(metadata);
-                metadata.Modifications.Remove(Constants.Documents.Metadata.Counters);
-                doc.Modifications = new DynamicJsonValue(doc)
-                {
-                    [Constants.Documents.Metadata.Key] = metadata
-                };
             }
             else
             {
-                if (metadataCounters != null &&
-                    metadataCounters.SequenceEqual(counters))
-                {
-                    return;
-                }
-
-                doc.Modifications = new DynamicJsonValue(doc);
+                flags |= DocumentFlags.HasCounters;
+                data.Modifications = new DynamicJsonValue(data);
                 if (metadata == null)
                 {
-                    doc.Modifications[Constants.Documents.Metadata.Key] = new DynamicJsonValue
+                    data.Modifications[Constants.Documents.Metadata.Key] = new DynamicJsonValue
                     {
                         [Constants.Documents.Metadata.Counters] = new DynamicJsonArray(counters)
                     };
@@ -735,66 +729,42 @@ namespace Raven.Server.Documents
                     {
                         [Constants.Documents.Metadata.Counters] = new DynamicJsonArray(counters)
                     };
-                    doc.Modifications[Constants.Documents.Metadata.Key] = metadata;
+                    data.Modifications[Constants.Documents.Metadata.Key] = metadata;
                 }
-
-                flags = DocumentFlags.HasCounters;
             }
 
-            var data = context.ReadObject(doc, docId, BlittableJsonDocumentBuilder.UsageMode.ToDisk);
-            _documentDatabase.DocumentsStorage.Put(context, docId, null, data, flags: flags, nonPersistentFlags: NonPersistentDocumentFlags.ByCountersUpdate);
+            var newDocumentData = context.ReadObject(doc.Data, docId, BlittableJsonDocumentBuilder.UsageMode.ToDisk);
+            _documentDatabase.DocumentsStorage.Put(context, docId, null, newDocumentData, flags: flags, nonPersistentFlags: nonPersistentDocumentFlags);
         }
 
-        private static void UpdateCountersListDueToOperations(ref List<string> counters, List<CounterOperation> countersOperations)
+        private static SortedSet<string> GetCountersForDocument(BlittableJsonReaderArray metadataCounters, SortedSet<string> countersToAdd, HashSet<string> countersToRemove, out bool modified)
         {
-            var localCounters = counters;
-
-            foreach (var operation in countersOperations)
+            modified = false;
+            if (metadataCounters == null)
             {
-                // we need to check the updates to avoid inserting duplicate counter names
-                var loc = localCounters?.BinarySearch(operation.CounterName, StringComparer.OrdinalIgnoreCase) ?? ~0;
-
-                switch (operation.Type)
-                {
-                    case CounterOperationType.Increment:
-                    case CounterOperationType.Put:
-                        if (loc < 0)
-                        {
-                            CreateUpdatesIfNeeded();
-                            localCounters.Insert(~loc, operation.CounterName);
-                        }
-
-                        break;
-                    case CounterOperationType.Delete:
-                        if (loc >= 0)
-                        {
-                            CreateUpdatesIfNeeded();
-                            localCounters.RemoveAt(loc);
-                        }
-                        break;
-                    case CounterOperationType.None:
-                    case CounterOperationType.Get:
-                        break;
-                    default:
-                        throw new ArgumentOutOfRangeException($"Unknown value {operation.Type}");
-                }
+                modified = true;
+                return countersToAdd;
             }
 
-            counters = localCounters; 
-
-            void CreateUpdatesIfNeeded()
+            foreach (var counter in metadataCounters)
             {
-                if (localCounters != null)
-                    return;
-
-                localCounters = new List<string>(countersOperations.Count);
-                foreach (var val in localCounters)
+                var str = counter.ToString();
+                if (countersToRemove.Contains(str))
                 {
-                    if (val == null)
-                        continue;
-                    localCounters.Add(val);
+                    modified = true;
+                    continue;
                 }
+
+                countersToAdd.Add(str);
             }
+
+            if (modified == false)
+            {
+                // if no counter was removed, we can be sure that there are no modification when the counter's count in the metadata is equal to the count of countersToAdd 
+                modified = countersToAdd.Count != metadataCounters.Length;
+            }
+
+            return countersToAdd;
         }
     }
 }

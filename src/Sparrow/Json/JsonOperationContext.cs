@@ -61,6 +61,12 @@ namespace Sparrow.Json
         private int _numberOfAllocatedStringsValues;
         private readonly FastList<LazyStringValue> _allocateStringValues = new FastList<LazyStringValue>(256);
 
+        /// <summary>
+        /// This flag means that this should be disposed, usually because we exceeded the maximum
+        /// amount of memory budget we have and need to return it to the system
+        /// </summary>
+        public bool DoNotReuse;
+
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void AcquirePathCache(out Dictionary<StringSegment, object> pathCache, out Dictionary<int, object> pathCacheByIndex)
         {
@@ -103,7 +109,7 @@ namespace Sparrow.Json
             }
 
             var allocateStringValue = new LazyStringValue(str, ptr, size, this);
-            if (_numberOfAllocatedStringsValues < 25 * 1000)
+            if (_numberOfAllocatedStringsValues < 32 * 1_024)
             {
                 _allocateStringValues.Add(allocateStringValue);
                 _numberOfAllocatedStringsValues++;
@@ -419,7 +425,7 @@ namespace Sparrow.Json
         {
 #if DEBUG || VALIDATE
             if (requestedSize <= 0)
-                throw new ArgumentException(nameof(requestedSize));
+            throw new ArgumentException(nameof(requestedSize));
 #endif
             //we should use JsonOperationContext in single thread
             if (_arenaAllocatorForLongLivedValues == null)
@@ -428,15 +434,15 @@ namespace Sparrow.Json
                 ThrowAlreadyDisposedForLongLivedAllocator();
 
                 //make compiler happy, previous row will throw
-                return null;
+                 return null;
             }
 
             var allocatedMemory = _arenaAllocatorForLongLivedValues.Allocate(requestedSize);
             allocatedMemory.ContextGeneration = Generation;
             allocatedMemory.Parent = this;
-#if DEBUG
+    #if DEBUG
             allocatedMemory.IsLongLived = true;
-#endif
+    #endif
             return allocatedMemory;
         }
 
@@ -455,7 +461,7 @@ namespace Sparrow.Json
         }
 
         private readonly DisposeOnce<ExceptionRetry> _disposeOnceRunner;
-        private bool Disposed => _disposeOnceRunner.Disposed;
+        public bool Disposed => _disposeOnceRunner.Disposed;
         public override void Dispose()
         {
             _disposeOnceRunner.Dispose();
@@ -493,13 +499,20 @@ namespace Sparrow.Json
 
         private LazyStringValue GetLazyStringForFieldWithCachingUnlikely(StringSegment key)
         {
-            EnsureNotDisposed();
-            LazyStringValue value = GetLazyString(key, longLived: true);
-            _fieldNames[key] = value;
+#if DEBUG || VALIDATE
+            using (new SingleThreadAccessAssertion(_threadId, "GetLazyStringForFieldWithCachingUnlikely"))
+            {
+#endif
+                EnsureNotDisposed();
+                LazyStringValue value = GetLazyString(key, longLived: true);
+                _fieldNames[key] = value;
 
-            //sanity check, in case the 'value' is manually disposed outside of this function
-            Debug.Assert(value.IsDisposed == false);
-            return value;
+                //sanity check, in case the 'value' is manually disposed outside of this function
+                Debug.Assert(value.IsDisposed == false);
+                return value;
+#if DEBUG || VALIDATE
+            }
+#endif
         }
 
         public LazyStringValue GetLazyString(string field)
@@ -527,7 +540,7 @@ namespace Sparrow.Json
                 var address = memory.Address;
                 var actualSize = Encodings.Utf8.GetBytes(pField + field.Offset, field.Length, address, memory.SizeInBytes);
 
-                state.FindEscapePositionsIn(address, actualSize, escapePositionsSize);
+                state.FindEscapePositionsIn(address, ref actualSize, escapePositionsSize);
 
                 state.WriteEscapePositionsTo(address + actualSize);
                 LazyStringValue result = longLived == false ? AllocateStringValue(field, address, actualSize) : new LazyStringValue(field, address, actualSize, this);
@@ -941,6 +954,9 @@ namespace Sparrow.Json
 
         protected internal virtual void Renew()
         {
+            if (Disposed)
+                ThrowObjectDisposed();
+
             _arenaAllocator.RenewArena();
             if (_arenaAllocatorForLongLivedValues == null)
             {
@@ -970,7 +986,7 @@ namespace Sparrow.Json
                 {
                     _arenaAllocatorForLongLivedValues.Return(mem.AllocatedMemoryData);
                     mem.AllocatedMemoryData = null;
-                    mem.Dispose();
+                    mem.IsDisposed = true;                    
                 }
 
                 _arenaAllocatorForLongLivedValues = null;
@@ -1369,5 +1385,39 @@ namespace Sparrow.Json
             allocationsArray.Array.Add(allocatedArray);
             return allocatedArray;
         }
+
+#if DEBUG || VALIDATE
+        private class IntReference
+        {
+            public long Value;
+        }
+
+        IntReference _threadId = new IntReference {Value = 0};
+
+        private class SingleThreadAccessAssertion : IDisposable
+        {
+            readonly IntReference _capturedThreadId;
+            private int _currentThreadId;
+            private string _method;
+
+            public SingleThreadAccessAssertion(IntReference expectedCapturedThread, string method)
+            {
+                _capturedThreadId = expectedCapturedThread;
+                _currentThreadId = Environment.CurrentManagedThreadId;
+                _method = method;
+                if (Interlocked.CompareExchange(ref expectedCapturedThread.Value, _currentThreadId, 0) != 0)
+                {
+                    throw new InvalidOperationException($"Concurrent access to JsonOperationContext.{method} method detected");
+                }
+            }
+            public void Dispose()
+            {
+                if (Interlocked.CompareExchange(ref _capturedThreadId.Value, 0, _currentThreadId) != _currentThreadId)
+                {
+                    throw new InvalidOperationException($"Concurrent access to JsonOperationContext.{_method} method detected");
+                }
+            }
+        }
+#endif
     }
 }

@@ -19,6 +19,7 @@ using Org.BouncyCastle.Utilities.Encoders;
 using Org.BouncyCastle.X509;
 using Raven.Server.Commercial;
 using Raven.Server.Config.Categories;
+using Raven.Server.Utils;
 using Sparrow;
 using Sparrow.Logging;
 using Sparrow.Platform;
@@ -323,24 +324,23 @@ namespace Raven.Server.ServerWide
 
         public RavenServer.CertificateHolder LoadCertificateWithExecutable(string executable, string args, ServerStore serverStore)
         {
-            var process = new Process
+            Process process;
+
+            var startInfo = new ProcessStartInfo
             {
-                StartInfo = new ProcessStartInfo
-                {
-                    FileName = executable,
-                    Arguments = args,
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true
-                }
+                FileName = executable,
+                Arguments = args,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
             };
 
             var sw = Stopwatch.StartNew();
 
             try
             {
-                process.Start();
+                process = Process.Start(startInfo);
             }
             catch (Exception e)
             {
@@ -422,25 +422,23 @@ namespace Raven.Server.ServerWide
 
         private byte[] LoadMasterKeyWithExecutable()
         {
+            Process process;
 
-            var process = new Process
+            var startInfo = new ProcessStartInfo
             {
-                StartInfo = new ProcessStartInfo
-                {
-                    FileName = _config.MasterKeyExec,
-                    Arguments = _config.MasterKeyExecArguments,
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true
-                }
+                FileName = _config.MasterKeyExec,
+                Arguments = _config.MasterKeyExecArguments,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
             };
 
             var sw = Stopwatch.StartNew();
 
             try
             {
-                process.Start();
+                process = Process.Start(startInfo);
             }
             catch (Exception e)
             {
@@ -511,7 +509,7 @@ namespace Raven.Server.ServerWide
 
             ValidateKeyUsages(source, loadedCertificate);
             
-            AddCertificateChainToTheUserCertificateAuthority(loadedCertificate, rawBytes, password);
+            AddCertificateChainToTheUserCertificateAuthorityStoreAndCleanExpiredCerts(loadedCertificate, rawBytes, password);
 
 
             return new RavenServer.CertificateHolder
@@ -522,7 +520,7 @@ namespace Raven.Server.ServerWide
             };
         }
 
-        private static void AddCertificateChainToTheUserCertificateAuthority(X509Certificate2 loadedCertificate, byte[] rawBytes, string password)
+        public static void AddCertificateChainToTheUserCertificateAuthorityStoreAndCleanExpiredCerts(X509Certificate2 loadedCertificate, byte[] rawBytes, string password)
         {
             // we have to add all the certs in the pfx file provides to the CA store for the current user 
             // to avoid a remote call on any incoming connection by the SslStream infrastructure
@@ -533,7 +531,7 @@ namespace Raven.Server.ServerWide
             if (string.IsNullOrEmpty(password))
                 collection.Import(rawBytes, (string)null, X509KeyStorageFlags.MachineKeySet);
             else
-                collection.Import(rawBytes, password, X509KeyStorageFlags.PersistKeySet | X509KeyStorageFlags.Exportable | X509KeyStorageFlags.MachineKeySet);
+                collection.Import(rawBytes, password, X509KeyStorageFlags.MachineKeySet);
 
             var storeName = PlatformDetails.RunningOnMacOsx ? StoreName.My : StoreName.CertificateAuthority;
             using (var userIntermediateStore = new X509Store(storeName, StoreLocation.CurrentUser, 
@@ -545,10 +543,47 @@ namespace Raven.Server.ServerWide
                         continue;
 
                     var results = userIntermediateStore.Certificates.Find(X509FindType.FindByThumbprint, cert.Thumbprint, false);
-                    if (results.Count > 0)
-                        continue;
+                    if (results.Count == 0)
+                        userIntermediateStore.Add(cert);
+                }
+                
+                // We had a problem where we didn't cleanup the user store in Linux (~/.dotnet/corefx/cryptography/x509stores/ca)
+                // and it exploded with thousands of certificates. This caused ssl handshakes to fail on that machine, because it would timeout when
+                // trying to match one of these certs to validate the chain.
 
-                    userIntermediateStore.Add(cert);
+                if (loadedCertificate.SubjectName.Name == null)
+                    return;
+                
+                var cnValue = loadedCertificate.SubjectName.Name.StartsWith("CN=", StringComparison.OrdinalIgnoreCase) 
+                    ? loadedCertificate.SubjectName.Name.Substring(3) 
+                    : loadedCertificate.SubjectName.Name;
+                
+                var utcNow = DateTime.UtcNow;
+                var existingCerts = userIntermediateStore.Certificates.Find(X509FindType.FindBySubjectName, cnValue, false);
+                foreach (var c in existingCerts)
+                {
+                    if (c.NotAfter.ToUniversalTime() > utcNow && c.NotBefore.ToUniversalTime() < utcNow)
+                        continue;
+                    
+                    // Remove all expired certs which have the same subject name as our own
+                    var chain = new X509Chain();
+                    chain.Build(c);
+
+                    foreach (var element in chain.ChainElements)
+                    {
+                        if (element.Certificate.NotAfter.ToUniversalTime() > utcNow && element.Certificate.NotBefore.ToUniversalTime() < utcNow)
+                            continue;
+                        try
+                        {
+                            userIntermediateStore.Remove(element.Certificate);
+                        }
+                        catch (CryptographicException e)
+                        {
+                            // Access denied?
+                            if (Logger.IsInfoEnabled)
+                                Logger.Info($"Tried to clean expired certificates from the OS user intermediate store but got an exception when removing a certificate with subject name '{element.Certificate.SubjectName.Name}' and thumbprint '{element.Certificate.Thumbprint}'.", e);
+                        }
+                    }
                 }
             }
         }

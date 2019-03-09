@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -98,7 +99,7 @@ namespace Raven.Server.Documents.Replication
 
                             if (ConflictSolver?.ResolveToLatest == true)
                             {
-                                resolved = ResolveToLatest(context, conflicts);
+                                resolved = ResolveToLatest(conflicts);
                                 resolved.Flags = resolved.Flags.Strip(DocumentFlags.FromReplication);
                                 resolvedConflicts.Add((resolved, maxConflictEtag));
 
@@ -245,51 +246,18 @@ namespace Raven.Server.Documents.Replication
            DocumentConflict resolved,
            DocumentConflict incoming = null)
         {
-            if (incoming != null)
-            {
-                // we resolved the conflict on the fly, so we save the remote documents as revisions
-                // we have to generate a new change vector, so it will be replicated back to the source
-                var newChangeVector = _database.DocumentsStorage.GetNewChangeVector(context);
-                if (incoming.Doc != null)
-                {
-                    _database.DocumentsStorage.RevisionsStorage.Put(context, incoming.Id, incoming.Doc, incoming.Flags.Strip(DocumentFlags.FromClusterTransaction) | DocumentFlags.Conflicted | DocumentFlags.HasRevisions,
-                        NonPersistentDocumentFlags.None, newChangeVector, incoming.LastModified.Ticks);
-                }
-                else
-                {
-                    using (Slice.External(context.Allocator, incoming.LowerId, out var lowerId))
-                    {
-                        _database.DocumentsStorage.RevisionsStorage.Delete(context, incoming.Id, lowerId, new CollectionName(incoming.Collection), newChangeVector,
-                            incoming.LastModified.Ticks, NonPersistentDocumentFlags.None, incoming.Flags | DocumentFlags.Conflicted | DocumentFlags.HasRevisions);
-                    }
-                }
-            }
+            SaveConflictedDocumentsAsRevisions(context, resolved.Id, incoming);
 
-            if (_database.DocumentsStorage.ConflictsStorage.ConflictsCount == 0)
-            {
-                var existing = _database.DocumentsStorage.GetDocumentOrTombstone(context, resolved.Id, throwOnConflict: false);
-                if (existing.Document != null)
-                {
-                    _database.DocumentsStorage.RevisionsStorage.Put(context, existing.Document.Id, existing.Document.Data,
-                        existing.Document.Flags | DocumentFlags.Conflicted | DocumentFlags.HasRevisions,
-                        NonPersistentDocumentFlags.None, existing.Document.ChangeVector, existing.Document.LastModified.Ticks);
-                }
-                else if (existing.Tombstone != null)
-                {
-                    using (Slice.External(context.Allocator, existing.Tombstone.LowerId, out var key))
-                    {
-                        _database.DocumentsStorage.RevisionsStorage.Delete(context, existing.Tombstone.LowerId, key, new CollectionName(existing.Tombstone.Collection), existing.Tombstone.ChangeVector,
-                            existing.Tombstone.LastModified.Ticks, NonPersistentDocumentFlags.None, existing.Tombstone.Flags | DocumentFlags.Conflicted | DocumentFlags.HasRevisions);
-                    }
-                }
-            }
+            // Resolved document should generate a new change vector, since it was changed locally. 
+            // In a cluster this may cause a ping-pong replication which will be settled down by the fact that a conflict with identical content doesn't increase the local etag
+            var changeVector = _database.DocumentsStorage.CreateNextDatabaseChangeVector(context, resolved.ChangeVector);
 
             if (resolved.Doc == null)
             {
                 using (Slice.External(context.Allocator, resolved.LowerId, out var lowerId))
                 {
-                    _database.DocumentsStorage.Delete(context, lowerId, resolved.Id, null,
-                        _database.Time.GetUtcNow().Ticks, resolved.ChangeVector, new CollectionName(resolved.Collection), documentFlags: resolved.Flags | DocumentFlags.Resolved | DocumentFlags.HasRevisions);
+                    _database.DocumentsStorage.Delete(context, lowerId, resolved.Id, null,null, changeVector, new CollectionName(resolved.Collection),
+                        documentFlags: resolved.Flags | DocumentFlags.Resolved | DocumentFlags.HasRevisions, nonPersistentFlags: NonPersistentDocumentFlags.FromResolver | NonPersistentDocumentFlags.Resolved);
                     return;
                 }
             }
@@ -306,7 +274,58 @@ namespace Raven.Server.Documents.Replication
                 DeleteDocumentFromDifferentCollectionIfNeeded(context, resolved);
 
                 ReplicationUtils.EnsureCollectionTag(clone, resolved.Collection);
-                _database.DocumentsStorage.Put(context, resolved.Id, null, clone, null, resolved.ChangeVector, resolved.Flags | DocumentFlags.Resolved);
+                // we always want to merge the counters and attachments, even if the user specified a script
+                var nonPersistentFlags = NonPersistentDocumentFlags.ResolveCountersConflict | NonPersistentDocumentFlags.ResolveAttachmentsConflict |
+                                         NonPersistentDocumentFlags.FromResolver | NonPersistentDocumentFlags.Resolved;
+                _database.DocumentsStorage.Put(context, resolved.Id, null, clone, null, changeVector, resolved.Flags | DocumentFlags.Resolved, nonPersistentFlags: nonPersistentFlags);
+            }
+        }
+        
+        private void SaveConflictedDocumentsAsRevisions(DocumentsOperationContext context, string id, DocumentConflict incoming)
+        {
+            if (incoming == null)
+                return;
+
+            // we resolved the conflict on the fly, so we save the remote document as revisions
+            if (incoming.Doc != null)
+            {
+                _database.DocumentsStorage.RevisionsStorage.Put(context, incoming.Id, incoming.Doc,
+                    incoming.Flags.Strip(DocumentFlags.FromClusterTransaction) | DocumentFlags.Conflicted | DocumentFlags.HasRevisions,
+                    NonPersistentDocumentFlags.FromResolver, incoming.ChangeVector, incoming.LastModified.Ticks);
+            }
+            else
+            {
+                using (Slice.External(context.Allocator, incoming.LowerId, out var lowerId))
+                {
+                    _database.DocumentsStorage.RevisionsStorage.Delete(context, incoming.Id, lowerId, new CollectionName(incoming.Collection), incoming.ChangeVector,
+                        incoming.LastModified.Ticks, NonPersistentDocumentFlags.FromResolver, incoming.Flags | DocumentFlags.Conflicted | DocumentFlags.HasRevisions);
+                }
+            }
+
+            if (_database.DocumentsStorage.ConflictsStorage.ConflictsCount != 0) // we have conflicts and we will resolve them in the put method, rest of the function is when we resolve on the fly
+                return;
+
+            SaveLocalAsRevision(context, id);
+        }
+
+        public void SaveLocalAsRevision(DocumentsOperationContext context, string id)
+        {
+            var existing = _database.DocumentsStorage.GetDocumentOrTombstone(context, id, throwOnConflict: false);
+            if (existing.Document != null)
+            {
+                _database.DocumentsStorage.RevisionsStorage.Put(context, existing.Document.Id, existing.Document.Data,
+                    existing.Document.Flags | DocumentFlags.Conflicted | DocumentFlags.HasRevisions,
+                    NonPersistentDocumentFlags.FromResolver, existing.Document.ChangeVector, existing.Document.LastModified.Ticks);
+            }
+            else if (existing.Tombstone != null)
+            {
+                using (Slice.External(context.Allocator, existing.Tombstone.LowerId, out var key))
+                {
+                    _database.DocumentsStorage.RevisionsStorage.Delete(context, existing.Tombstone.LowerId, key, new CollectionName(existing.Tombstone.Collection),
+                        existing.Tombstone.ChangeVector,
+                        existing.Tombstone.LastModified.Ticks, NonPersistentDocumentFlags.FromResolver,
+                        existing.Tombstone.Flags | DocumentFlags.Conflicted | DocumentFlags.HasRevisions);
+                }
             }
         }
 
@@ -348,13 +367,12 @@ namespace Raven.Server.Documents.Replication
             updatedConflict.Doc = resolved;
             updatedConflict.Collection = collection;
             updatedConflict.ChangeVector = ChangeVectorUtils.MergeVectors(conflicts.Select(c => c.ChangeVector).ToList());
-
             resolvedConflict = updatedConflict;
 
             return true;
         }
 
-        public DocumentConflict ResolveToLatest(DocumentsOperationContext context, List<DocumentConflict> conflicts)
+        public DocumentConflict ResolveToLatest(List<DocumentConflict> conflicts)
         {
             // we have to sort this here because we need to ensure that all the nodes are always 
             // arrive to the same conclusion, regardless of what time they go it
@@ -363,12 +381,12 @@ namespace Raven.Server.Documents.Replication
             var latestDoc = conflicts[0];
             var latestTime = latestDoc.LastModified.Ticks;
 
-            foreach (var documentConflict in conflicts)
+            foreach (var conflict in conflicts)
             {
-                if (documentConflict.LastModified.Ticks > latestTime)
+                if (conflict.LastModified.Ticks > latestTime)
                 {
-                    latestDoc = documentConflict;
-                    latestTime = documentConflict.LastModified.Ticks;
+                    latestDoc = conflict;
+                    latestTime = conflict.LastModified.Ticks;
                 }
             }
 

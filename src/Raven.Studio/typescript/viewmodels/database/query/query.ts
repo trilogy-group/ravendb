@@ -31,6 +31,7 @@ import actionColumn = require("widgets/virtualGrid/columns/actionColumn");
 import explainQueryDialog = require("viewmodels/database/query/explainQueryDialog");
 import explainQueryCommand = require("commands/database/index/explainQueryCommand");
 import timingsChart = require("common/timingsChart");
+import generalUtils = require("common/generalUtils");
 
 type queryResultTab = "results" | "explanations" | "timings";
 
@@ -126,7 +127,7 @@ class query extends viewModelBase {
     criteria = ko.observable<queryCriteria>(queryCriteria.empty());
     cacheEnabled = ko.observable<boolean>(true);
 
-    private indexEntrieStateWasTrue: boolean = false; // Used to save current query settings when switching to a 'dynamic' index
+    private indexEntriesStateWasTrue: boolean = false; // Used to save current query settings when switching to a 'dynamic' index
 
     columnsSelector = new columnsSelector<document>();
 
@@ -562,12 +563,12 @@ class query extends viewModelBase {
 
         if (this.isCollectionQuery() && this.criteria().indexEntries()) {
             this.criteria().indexEntries(false);
-            this.indexEntrieStateWasTrue = true; // save the state..
+            this.indexEntriesStateWasTrue = true; // save the state..
         }
 
-        if (!this.isCollectionQuery() && this.indexEntrieStateWasTrue) {
+        if (!this.isCollectionQuery() && this.indexEntriesStateWasTrue) {
             this.criteria().indexEntries(true);
-            this.indexEntrieStateWasTrue = false;
+            this.indexEntriesStateWasTrue = false;
         }
 
         this.runQuery();
@@ -609,9 +610,16 @@ class query extends viewModelBase {
             // we declare this variable here, if any result returns skippedResults <> 0 we enter infinite scroll mode 
             let totalSkippedResults = 0;
             
-            this.rawJsonUrl(appUrl.forDatabaseQuery(database) + queryCmd.getUrl());
-            this.csvUrl(queryCmd.getCsvUrl());
-
+            try {
+                this.rawJsonUrl(appUrl.forDatabaseQuery(database) + queryCmd.getUrl());
+                this.csvUrl(queryCmd.getCsvUrl());    
+            } catch (error) {
+                // it may throw when unable to compute query parameters, etc.
+                messagePublisher.reportError("Unable to run the query", error.message, null, false);
+                this.isLoading(false);
+                return;
+            }
+            
             const resultsFetcher = (skip: number, take: number) => {
                 const command = new queryCommand(database, skip + totalSkippedResults, take + 1, this.criteria(), !this.cacheEnabled());
                 
@@ -630,6 +638,13 @@ class query extends viewModelBase {
                     })
                     .done((queryResults: pagedResultExtended<document>) => {
                         this.hasMoreUnboundedResults(false);
+                        
+                        if (queryResults.items.length < take + 1) {
+                            // we get less items than requested. I assume the distinct operation was used. 
+                            // let's try to handle that. I assuming that we reach the end of results.
+                            queryResults.totalResultCount = skip + queryResults.items.length;
+                            queryResults.additionalResultInfo.TotalResults = queryResults.totalResultCount;
+                        }
                     
                         if (queryResults.totalResultCount === -1) {
                             // unbounded result set
@@ -637,11 +652,11 @@ class query extends viewModelBase {
                                 // returned all or have more
                                 this.hasMoreUnboundedResults(true);
                                 queryResults.totalResultCount = skip + take + 30;
+                                queryResults.additionalResultInfo.TotalResults = skip + take;
                             } else {
                                 queryResults.totalResultCount = skip + queryResults.items.length;
+                                queryResults.additionalResultInfo.TotalResults = queryResults.totalResultCount;
                             }
-                            
-                            queryResults.additionalResultInfo.TotalResults = queryResults.totalResultCount;
                         }
                         
                         if (queryResults.additionalResultInfo.SkippedResults) {
@@ -720,7 +735,10 @@ class query extends viewModelBase {
                 
                 // Verify if name already exists
                 if (_.find(savedQueriesStorage.getSavedQueries(this.activeDatabase()), x => x.name.toUpperCase() === this.querySaveName().toUpperCase())) {
-                    this.confirmationMessage(`Query ${this.querySaveName()} already exists`, `Overwrite existing query ?`, ["No", "Overwrite"])
+                    this.confirmationMessage(`Query ${generalUtils.escapeHtml(this.querySaveName())} already exists`, `Overwrite existing query?`, {
+                        buttons: ["No", "Overwrite"],
+                        html: true
+                    })
                         .done(result => {
                             if (result.can) {
                                 this.saveQueryToStorage(this.criteria().toStorageDto());   
@@ -793,7 +811,7 @@ class query extends viewModelBase {
     }
 
     private getRecentQueryName(): string {
-        const collectionIndexName = queryUtil.getCollectionOrIndexName(this.criteria().queryText());
+        const [collectionIndexName] = queryUtil.getCollectionOrIndexName(this.criteria().queryText());
 
         return query.recentKeyword + " (" + collectionIndexName + ")";
     }
@@ -821,7 +839,10 @@ class query extends viewModelBase {
     }
 
     removeQuery(item: storedQueryDto) {
-        this.confirmationMessage("Query", `Are you sure you want to delete query '${item.name}'?`, ["Cancel", "Delete"])
+        this.confirmationMessage("Query", `Are you sure you want to delete query '${generalUtils.escapeHtml(item.name)}'?`, {
+            buttons: ["Cancel", "Delete"],
+            html: true
+        })
             .done(result => {
                 if (result.can) {
 
@@ -1041,14 +1062,27 @@ class query extends viewModelBase {
     exportCsv() {
         eventsCollector.default.reportEvent("query", "export-csv");
 
-        const args = {
-            format: "csv",
-        };
-
-        const payload = {
-            Query: this.criteria().queryText()
-        };
-
+        let args: { format: string, debug?: string };
+        if (this.criteria().indexEntries()) {
+            args = {
+                format: "csv",
+                debug: "entries"
+            };
+        } else {
+            args = {
+                format: "csv"
+            };
+        }
+        let payload: { Query: string };
+        if (this.criteria().showFields()) {
+            payload = {
+                Query: queryUtil.replaceSelectAndIncludeWithFetchAllStoredFields(this.criteria().queryText())
+            };
+        } else {
+            payload = {
+                Query: this.criteria().queryText()
+            };
+        }
         $("input[name=ExportOptions]").val(JSON.stringify(payload));
 
         const url = appUrl.forDatabaseQuery(this.activeDatabase()) + endpoints.databases.streaming.streamsQueries + appUrl.urlEncodeArgs(args);

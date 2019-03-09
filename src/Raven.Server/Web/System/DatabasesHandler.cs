@@ -5,6 +5,7 @@ using System.Net;
 using System.Threading.Tasks;
 using Raven.Client.Documents.Indexes;
 using Raven.Client.Documents.Operations.Configuration;
+using Raven.Client.Extensions;
 using Raven.Client.Http;
 using Raven.Client.ServerWide;
 using Raven.Client.ServerWide.Commands;
@@ -183,6 +184,7 @@ namespace Raven.Server.Web.System
             var domain = GetStringQueryString("domain", required: false);
             var apiKey = GetStringQueryString("apiKey", required: false);
             var enableBasicAuthenticationOverUnsecuredHttp = GetBoolValueQueryString("enableBasicAuthenticationOverUnsecuredHttp", required: false);
+            var skipServerCertificateValidation = GetBoolValueQueryString("skipServerCertificateValidation", required: false);
             var migrator = new Migrator(new SingleDatabaseMigrationConfiguration
             {
                 ServerUrl = serverUrl,
@@ -190,7 +192,8 @@ namespace Raven.Server.Web.System
                 Password = password,
                 Domain = domain,
                 ApiKey = apiKey,
-                EnableBasicAuthenticationOverUnsecuredHttp = enableBasicAuthenticationOverUnsecuredHttp ?? false
+                EnableBasicAuthenticationOverUnsecuredHttp = enableBasicAuthenticationOverUnsecuredHttp ?? false,
+                SkipServerCertificateValidation = skipServerCertificateValidation ?? false
             }, ServerStore);
             
             var buildInfo = await migrator.GetBuildInfo();

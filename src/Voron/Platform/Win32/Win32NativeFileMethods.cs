@@ -12,6 +12,7 @@ using System.Security;
 using System.Text;
 using System.Threading;
 using Microsoft.Win32.SafeHandles;
+using Sparrow;
 using Sparrow.Utils;
 using Voron.Exceptions;
 
@@ -24,14 +25,12 @@ namespace Voron.Platform.Win32
         public const int ErrorHandleEof = 38;
         public const int ErrorInvalidHandle = 6;
 
-
         [StructLayout(LayoutKind.Explicit, Size = 8)]
         public struct FileSegmentElement
         {
             [FieldOffset(0)] public IntPtr Buffer;
             [FieldOffset(0)] public UInt64 Alignment;
         }
-
 
         [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
@@ -71,15 +70,11 @@ namespace Voron.Platform.Win32
         public static extern bool WriteFile(SafeFileHandle hFile, byte* lpBuffer, int nNumberOfBytesToWrite,
             IntPtr lpNumberOfBytesWritten, NativeOverlapped* lpOverlapped);
 
-
         [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
 
         public static extern bool WriteFile(SafeFileHandle hFile, byte* lpBuffer, int nNumberOfBytesToWrite,
             out int lpNumberOfBytesWritten, NativeOverlapped* lpOverlapped);
-
-
-
 
         [DllImport(@"kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
@@ -115,49 +110,25 @@ namespace Voron.Platform.Win32
 
         public static extern bool FlushFileBuffers(SafeFileHandle hFile);
 
-        [DllImport("kernel32.dll", EntryPoint = "GetFinalPathNameByHandleW", CharSet = CharSet.Unicode,
-             SetLastError = true)]
-        public static extern int GetFinalPathNameByHandle(SafeFileHandle handle, [In, Out] StringBuilder path,
-            int bufLen, int flags);
-
-        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        public static extern bool GetDiskFreeSpaceEx(string lpDirectoryName,
-                out ulong lpFreeBytesAvailable,
-                out ulong lpTotalNumberOfBytes,
-                out ulong lpTotalNumberOfFreeBytes);
-
-
         public static void SetFileLength(SafeFileHandle fileHandle, long length)
         {
             if (SetFilePointerEx(fileHandle, length, IntPtr.Zero, Win32NativeFileMoveMethod.Begin) == false)
             {
                 var exception = new Win32Exception(Marshal.GetLastWin32Error());
-
                 var filePath = GetFilePath();
-
+                
                 throw new IOException($"Could not move the pointer of file {filePath}", exception);
             }
 
             if (SetEndOfFile(fileHandle) == false)
             {
                 var lastError = Marshal.GetLastWin32Error();
-
                 var filePath = GetFilePath();
 
                 if (lastError == (int) Win32NativeFileErrors.ERROR_DISK_FULL)
                 {
-                    long? freeSpaceAvailable = null;
-                    
-                    if(GetDiskFreeSpaceEx(Path.GetDirectoryName(filePath),
-                        out _,
-                        out _,
-                        out var totalFreeAvailable))
-                    {
-                        freeSpaceAvailable = (long)totalFreeAvailable;
-                    }
-
-                    throw new DiskFullException(filePath, length, freeSpaceAvailable);
+                    var driveInfo = DiskSpaceChecker.GetDiskSpaceInfo(filePath);
+                    throw new DiskFullException(filePath, length, driveInfo?.TotalFreeSpace.GetValue(SizeUnit.Bytes));
                 }
 
                 var exception = new Win32Exception(lastError);
@@ -171,15 +142,14 @@ namespace Voron.Platform.Win32
 
             string GetFilePath()
             {
-                var filePath = new StringBuilder(256);
-
-                while (GetFinalPathNameByHandle(fileHandle, filePath, filePath.Capacity, 0) > filePath.Capacity &&
-                       filePath.Capacity < 32767) // max unicode path length
+                try
                 {
-                    filePath.EnsureCapacity(filePath.Capacity * 2);
+                    return DiskSpaceChecker.GetWindowsRealPathByHandle(fileHandle.DangerousGetHandle());
                 }
-
-                return filePath.ToString();
+                catch
+                {
+                    return null;
+                }
             }
         }
     }
@@ -396,8 +366,6 @@ namespace Voron.Platform.Win32
             SectionReserve = 0x4000000,
         }
 
-
-
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         public static extern IntPtr CreateFileMapping(
             IntPtr hFile,
@@ -490,7 +458,6 @@ namespace Voron.Platform.Win32
             uint ShareMode, IntPtr lpSecurityAttributes,
             uint CreationDisposition, uint dwFlagsAndAttributes,
             IntPtr hTemplateFile);
-
 
         public struct StorageDeviceNumber
         {

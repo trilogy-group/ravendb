@@ -11,6 +11,7 @@ using Raven.Server.Documents.Replication;
 using Raven.Client.Exceptions.Documents;
 using Raven.Client.Exceptions.Documents.Indexes;
 using Raven.Server.ServerWide.Context;
+using Raven.Server.Utils;
 using Voron;
 using Voron.Data.Tables;
 using Voron.Impl;
@@ -175,9 +176,12 @@ namespace Raven.Server.Documents
 
                     DeleteTombstoneIfNeeded(context, keySlice);
 
-                    var changeVector = _documentsStorage.GetNewChangeVector(context, attachmentEtag);
+                    var changeVector = ChangeVectorUtils.TryUpdateChangeVector(_documentDatabase.ServerStore.NodeTag, _documentDatabase.DbBase64Id, attachmentEtag,
+                        context.LastDatabaseChangeVector ?? GetDatabaseChangeVector(context)).ChangeVector;
                     Debug.Assert(changeVector != null);
                     context.LastDatabaseChangeVector = changeVector;
+
+                    Debug.Assert(changeVector != null);
 
                     var table = context.Transaction.InnerTransaction.OpenTable(AttachmentsSchema, AttachmentsMetadataSlice);
                     void SetTableValue(TableValueBuilder tvb, Slice cv)
@@ -285,17 +289,19 @@ namespace Raven.Server.Documents
         /// <summary>
         /// Should be used only from replication or smuggler.
         /// </summary>
-        public void PutDirect(DocumentsOperationContext context, Slice key, Slice name, Slice contentType, Slice base64Hash, string changeVector)
+        public void PutDirect(DocumentsOperationContext context, Slice key, Slice name, Slice contentType, Slice base64Hash, string changeVector = null)
         {
             Debug.Assert(base64Hash.Size == 44, $"Hash size should be 44 but was: {key.Size}");
 
             var newEtag = _documentsStorage.GenerateNextEtag();
+
             if (string.IsNullOrEmpty(changeVector))
             {
-                changeVector = _documentsStorage.GetNewChangeVector(context, newEtag);
+                changeVector = ChangeVectorUtils.TryUpdateChangeVector(_documentDatabase.ServerStore.NodeTag, _documentDatabase.DbBase64Id, newEtag,
+                    context.LastDatabaseChangeVector ?? GetDatabaseChangeVector(context)).ChangeVector;
                 context.LastDatabaseChangeVector = changeVector;
             }
-
+            Debug.Assert(changeVector != null);
             DeleteTombstoneIfNeeded(context, key);
 
             var table = context.Transaction.InnerTransaction.OpenTable(AttachmentsSchema, AttachmentsMetadataSlice);
@@ -335,6 +341,7 @@ namespace Raven.Server.Documents
                 var attachments = GetAttachmentsMetadataForDocument(context, lowerDocumentId);
 
                 var flags = TableValueToFlags((int)DocumentsTable.Flags, ref copyTvr);
+                flags = flags.Strip(DocumentFlags.FromClusterTransaction | DocumentFlags.Resolved);
 
                 data.Modifications = new DynamicJsonValue(data);
                 if (data.TryGet(Constants.Documents.Metadata.Key, out BlittableJsonReaderObject metadata))
@@ -371,7 +378,7 @@ namespace Raven.Server.Documents
                 }
 
                 data = context.ReadObject(data, documentId, BlittableJsonDocumentBuilder.UsageMode.ToDisk);
-                return _documentsStorage.Put(context, documentId, null, data, null, changeVector, flags, NonPersistentDocumentFlags.ByAttachmentUpdate).ChangeVector;
+                return _documentsStorage.Put(context, documentId, null, data, null, null, flags, NonPersistentDocumentFlags.ByAttachmentUpdate).ChangeVector;
             }
             finally
             {
@@ -797,7 +804,7 @@ namespace Raven.Server.Documents
             };
         }
 
-        public AttachmentDetails CopyAttachment(DocumentsOperationContext context, string documentId, string name, string destinationId, string destinationName, LazyStringValue changeVector)
+        public AttachmentDetails CopyAttachment(DocumentsOperationContext context, string documentId, string name, string destinationId, string destinationName, LazyStringValue changeVector, AttachmentType attachmentType)
         {
             if (string.IsNullOrWhiteSpace(documentId))
                 throw new ArgumentException("Argument cannot be null or whitespace.", nameof(documentId));
@@ -810,7 +817,7 @@ namespace Raven.Server.Documents
             if (context.Transaction == null)
                 throw new ArgumentException("Context must be set with a valid transaction before calling Copy", nameof(context));
 
-            var attachment = GetAttachment(context, documentId, name, AttachmentType.Document, changeVector);
+            var attachment = GetAttachment(context, documentId, name, attachmentType, changeVector);
             if (attachment == null)
                 AttachmentDoesNotExistException.ThrowFor(documentId, name);
 
@@ -1113,7 +1120,7 @@ namespace Raven.Server.Documents
             return (doc, name);
         }
 
-#if DEBUG
+        [Conditional("DEBUG")]
         public static void AssertAttachments(BlittableJsonReaderObject document, DocumentFlags flags)
         {
             if ((flags & DocumentFlags.HasAttachments) == DocumentFlags.HasAttachments)
@@ -1133,6 +1140,5 @@ namespace Raven.Server.Documents
                 }
             }
         }
-#endif
     }
 }

@@ -26,22 +26,6 @@ namespace Sparrow.Json
 
         private class ContextStack : StackHeader<T>, IDisposable
         {
-            ~ContextStack()
-            {
-                if (Environment.HasShutdownStarted)
-                    return; // let the OS clean this up
-
-                try
-                {
-                    DisposeOfContexts();
-                }
-                catch (ObjectDisposedException)
-                {
-                    // This is expected, we might be calling the finalizer on an object that
-                    // was already disposed, we don't want to error here because of this
-                }
-            }
-
             public void Dispose()
             {
                 GC.SuppressFinalize(this);
@@ -193,12 +177,24 @@ namespace Sparrow.Json
 
             public void Dispose()
             {
+                if (Parent == null)
+                    return;// disposed already
+
+                if (Context.DoNotReuse)
+                {
+                    Context.Dispose();
+                    return;
+                }
+
                 Context.Reset();
                 // These contexts are reused, so we don't want to use LowerOrDie here.
                 Context.InUse.Lower();
                 Context.InPoolSince = DateTime.UtcNow;
 
                 Parent.Push(Context);
+
+                Parent = null;
+                Context = null;
             }
 
         }

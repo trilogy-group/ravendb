@@ -526,6 +526,7 @@ namespace Raven.Server.Documents.Indexes
             {
                 foreach (var kvp in indexingScope.ReferenceEtagsByCollection)
                 {
+                    var lastIndexedEtag = ReadLastIndexedEtag(tx, kvp.Key);
                     var collectionEtagTree = tx.InnerTransaction.CreateTree("$" + kvp.Key); // $collection
                     foreach (var collections in kvp.Value)
                     {
@@ -536,11 +537,19 @@ namespace Raven.Server.Documents.Indexes
                         using (Slice.From(tx.InnerTransaction.Allocator, collectionName.Name, ByteStringType.Immutable, out Slice collectionKey))
                         {
                             var etag = collections.Value;
-
                             var result = collectionEtagTree.Read(collectionKey);
                             var oldEtag = result?.Reader.ReadLittleEndianInt64();
                             if (oldEtag >= etag)
                                 continue;
+
+                            if (oldEtag == lastIndexedEtag)
+                                continue;
+
+                            // we cannot set referenced etag value higher than last processed document from the main indexing functions
+                            // to avoid skipping document re-indexation when batch is being cancelled (e.g. due to memory limitations)
+                            // and changed are applied to references, not main documents (RDBC-128.IndexingOfLoadDocumentWhileChanged)
+                            if (etag > lastIndexedEtag)
+                                etag = lastIndexedEtag;
 
                             using (Slice.External(tx.InnerTransaction.Allocator, (byte*)&etag, sizeof(long), out Slice etagSlice))
                                 collectionEtagTree.Add(collectionKey, etagSlice);

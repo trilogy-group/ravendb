@@ -314,10 +314,25 @@ namespace Raven.Server.Documents.Queries.Results
                 ThrowBinaryValuesNotSupported();
 
             var stringValue = field.StringValue(state);
-            if (stringValue == Constants.Documents.Indexing.Fields.NullValue || stringValue == null)
+
+            if (stringValue == null)
                 return null;
-            if (stringValue == Constants.Documents.Indexing.Fields.EmptyString || stringValue == string.Empty)
+
+            if (stringValue == string.Empty)
                 return string.Empty;
+
+            if (field.IsTokenized == false)
+            {
+                // NULL_VALUE and EMPTY_STRING fields aren't tokenized
+                // this will prevent converting fields with a "NULL_VALUE" string to null
+                switch (stringValue)
+                {
+                    case Constants.Documents.Indexing.Fields.NullValue:
+                        return null;
+                    case Constants.Documents.Indexing.Fields.EmptyString:
+                        return string.Empty;
+                }
+            }
 
             if (fieldType.IsJson == false)
                 return stringValue;
@@ -358,6 +373,7 @@ namespace Raven.Server.Documents.Queries.Results
                     value = InvokeFunction(
                         fieldToFetch.QueryField.Name,
                         _query.Metadata.Query,
+                        document?.Id,
                         args);
 
                     return true;
@@ -462,8 +478,11 @@ namespace Raven.Server.Documents.Queries.Results
                 else if (fieldToFetch.CanExtractFromIndex)
                 {
                     var field = luceneDoc.GetField(fieldToFetch.QueryField.SourceAlias);
-                    var fieldValue = ConvertType(_context, field, GetFieldType(field.Name, luceneDoc), state);
-                    _loadedDocumentIds.Add(fieldValue.ToString());
+                    if (field != null)
+                    {
+                        var fieldValue = ConvertType(_context, field, GetFieldType(field.Name, luceneDoc), state);
+                        _loadedDocumentIds.Add(fieldValue.ToString());
+                    }
                 }
 
                 else
@@ -607,13 +626,13 @@ namespace Raven.Server.Documents.Queries.Results
             }
         }
 
-        public object InvokeFunction(string methodName, Query query, object[] args)
+        public object InvokeFunction(string methodName, Query query, string documentId, object[] args)
         {
             var key = new QueryKey(query.DeclaredFunctions);
             using (_database.Scripts.GetScriptRunner(key, readOnly: true, patchRun: out var run))
             using (var result = run.Run(_context, _context as DocumentsOperationContext, methodName, args))
             {
-                _includeDocumentsCommand?.AddRange(run.Includes);
+                _includeDocumentsCommand?.AddRange(run.Includes, documentId);
 
                 if (result.IsNull)
                     return null;

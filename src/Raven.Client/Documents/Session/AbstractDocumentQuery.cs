@@ -950,8 +950,8 @@ Use session.Query<T>() instead of session.Advanced.DocumentQuery<T>. The session
             if (whereToken == null)
                 throw new InvalidOperationException("Missing where clause");
 
-            if (boost <= 0m)
-                throw new ArgumentOutOfRangeException(nameof(boost), "Boost factor must be a positive number");
+            if (boost < 0m)
+                throw new ArgumentOutOfRangeException(nameof(boost), "Boost factor must be a non-negative number");
 
             whereToken.Options.Boost = boost;
         }
@@ -1689,7 +1689,7 @@ Use session.Query<T>() instead of session.Advanced.DocumentQuery<T>. The session
 
             var tokens = GetCurrentWhereTokens();
             var current = tokens.First;
-            while(current != null)
+            while (current != null)
             {
                 if (current.Value is WhereToken w)
                     current.Value = w.AddAlias(fromAlias);
@@ -1720,7 +1720,7 @@ Use session.Query<T>() instead of session.Advanced.DocumentQuery<T>. The session
         {
             sourceAlias = null;
 
-            if (fields.Length != 1)
+            if (fields.Length != 1 || fields[0] == null)
                 return;
 
             var indexOf = fields[0].IndexOf(".", StringComparison.Ordinal);

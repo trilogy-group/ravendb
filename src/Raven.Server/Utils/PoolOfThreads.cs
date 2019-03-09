@@ -5,12 +5,14 @@ using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
+using Raven.Client;
 using Sparrow.Binary;
 using Sparrow.Logging;
 using Sparrow.LowMemory;
 using Sparrow.Platform;
 using Sparrow.Platform.Posix;
 using Sparrow.Utils;
+using Constants = Voron.Global.Constants;
 
 namespace Raven.Server.Utils
 {
@@ -32,15 +34,8 @@ namespace Raven.Server.Utils
 
         public static PoolOfThreads GlobalRavenThreadPool => _globalRavenThreadPool.Value;
         private static Logger _log = LoggingSource.Instance.GetLogger<PoolOfThreads>("Server");
-        private float _minimumFreeCommittedMemory = 0.05f;
 
-        public void SetMinimumFreeCommittedMemory(float min)
-        {
-            if (min <= 0)
-                throw new ArgumentException("MinimumFreeCommittedMemory must be positive, but was: " + min);
-
-            _minimumFreeCommittedMemory = min;
-        }
+        public int TotalNumberOfThreads;
 
         public void SetThreadsAffinityIfNeeded()
         {
@@ -107,10 +102,10 @@ namespace Raven.Server.Utils
         {
             if (_pool.TryDequeue(out var pooled) == false)
             {
-                MemoryInformation.AssertNotAboutToRunOutOfMemory(_minimumFreeCommittedMemory);
+                MemoryInformation.AssertNotAboutToRunOutOfMemory();
 
                 pooled = new PooledThread(this);
-                var thread = new Thread(pooled.Run)
+                var thread = new Thread(pooled.Run, PlatformDetails.Is32Bits ? 512 * Constants.Size.Kilobyte : 0)
                 {
                     Name = name,
                     IsBackground = true,
@@ -172,6 +167,7 @@ namespace Raven.Server.Utils
             {
                 try
                 {
+                    Interlocked.Increment(ref _parent.TotalNumberOfThreads);
                     InitializeProcessThreads();
                     LongRunningWork.CurrentPooledThread = this;
 
@@ -186,6 +182,7 @@ namespace Raven.Server.Utils
                 finally
                 {
                     NativeMemory.NotifyCurrentThreadAboutToClose();
+                    Interlocked.Decrement(ref _parent.TotalNumberOfThreads);
                 }
             }
 
@@ -227,6 +224,7 @@ namespace Raven.Server.Utils
                 _action = null;
                 _state = null;
                 _workIsDone = null;
+                NativeMemory.CurrentThreadStats.CurrentlyAllocatedForProcessing = 0;
 
                 ThreadLocalCleanup.Run();
 

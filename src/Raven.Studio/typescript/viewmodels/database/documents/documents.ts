@@ -63,6 +63,18 @@ class documents extends viewModelBase {
     constructor() {
         super();
 
+        this.columnsSelector.configureColumnsPersistence(() => {
+            if (this.currentCollection().isAllDocuments) {
+                // don't save custom layout for all documents
+                return null;
+            }
+            
+            const dbName = this.activeDatabase().name;
+            const collectionName = this.currentCollection().name;
+            
+            return dbName + ".[" + collectionName + "]";
+        });
+        
         this.initObservables();
     }
 
@@ -178,7 +190,7 @@ class documents extends viewModelBase {
 
     compositionComplete() {
         super.compositionComplete();
-
+        
         this.$downloadForm = $("#exportCsvForm");
         
         this.setupDisableReasons();
@@ -190,11 +202,13 @@ class documents extends viewModelBase {
         const documentsProvider = new documentBasedColumnsProvider(this.activeDatabase(), grid, 
             { showRowSelectionCheckbox: true, enableInlinePreview: false, showSelectAllCheckbox: true, showFlags: true });
 
+        this.columnsSelector.tryInitializeWithSavedDefault(source => documentsProvider.reviver(source));
+        
         this.columnsSelector.init(grid, (s, t, previewCols, fullCols) => this.fetchDocs(s, t, previewCols, fullCols), (w, r) => {
             if (this.currentCollection().isAllDocuments) {
                 return [
                     new checkedColumn(true),
-                    new hyperlinkColumn<document>(grid, x => x.getId(), x => appUrl.forEditDoc(x.getId(), this.activeDatabase()), "Id", "300px"),
+                    new hyperlinkColumn<document>(grid, document.createDocumentIdProvider(), x => appUrl.forEditDoc(x.getId(), this.activeDatabase()), "Id", "300px"),
                     new textColumn<document>(grid, x => changeVectorUtils.formatChangeVectorAsShortString(x.__metadata.changeVector()), "Change Vector", "200px"),
                     new textColumn<document>(grid, x => generalUtils.formatUtcDateAsLocal(x.__metadata.lastModified()), "Last Modified", "300px"),
                     new hyperlinkColumn<document>(grid, x => x.getCollection(), x => appUrl.forDocuments(x.getCollection(), this.activeDatabase()), "Collection", "200px"),

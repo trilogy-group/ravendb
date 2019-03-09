@@ -1,10 +1,9 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using System.Linq;
 using System.Runtime.CompilerServices;
-using System.Runtime.Serialization;
 using System.Threading.Tasks;
 using Raven.Client.Documents.Attachments;
 using Raven.Client.Documents.Indexes;
@@ -23,12 +22,14 @@ using Raven.Server.ServerWide.Commands.ConnectionStrings;
 using Raven.Server.ServerWide.Context;
 using Raven.Server.Smuggler.Documents.Data;
 using Raven.Server.Smuggler.Documents.Processors;
+using Raven.Server.Utils;
 using Sparrow.Json;
 using Sparrow.Logging;
 using Voron;
 using Voron.Global;
 using Sparrow;
 using Sparrow.Json.Parsing;
+using Sparrow.Platform;
 using Sparrow.Utils;
 
 namespace Raven.Server.Smuggler.Documents
@@ -39,6 +40,7 @@ namespace Raven.Server.Smuggler.Documents
 
         private readonly Logger _log;
         private BuildVersionType _buildType;
+        private static DatabaseSmugglerOptionsServerSide _options;
 
         public DatabaseDestination(DocumentDatabase database)
         {
@@ -46,9 +48,10 @@ namespace Raven.Server.Smuggler.Documents
             _log = LoggingSource.Instance.GetLogger<DatabaseDestination>(database.Name);
         }
 
-        public IDisposable Initialize(DatabaseSmugglerOptions options, SmugglerResult result, long buildVersion)
+        public IDisposable Initialize(DatabaseSmugglerOptionsServerSide options, SmugglerResult result, long buildVersion)
         {
             _buildType = BuildVersion.Type(buildVersion);
+            _options = options;
             return null;
         }
 
@@ -131,7 +134,17 @@ namespace Raven.Server.Smuggler.Documents
             private MergedBatchPutCommand _prevCommand;
             private Task _prevCommandTask = Task.CompletedTask;
 
+            private MergedBatchDeleteRevisionCommand _revisionDeleteCommand;
+            private MergedBatchDeleteRevisionCommand _prevRevisionDeleteCommand;
+            private Task _prevRevisionCommandTask = Task.CompletedTask;
+
+            private MergedBatchFixDocumentMetadataCommand _fixDocumentMetadataCommand;
+            private MergedBatchFixDocumentMetadataCommand _prevFixDocumentMetadataCommand;
+            private Task _prevFixDocumentMetadataCommandTask = Task.CompletedTask;
+
             private readonly Sparrow.Size _enqueueThreshold;
+            private readonly ConcurrentDictionary<string, CollectionName> _missingDocumentsForRevisions;
+            private readonly HashSet<string> _documentIdsOfMissingAttachments;
 
             public DatabaseDocumentActions(DocumentDatabase database, BuildVersionType buildType, bool isRevision, Logger log)
             {
@@ -143,7 +156,9 @@ namespace Raven.Server.Smuggler.Documents
                     (sizeof(int) == IntPtr.Size || database.Configuration.Storage.ForceUsing32BitsPager) ? 2 : 32,
                     SizeUnit.Megabytes);
 
-                _command = new MergedBatchPutCommand(database, buildType, log)
+                _missingDocumentsForRevisions = isRevision ? new ConcurrentDictionary<string, CollectionName>() : null;
+                _documentIdsOfMissingAttachments = isRevision ? null : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                _command = new MergedBatchPutCommand(database, buildType, log, _missingDocumentsForRevisions, _documentIdsOfMissingAttachments)
                 {
                     IsRevision = isRevision
                 };
@@ -152,8 +167,12 @@ namespace Raven.Server.Smuggler.Documents
             public void WriteDocument(DocumentItem item, SmugglerProgressBase.CountsWithLastEtag progress)
             {
                 if (item.Attachments != null)
-                    progress.Attachments.ReadCount += item.Attachments.Count;
-
+                {
+                    if (_options.OperateOnTypes.HasFlag(DatabaseItemType.Attachments))
+                        progress.Attachments.ReadCount += item.Attachments.Count;
+                    else
+                        progress.Attachments.Skipped = true;
+                }
 
                 _command.Add(item);
                 HandleBatchOfDocumentsIfNecessary();
@@ -199,12 +218,146 @@ namespace Raven.Server.Smuggler.Documents
             public void Dispose()
             {
                 FinishBatchOfDocuments();
+                FixDocumentMetadataIfNecessary();
+                DeleteRevisionsForNonExistingDocuments();
+            }
+
+            private void FixDocumentMetadataIfNecessary()
+            {
+                if (_documentIdsOfMissingAttachments == null || 
+                    _documentIdsOfMissingAttachments.Count == 0)
+                    return;
+
+                _fixDocumentMetadataCommand = new MergedBatchFixDocumentMetadataCommand(_database, _log);
+
+                foreach (var docId in _documentIdsOfMissingAttachments)
+                {
+                    _fixDocumentMetadataCommand.Add(docId);
+                    HandleBatchOfFixDocumentsMetadataIfNecessary();
+                }
+
+                FinishBatchOfFixDocumentsMetadata();
+            }
+
+            private void HandleBatchOfFixDocumentsMetadataIfNecessary()
+            {
+                var prevDoneAndHasEnough = _fixDocumentMetadataCommand.Context.AllocatedMemory > Constants.Size.Megabyte && _prevRevisionCommandTask.IsCompleted;
+                var currentReachedLimit = _fixDocumentMetadataCommand.Context.AllocatedMemory > _enqueueThreshold.GetValue(SizeUnit.Bytes);
+
+                if (currentReachedLimit == false && prevDoneAndHasEnough == false)
+                    return;
+
+                var prevCommand = _prevFixDocumentMetadataCommand;
+                var prevCommandTask = _prevFixDocumentMetadataCommandTask;
+                var commandTask = _database.TxMerger.Enqueue(_fixDocumentMetadataCommand);
+                // we ensure that we first enqueue the command to if we
+                // fail to do that, we won't be waiting on the previous
+                // one
+                _prevFixDocumentMetadataCommand = _fixDocumentMetadataCommand;
+                _prevFixDocumentMetadataCommandTask = commandTask;
+
+                if (prevCommand != null)
+                {
+                    using (prevCommand)
+                    {
+                        prevCommandTask.GetAwaiter().GetResult();
+                        Debug.Assert(prevCommand.IsDisposed == false,
+                            "we rely on reusing this context on the next batch, so it has to be disposed here");
+                    }
+                }
+
+                _fixDocumentMetadataCommand = new MergedBatchFixDocumentMetadataCommand(_database, _log);
+            }
+
+            private void FinishBatchOfFixDocumentsMetadata()
+            {
+                if (_prevFixDocumentMetadataCommand != null)
+                {
+                    using (_prevFixDocumentMetadataCommand)
+                        AsyncHelpers.RunSync(() => _prevFixDocumentMetadataCommandTask);
+
+                    _prevFixDocumentMetadataCommand = null;
+                }
+
+                if (_fixDocumentMetadataCommand.Ids.Count > 0)
+                {
+                    using (_fixDocumentMetadataCommand)
+                        AsyncHelpers.RunSync(() => _database.TxMerger.Enqueue(_fixDocumentMetadataCommand));
+                }
+
+                _fixDocumentMetadataCommand = null;
+            }
+
+            private void DeleteRevisionsForNonExistingDocuments()
+            {
+                if (_missingDocumentsForRevisions == null)
+                    return;
+
+                _revisionDeleteCommand = new MergedBatchDeleteRevisionCommand(_database, _log);
+
+                foreach (var docId in _missingDocumentsForRevisions)
+                {
+                    _revisionDeleteCommand.Add(docId);
+                    HandleBatchOfRevisionsIfNecessary();
+                }
+
+                FinishBatchOfRevisions();
+            }
+
+            private void HandleBatchOfRevisionsIfNecessary()
+            {
+                var prevDoneAndHasEnough = _revisionDeleteCommand.Context.AllocatedMemory > Constants.Size.Megabyte && _prevRevisionCommandTask.IsCompleted;
+                var currentReachedLimit = _revisionDeleteCommand.Context.AllocatedMemory > _enqueueThreshold.GetValue(SizeUnit.Bytes);
+
+                if (currentReachedLimit == false && prevDoneAndHasEnough == false)
+                    return;
+
+                var prevCommand = _prevRevisionDeleteCommand;
+                var prevCommandTask = _prevRevisionCommandTask;
+                var commandTask = _database.TxMerger.Enqueue(_revisionDeleteCommand);
+                // we ensure that we first enqueue the command to if we
+                // fail to do that, we won't be waiting on the previous
+                // one
+                _prevRevisionDeleteCommand = _revisionDeleteCommand;
+                _prevRevisionCommandTask = commandTask;
+
+                if (prevCommand != null)
+                {
+                    using (prevCommand)
+                    {
+                        prevCommandTask.GetAwaiter().GetResult();
+                        Debug.Assert(prevCommand.IsDisposed == false,
+                            "we rely on reusing this context on the next batch, so it has to be disposed here");
+                    }
+                }
+
+                _revisionDeleteCommand = new MergedBatchDeleteRevisionCommand(_database, _log);
+            }
+
+            private void FinishBatchOfRevisions()
+            {
+                if (_prevRevisionDeleteCommand != null)
+                {
+                    using (_prevRevisionDeleteCommand)
+                        AsyncHelpers.RunSync(() => _prevRevisionCommandTask);
+
+                    _prevRevisionDeleteCommand = null;
+                }
+
+                if (_revisionDeleteCommand.Ids.Count > 0)
+                {
+                    using (_revisionDeleteCommand)
+                        AsyncHelpers.RunSync(() => _database.TxMerger.Enqueue(_revisionDeleteCommand));
+                }
+
+                _revisionDeleteCommand = null;
             }
 
             private void HandleBatchOfDocumentsIfNecessary()
             {
-                var prevDoneAndHasEnough = _command.Context.AllocatedMemory > Constants.Size.Megabyte && _prevCommandTask.IsCompleted;
-                var currentReachedLimit = _command.Context.AllocatedMemory > _enqueueThreshold.GetValue(SizeUnit.Bytes);
+                var commandSize = _command.GetCommandAllocationSize();
+                var prevDoneAndHasEnough = commandSize > Constants.Size.Megabyte && _prevCommandTask.IsCompleted;
+                var currentReachedLimit = commandSize > _enqueueThreshold.GetValue(SizeUnit.Bytes);
 
                 if (currentReachedLimit == false && prevDoneAndHasEnough == false)
                     return;
@@ -229,7 +382,8 @@ namespace Raven.Server.Smuggler.Documents
                     }
                 }
 
-                _command = new MergedBatchPutCommand(_database, _buildType, _log)
+                _command = new MergedBatchPutCommand(_database, _buildType, _log, 
+                    _missingDocumentsForRevisions, _documentIdsOfMissingAttachments)
                 {
                     IsRevision = _isRevision
                 };
@@ -347,7 +501,7 @@ namespace Raven.Server.Smuggler.Documents
             public void WriteDatabaseRecord(DatabaseRecord databaseRecord, SmugglerProgressBase.DatabaseRecordProgress progress, AuthorizationStatus authorizationStatus)
             {
                 var currentDatabaseRecord = _database.ReadDatabaseRecord();
-                var tasks = new List<Task>();
+                var tasks = new List<Task<(long Index, object Result)>>();
 
                 if (currentDatabaseRecord?.Revisions == null &&
                     databaseRecord?.Revisions != null)
@@ -400,10 +554,18 @@ namespace Raven.Server.Smuggler.Documents
                     progress.ClientConfigurationUpdated = true;
                 }
 
+                if (tasks.Count == 0)
+                    return;
+
+                long maxIndex = 0;
                 foreach (var task in tasks)
                 {
-                    AsyncHelpers.RunSync(() => task);
+                    var (index, _) = AsyncHelpers.RunSync(() => task);
+                    if (index > maxIndex)
+                        maxIndex = index;
                 }
+
+                AsyncHelpers.RunSync(() => _database.RachisLogIndexNotifications.WaitForIndexNotification(maxIndex, _database.ServerStore.Engine.OperationTimeout));
 
                 tasks.Clear();
             }
@@ -428,16 +590,35 @@ namespace Raven.Server.Smuggler.Documents
             private bool _isDisposed;
 
             public bool IsDisposed => _isDisposed;
-
+            private readonly ConcurrentDictionary<string, CollectionName> _missingDocumentsForRevisions;
+            private readonly HashSet<string> _documentIdsOfMissingAttachments;
             private readonly DocumentsOperationContext _context;
-            private const string PreV4RevisionsDocumentId = "/revisions/";
+            private long _attachmentsStreamSizeOverhead;
 
-            public MergedBatchPutCommand(DocumentDatabase database, BuildVersionType buildType, Logger log)
+            public MergedBatchPutCommand(DocumentDatabase database, BuildVersionType buildType,
+                Logger log, 
+                ConcurrentDictionary<string, CollectionName> missingDocumentsForRevisions = null,
+                HashSet<string> documentIdsOfMissingAttachments = null)
             {
                 _database = database;
                 _buildType = buildType;
                 _log = log;
                 _resetContext = _database.DocumentsStorage.ContextPool.AllocateOperationContext(out _context);
+                _missingDocumentsForRevisions = missingDocumentsForRevisions;
+                _documentIdsOfMissingAttachments = documentIdsOfMissingAttachments;
+                Is32Bit = _database.Configuration.Storage.ForceUsing32BitsPager || PlatformDetails.Is32Bits;
+                if (Is32Bit)
+                {
+                    using (var ctx = DocumentsOperationContext.ShortTermSingleUse(database))
+                    using (ctx.OpenReadTransaction())
+                    {
+                        _collectionNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                        foreach (var collection in _database.DocumentsStorage.GetCollections(ctx))
+                        {
+                            _collectionNames.Add(collection.Name);
+                        }
+                    }
+                }
             }
 
             public DocumentsOperationContext Context => _context;
@@ -448,7 +629,7 @@ namespace Raven.Server.Smuggler.Documents
                     _log.Info($"Importing {Documents.Count:#,#0} documents");
 
                 var idsOfDocumentsToUpdateAfterAttachmentDeletion = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
+                var databaseChangeVector = context.LastDatabaseChangeVector ?? DocumentsStorage.GetDatabaseChangeVector(context);
                 foreach (var documentType in Documents)
                 {
                     var tombstone = documentType.Tombstone;
@@ -456,12 +637,17 @@ namespace Raven.Server.Smuggler.Documents
                     {
                         using (Slice.External(context.Allocator, tombstone.LowerId, out Slice key))
                         {
-                            var newEtag = _database.DocumentsStorage.GenerateNextEtag();
-                            var changeVector = _database.DocumentsStorage.GetNewChangeVector(context, newEtag);
+                            if (_options.KeepOriginalChangeVector == false)
+                            {
+                                var newEtag = _database.DocumentsStorage.GenerateNextEtag();
+                                tombstone.ChangeVector = _database.DocumentsStorage.GetNewChangeVector(context, newEtag);
+                            }
+
+                            databaseChangeVector = ChangeVectorUtils.MergeVectors(databaseChangeVector, tombstone.ChangeVector);
                             switch (tombstone.Type)
                             {
                                 case Tombstone.TombstoneType.Document:
-                                    _database.DocumentsStorage.Delete(context, key, tombstone.LowerId, null, tombstone.LastModified.Ticks, changeVector, new CollectionName(tombstone.Collection));
+                                    _database.DocumentsStorage.Delete(context, key, tombstone.LowerId, null, tombstone.LastModified.Ticks, tombstone.ChangeVector, new CollectionName(tombstone.Collection));
                                     break;
                                 case Tombstone.TombstoneType.Attachment:
                                     var idEnd = key.Content.IndexOf(SpecialChars.RecordSeparator);
@@ -470,14 +656,14 @@ namespace Raven.Server.Smuggler.Documents
                                     var attachmentId = key.Content.Substring(idEnd);
                                     idsOfDocumentsToUpdateAfterAttachmentDeletion.Add(attachmentId);
 
-                                    _database.DocumentsStorage.AttachmentsStorage.DeleteAttachmentDirect(context, key, false, "$fromReplication", null, changeVector, tombstone.LastModified.Ticks);
+                                    _database.DocumentsStorage.AttachmentsStorage.DeleteAttachmentDirect(context, key, false, "$fromReplication", null, tombstone.ChangeVector, tombstone.LastModified.Ticks);
                                     break;
                                 case Tombstone.TombstoneType.Revision:
-                                    _database.DocumentsStorage.RevisionsStorage.DeleteRevision(context, key, tombstone.Collection, changeVector, tombstone.LastModified.Ticks);
+                                    _database.DocumentsStorage.RevisionsStorage.DeleteRevision(context, key, tombstone.Collection, tombstone.ChangeVector, tombstone.LastModified.Ticks);
                                     break;
                                 case Tombstone.TombstoneType.Counter:
-                                    _database.DocumentsStorage.CountersStorage.DeleteCounter(context, key, tombstone.Collection,
-                                        tombstone.LastModified.Ticks, forceTombstone: true);
+                                    _database.DocumentsStorage.CountersStorage.DeleteCounter(context, key, tombstone.Collection, null,
+                                       tombstone.LastModified.Ticks, forceTombstone: true);
                                     break;
                             }
                         }
@@ -488,6 +674,7 @@ namespace Raven.Server.Smuggler.Documents
                     var conflict = documentType.Conflict;
                     if (conflict != null)
                     {
+                        databaseChangeVector = ChangeVectorUtils.MergeVectors(databaseChangeVector, documentType.Conflict.ChangeVector);
                         _database.DocumentsStorage.ConflictsStorage.AddConflict(context, conflict.Id, conflict.LastModified.Ticks, conflict.Doc, conflict.ChangeVector,
                             conflict.Collection, conflict.Flags, NonPersistentDocumentFlags.FromSmuggler);
 
@@ -505,16 +692,25 @@ namespace Raven.Server.Smuggler.Documents
                     var document = documentType.Document;
                     var id = document.Id;
 
-
                     if (IsRevision)
                     {
                         if (_database.DocumentsStorage.RevisionsStorage.Configuration == null)
                             ThrowRevisionsDisabled();
 
-                        PutAttachments(context, document);
+                        PutAttachments(context, document, isRevision: true);
+                        if ((document.NonPersistentFlags.Contain(NonPersistentDocumentFlags.FromSmuggler)) &&
+                            (_missingDocumentsForRevisions != null))
+                        {
+                            if (_database.DocumentsStorage.Get(context, document.Id) == null)
+                            {
+                                var collection = _database.DocumentsStorage.ExtractCollectionName(context, document.Data);
+                                _missingDocumentsForRevisions.TryAdd(document.Id.ToString(), collection);
+                            }
+                        }
 
                         if (document.Flags.Contain(DocumentFlags.DeleteRevision))
                         {
+                            _missingDocumentsForRevisions?.TryRemove(id, out _);
                             _database.DocumentsStorage.RevisionsStorage.Delete(context, id, document.Data, document.Flags,
                                 document.NonPersistentFlags, document.ChangeVector, document.LastModified.Ticks);
                         }
@@ -527,13 +723,13 @@ namespace Raven.Server.Smuggler.Documents
                         continue;
                     }
 
-                    if (IsPreV4Revision(id, document))
+                    if (DatabaseSmuggler.IsPreV4Revision(_buildType, id, document))
                     {
                         // handle old revisions
                         if (_database.DocumentsStorage.RevisionsStorage.Configuration == null)
                             ThrowRevisionsDisabled();
 
-                        var endIndex = id.IndexOf(PreV4RevisionsDocumentId, StringComparison.OrdinalIgnoreCase);
+                        var endIndex = id.IndexOf(DatabaseSmuggler.PreV4RevisionsDocumentId, StringComparison.OrdinalIgnoreCase);
                         var newId = id.Substring(0, endIndex);
 
                         _database.DocumentsStorage.RevisionsStorage.Put(context, newId, document.Data, document.Flags,
@@ -541,11 +737,20 @@ namespace Raven.Server.Smuggler.Documents
                         continue;
                     }
 
-                    PutAttachments(context, document);
+                    if (_options.KeepOriginalChangeVector == false)
+                    {
+                        var newEtag = _database.DocumentsStorage.GenerateNextEtag();
+                        document.ChangeVector = _database.DocumentsStorage.GetNewChangeVector(context, newEtag);
+                    }
 
-                    _database.DocumentsStorage.Put(context, id, null, document.Data, document.LastModified.Ticks, null, document.Flags, document.NonPersistentFlags);
+                    databaseChangeVector = ChangeVectorUtils.MergeVectors(databaseChangeVector, document.ChangeVector);
 
+                    PutAttachments(context, document, isRevision: false);
+
+                    _database.DocumentsStorage.Put(context, id, null, document.Data, document.LastModified.Ticks, document.ChangeVector, document.Flags, document.NonPersistentFlags);
                 }
+
+                context.LastDatabaseChangeVector = databaseChangeVector;
 
                 foreach (var idToUpdate in idsOfDocumentsToUpdateAfterAttachmentDeletion)
                 {
@@ -556,15 +761,13 @@ namespace Raven.Server.Smuggler.Documents
             }
 
             [MethodImpl(MethodImplOptions.AggressiveInlining)]
-            private unsafe void PutAttachments(DocumentsOperationContext context, Document document)
+            private unsafe void PutAttachments(DocumentsOperationContext context, Document document, bool isRevision)
             {
-                if ((document.Flags & DocumentFlags.HasAttachments) != DocumentFlags.HasAttachments)
-                    return;
-
                 if (document.Data.TryGet(Client.Constants.Documents.Metadata.Key, out BlittableJsonReaderObject metadata) == false ||
                     metadata.TryGet(Client.Constants.Documents.Metadata.Attachments, out BlittableJsonReaderArray attachments) == false)
                     return;
 
+                var attachmentsStorage = _database.DocumentsStorage.AttachmentsStorage;
                 foreach (BlittableJsonReaderObject attachment in attachments)
                 {
                     if (attachment.TryGet(nameof(AttachmentName.Name), out LazyStringValue name) == false ||
@@ -575,7 +778,11 @@ namespace Raven.Server.Smuggler.Documents
                     var cv = Slices.Empty;
                     var type = (document.Flags & DocumentFlags.Revision) == DocumentFlags.Revision ? AttachmentType.Revision : AttachmentType.Document;
 
-                    var attachmentsStorage = _database.DocumentsStorage.AttachmentsStorage;
+                    if (isRevision == false && attachmentsStorage.AttachmentExists(context, hash) == false)
+                    {
+                        _documentIdsOfMissingAttachments.Add(document.Id);
+                    }
+
                     using (DocumentIdWorker.GetSliceFromId(_context, document.Id, out Slice lowerDocumentId))
                     using (DocumentIdWorker.GetLowerIdSliceAndStorageKey(_context, name, out Slice lowerName, out Slice nameSlice))
                     using (DocumentIdWorker.GetLowerIdSliceAndStorageKey(_context, contentType, out Slice lowerContentType, out Slice contentTypeSlice))
@@ -584,21 +791,9 @@ namespace Raven.Server.Smuggler.Documents
                     using (attachmentsStorage.GetAttachmentKey(_context, lowerDocumentId.Content.Ptr, lowerDocumentId.Size, lowerName.Content.Ptr, lowerName.Size,
                         base64Hash, lowerContentType.Content.Ptr, lowerContentType.Size, type, cv, out Slice keySlice))
                     {
-                        attachmentsStorage.PutDirect(context, keySlice, nameSlice, contentTypeSlice, base64Hash, null);
+                        attachmentsStorage.PutDirect(context, keySlice, nameSlice, contentTypeSlice, base64Hash);
                     }
                 }
-            }
-
-            [MethodImpl(MethodImplOptions.AggressiveInlining)]
-            private bool IsPreV4Revision(string id, Document document)
-            {
-                if (_buildType == BuildVersionType.V3 == false)
-                    return false;
-
-                if ((document.NonPersistentFlags & NonPersistentDocumentFlags.LegacyRevision) != NonPersistentDocumentFlags.LegacyRevision)
-                    return false;
-
-                return id.Contains(PreV4RevisionsDocumentId);
             }
 
             private static void ThrowRevisionsDisabled()
@@ -636,11 +831,48 @@ namespace Raven.Server.Smuggler.Documents
                 AttachmentStreamsTempFile = null;
             }
 
+            /// <summary>
+            /// Return the actual size this command allocates including the stream sizes
+            /// </summary>
+            /// <returns></returns>
+            public long GetCommandAllocationSize()
+            {
+                return Context.AllocatedMemory + _attachmentsStreamSizeOverhead + _schemaOverHeadSize;
+            }
+
+            private HashSet<string> _collectionNames;
+            private int _schemaOverHeadSize;
+            private bool Is32Bit { get; }
+
             public void Add(DocumentItem document)
             {
                 Documents.Add(document);
-            }
+                if (document.Attachments != null)
+                {
+                    if (document.Document.TryGetMetadata(out var metadata)
+                        && metadata.TryGet(Client.Constants.Documents.Metadata.Attachments, out BlittableJsonReaderArray attachments))
+                    {
+                        foreach (BlittableJsonReaderObject attachment in attachments)
+                        {
+                            if (attachment.TryGet(nameof(Attachment.Size), out long size))
+                            {
+                                _attachmentsStreamSizeOverhead += size;
+                            }
+                        }
+                    }
+                }
 
+                if (Is32Bit && document.Document != null)
+                {
+                    if (document.Document.TryGetMetadata(out var metadata)
+                        && metadata.TryGet(Client.Constants.Documents.Metadata.Collection, out string collectionName)
+                        && _collectionNames.Add(collectionName))
+                    {
+                        _schemaOverHeadSize += SchemaSize;
+                    }
+                }
+            }
+            private const int SchemaSize = 2 * 1024 * 1024;
             public override TransactionOperationsMerger.IReplayableCommandDto<TransactionOperationsMerger.MergedTransactionCommand> ToDto(JsonOperationContext context)
             {
                 return new MergedBatchPutCommandDto
@@ -674,19 +906,251 @@ namespace Raven.Server.Smuggler.Documents
             }
         }
 
+        internal class MergedBatchFixDocumentMetadataCommand : TransactionOperationsMerger.MergedTransactionCommand, IDisposable
+        {
+            private readonly Logger _log;
+            public HashSet<string> Ids = new HashSet<string>();
+            private readonly DocumentDatabase _database;
+            private readonly DocumentsOperationContext _context;
+            public DocumentsOperationContext Context => _context;
+            private bool _isDisposed;
+            public bool IsDisposed => _isDisposed;
+
+            public MergedBatchFixDocumentMetadataCommand(DocumentDatabase database, Logger log)
+            {
+                _database = database;
+                _log = log;
+                _database.DocumentsStorage.ContextPool.AllocateOperationContext(out _context);
+            }
+
+            protected override int ExecuteCmd(DocumentsOperationContext context)
+            {
+                if (_log.IsInfoEnabled)
+                    _log.Info($"Trying to update {Ids.Count:#,#0} documents metadata if necessary");
+
+                var count = 0;
+                foreach (var id in Ids)
+                {
+                    using (DocumentIdWorker.GetSliceFromId(context, id, out var lowerId))
+                    {
+                        var document = _database.DocumentsStorage.Get(context, lowerId, throwOnConflict: false, skipValidationInDebug: true);
+                        if (document == null)
+                            continue;
+
+                        if (document.Data.TryGet(Client.Constants.Documents.Metadata.Key, out BlittableJsonReaderObject metadata) == false ||
+                            metadata.TryGet(Client.Constants.Documents.Metadata.Attachments, out BlittableJsonReaderArray attachments) == false)
+                            continue;
+
+                        var attachmentsToRemoveNames = new HashSet<LazyStringValue>();
+                        var attachmentsToRemoveHashes = new HashSet<LazyStringValue>();
+
+                        foreach (BlittableJsonReaderObject attachment in attachments)
+                        {
+                            if (attachment.TryGet(nameof(AttachmentName.Name), out LazyStringValue name) == false ||
+                                attachment.TryGet(nameof(AttachmentName.ContentType), out LazyStringValue _) == false ||
+                                attachment.TryGet(nameof(AttachmentName.Hash), out LazyStringValue hash) == false)
+                                throw new ArgumentException($"The attachment info in missing a mandatory value: {attachment}");
+
+                            var attachmentsStorage = _database.DocumentsStorage.AttachmentsStorage;
+                            if (attachmentsStorage.AttachmentExists(context, hash) == false)
+                            {
+                                attachmentsToRemoveNames.Add(name);
+                                attachmentsToRemoveHashes.Add(hash);
+                            }
+                        }
+
+                        if (attachmentsToRemoveNames.Count == 0)
+                            continue;
+
+                        count++;
+                        var attachmentsToSave = new DynamicJsonArray();
+
+                        foreach (BlittableJsonReaderObject attachment in attachments)
+                        {
+                            attachment.TryGet(nameof(AttachmentName.Hash), out LazyStringValue hash);
+
+                            if (attachmentsToRemoveHashes.Contains(hash))
+                                continue;
+
+                            attachmentsToSave.Add(attachment);
+                        }
+
+                        foreach (var toRemove in attachmentsToRemoveNames)
+                        {
+                            _database.DocumentsStorage.AttachmentsStorage.DeleteAttachment(context, id, toRemove, null, updateDocument: false);
+                        }
+
+                        metadata.Modifications = new DynamicJsonValue(metadata);
+                        document.Data.Modifications = new DynamicJsonValue(document.Data)
+                        {
+                            [Client.Constants.Documents.Metadata.Key] = metadata
+                        };
+
+                        if (attachmentsToSave.Count == 0)
+                        {
+                            document.Flags = document.Flags.Strip(DocumentFlags.HasAttachments);
+                            metadata.Modifications.Remove(Client.Constants.Documents.Metadata.Attachments);
+                        }
+                        else
+                        {
+                            document.Flags |= DocumentFlags.HasAttachments;
+                            metadata.Modifications = new DynamicJsonValue(metadata)
+                            {
+                                [Client.Constants.Documents.Metadata.Attachments] = attachmentsToSave
+                            };
+                        }
+
+                        using (var old = document.Data)
+                        {
+                            var newDocument = context.ReadObject(old, document.Id, BlittableJsonDocumentBuilder.UsageMode.ToDisk);
+                            _database.DocumentsStorage.Put(context, document.Id, null, newDocument);
+                        }
+                    }
+                }
+
+                if (_log.IsInfoEnabled)
+                    _log.Info($"Updated {count:#,#0} documents metadata");
+
+                return count;
+            }
+
+            public void Add(string id)
+            {
+                Ids.Add(id);
+            }
+
+            public void Dispose()
+            {
+                if (_isDisposed)
+                    return;
+
+                _isDisposed = true;
+                Ids.Clear();
+            }
+
+            public override TransactionOperationsMerger.IReplayableCommandDto<TransactionOperationsMerger.MergedTransactionCommand> ToDto(JsonOperationContext context)
+            {
+                return new MergedBatchFixDocumentMetadataCommandDto
+                {
+                    Ids = Ids
+                };
+            }
+
+            internal class MergedBatchFixDocumentMetadataCommandDto : TransactionOperationsMerger.IReplayableCommandDto<MergedBatchFixDocumentMetadataCommand>
+            {
+                public HashSet<string> Ids = new HashSet<string>();
+
+                public MergedBatchFixDocumentMetadataCommand ToCommand(DocumentsOperationContext context, DocumentDatabase database)
+                {
+                    var log = LoggingSource.Instance.GetLogger<DatabaseDestination>(database.Name);
+                    var command = new MergedBatchFixDocumentMetadataCommand(database, log);
+
+                    foreach (var id in Ids)
+                    {
+                        command.Add(id);
+                    }
+
+                    return command;
+                }
+            }
+        }
+
+        internal class MergedBatchDeleteRevisionCommand : TransactionOperationsMerger.MergedTransactionCommand, IDisposable
+        {
+            private readonly Logger _log;
+            public readonly List<KeyValuePair<string, CollectionName>> Ids = new List<KeyValuePair<string, CollectionName>>();
+            private readonly DocumentDatabase _database;
+            private readonly DocumentsOperationContext _context;
+            public DocumentsOperationContext Context => _context;
+            private bool _isDisposed;
+            public bool IsDisposed => _isDisposed;
+
+            public MergedBatchDeleteRevisionCommand(DocumentDatabase database, Logger log)
+            {
+                _database = database;
+                _log = log;
+                _database.DocumentsStorage.ContextPool.AllocateOperationContext(out _context);
+            }
+
+            protected override int ExecuteCmd(DocumentsOperationContext context)
+            {
+                if (_log.IsInfoEnabled)
+                    _log.Info($"Deleting {Ids.Count:#,#0} revisions");
+
+                foreach (var id in Ids)
+                {
+                    using (DocumentIdWorker.GetSliceFromId(context, id.Key, out var lowerId))
+                    {
+                        _database.DocumentsStorage.RevisionsStorage.Delete(context,
+                            id.Key,
+                            lowerId,
+                            id.Value,
+                            _database.DocumentsStorage.GetNewChangeVector(context, _database.DocumentsStorage.GenerateNextEtag()),
+                            _database.Time.GetUtcNow().Ticks,
+                            NonPersistentDocumentFlags.FromSmuggler,
+                            DocumentFlags.DeleteRevision);
+                    }
+                }
+                return 1;
+            }
+
+            public void Add(KeyValuePair<string, CollectionName> id)
+            {
+                Ids.Add(id);
+            }
+
+            public void Dispose()
+            {
+                if (_isDisposed)
+                    return;
+
+                _isDisposed = true;
+                Ids.Clear();
+            }
+
+
+            public override TransactionOperationsMerger.IReplayableCommandDto<TransactionOperationsMerger.MergedTransactionCommand> ToDto(JsonOperationContext context)
+            {
+                return new MergedBatchDeleteRevisionCommandDto
+                {
+                    Ids = Ids
+                };
+            }
+        }
+
+        internal class MergedBatchDeleteRevisionCommandDto : TransactionOperationsMerger.IReplayableCommandDto<MergedBatchDeleteRevisionCommand>
+        {
+            public List<KeyValuePair<string, CollectionName>> Ids = new List<KeyValuePair<string, CollectionName>>();
+
+            public MergedBatchDeleteRevisionCommand ToCommand(DocumentsOperationContext context, DocumentDatabase database)
+            {
+                var log = LoggingSource.Instance.GetLogger<DatabaseDestination>(database.Name);
+                var command = new MergedBatchDeleteRevisionCommand(database, log);
+
+                foreach (var id in Ids)
+                {
+                    command.Add(id);
+                }
+
+                return command;
+            }
+        }
+
         private class CounterActions : ICounterActions
         {
             private readonly DocumentDatabase _database;
             private CountersHandler.ExecuteCounterBatchCommand _cmd;
             private CountersHandler.ExecuteCounterBatchCommand _prevCommand;
             private Task _prevCommandTask = Task.CompletedTask;
-            private int _batchSize;
-            private const int _maxBatchSize = 10000;
+            private int _docCount;
+            private int _countersPerDoc;
+            private const int MaxDocumentCount = 1_024;
+            private const int MaxCountersPerDocument = 32 * 1_024;
 
             public CounterActions(DocumentDatabase database)
             {
                 _database = database;
-                _batchSize = 0;
+                _docCount = 0;
                 _cmd = new CountersHandler.ExecuteCounterBatchCommand(_database)
                 {
                     HasWrites = true
@@ -703,8 +1167,14 @@ namespace Raven.Server.Smuggler.Documents
                     ChangeVector = counter.ChangeVector
                 };
 
-                _cmd.Add(counter.DocumentId, counterOp);
-                _batchSize++;
+                var countersCount = _cmd.Add(counter.DocumentId, counterOp, out var isNew);
+                if (isNew)
+                    _docCount++;
+
+                if (countersCount > _countersPerDoc)
+                {
+                    _countersPerDoc = countersCount;
+                }
             }
 
             public void WriteCounter(CounterDetail counterDetail)
@@ -720,7 +1190,7 @@ namespace Raven.Server.Smuggler.Documents
 
             private void HandleBatchOfCountersIfNecessary()
             {
-                if (_batchSize < _maxBatchSize)
+                if (_docCount < MaxDocumentCount && _countersPerDoc < MaxCountersPerDocument)
                     return;
 
                 var prevCommand = _prevCommand;
@@ -735,13 +1205,13 @@ namespace Raven.Server.Smuggler.Documents
                 {
                     AsyncHelpers.RunSync(() => prevCommandTask);
                 }
-
                 _cmd = new CountersHandler.ExecuteCounterBatchCommand(_database)
                 {
                     HasWrites = true
                 };
 
-                _batchSize = 0;
+                _docCount = 0;
+                _countersPerDoc = 0;
             }
 
             private void FinishBatchOfCounters()
@@ -752,7 +1222,7 @@ namespace Raven.Server.Smuggler.Documents
                     _prevCommand = null;
                 }
 
-                if (_batchSize > 0)
+                if (_docCount > 0)
                 {
                     AsyncHelpers.RunSync(() => _database.TxMerger.Enqueue(_cmd));
                 }

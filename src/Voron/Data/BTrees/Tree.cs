@@ -690,7 +690,7 @@ namespace Voron.Data.BTrees
             }
 
             if (p.IsLeaf == false)
-                VoronUnrecoverableErrorException.Raise(_llt.Environment, "Index points to a non leaf page " + p.PageNumber);
+                VoronUnrecoverableErrorException.Raise(_llt, "Index points to a non leaf page " + p.PageNumber);
 
             if (p.IsCompressed)
                 ThrowOnCompressedPage(p);
@@ -760,7 +760,7 @@ namespace Voron.Data.BTrees
             cursorConstructor = new TreeCursorConstructor(cursor);
 
             if (p.IsLeaf == false)
-                VoronUnrecoverableErrorException.Raise(_llt.Environment, "Index points to a non leaf page");
+                VoronUnrecoverableErrorException.Raise(_llt, "Index points to a non leaf page");
 
             if (allowCompressed == false && p.IsCompressed)
                 ThrowOnCompressedPage(p);
@@ -872,7 +872,7 @@ namespace Voron.Data.BTrees
             }
 
             if (page.IsLeaf == false)
-                VoronUnrecoverableErrorException.Raise(_llt.Environment, "Index points to a non leaf page");
+                VoronUnrecoverableErrorException.Raise(_llt, "Index points to a non leaf page");
 
             node = page.Search(_llt, key); // will set the LastSearchPosition
 
@@ -904,7 +904,7 @@ namespace Voron.Data.BTrees
             }
 
             if (page.IsLeaf == false)
-                VoronUnrecoverableErrorException.Raise(_llt.Environment, "Index points to a non leaf page");
+                VoronUnrecoverableErrorException.Raise(_llt, "Index points to a non leaf page");
 
             node = page.Search(_llt, key); // will set the LastSearchPosition
 
@@ -1113,7 +1113,7 @@ namespace Voron.Data.BTrees
                         // the key we were looking for might belong to an compressed entry
                         // if the page isn't compressed then it's a corruption
                         
-                        VoronUnrecoverableErrorException.Raise(_tx.LowLevelTransaction.Environment,
+                        VoronUnrecoverableErrorException.Raise(_tx.LowLevelTransaction,
                             $"Could not find a page containing {key} when looking for a parent of {page}. Page {p} was found, last match: {p.LastMatch}.");
                     }
 #if DEBUG
@@ -1268,6 +1268,8 @@ namespace Voron.Data.BTrees
                         _llt.FreePage(readOnlyOverflowPage.PageNumber + requestedOverflows + i);
                     }
 
+                    _llt.DiscardScratchModificationOn(readOnlyOverflowPage.PageNumber);
+
                     State.RecordFreedPage(readOnlyOverflowPage, overflowsToFree);
 
                     var page = _llt.AllocatePage(requestedOverflows, updatedNode->PageNumber);
@@ -1421,6 +1423,80 @@ namespace Voron.Data.BTrees
 
             _newPageAllocator = newPageAllocator;
             HasNewPageAllocator = true;
+        }
+
+        internal void DebugValidateBranchReferences()
+        {
+            var rootPageNumber = State.RootPageNumber;
+
+            var pages = new HashSet<long>();
+            var stack = new Stack<TreePage>();
+            var root = GetReadOnlyTreePage(rootPageNumber);
+            stack.Push(root);
+            pages.Add(rootPageNumber);
+
+            while (stack.Count > 0)
+            {
+                var p = stack.Pop();
+
+                if (p.IsBranch == false)
+                    continue;
+
+                if (p.NumberOfEntries < 2)
+                {
+                    throw new InvalidOperationException("The branch page " + p.PageNumber + " has " +
+                                                        p.NumberOfEntries + " entry");
+                }
+
+                for (int i = 0; i < p.NumberOfEntries; i++)
+                {
+                    var page = p.GetNode(i)->PageNumber;
+
+                    if (pages.Add(page) == false)
+                    {
+                        DebugStuff.RenderAndShow(this);
+                        throw new InvalidOperationException("The page " + page + " already appeared in the tree!");
+                    }
+
+                    var refPage = GetReadOnlyTreePage(page);
+
+                    using (p.GetNodeKey(_llt, i, out var referenceKey))
+                    {
+                        Validate(refPage, referenceKey);
+
+                        if (refPage.IsCompressed)
+                        {
+                            using (var decompressedRefPage = DecompressPage(refPage, skipCache: true))
+                            {
+                                Validate(decompressedRefPage, referenceKey);
+                            }
+                        }
+                    }
+
+                    if (refPage.IsBranch == false)
+                        continue;
+
+                    stack.Push(refPage);
+
+                    void Validate(TreePage pageRef, Slice refKey)
+                    {
+                        if (refKey.Options == SliceOptions.Key)
+                        {
+                            for (int j = 0; j < pageRef.NumberOfEntries; j++)
+                            {
+                                using (pageRef.GetNodeKey(_llt, j, out var key))
+                                {
+                                    if (key.HasValue && key.Size > 0 && SliceComparer.Compare(key, refKey) < 0)
+                                    {
+                                        DebugStuff.RenderAndShow(this);
+                                        throw new InvalidOperationException($"Found invalid reference in branch page: {p}. Reference key: {refKey}, key found in referenced {pageRef} page: {key}");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }

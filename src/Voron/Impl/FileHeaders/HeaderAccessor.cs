@@ -7,10 +7,12 @@
 using Sparrow;
 using System;
 using System.IO;
-using System.Runtime.InteropServices;
 using System.Threading;
 using Sparrow.Utils;
+using Voron.Exceptions;
 using Voron.Global;
+using Voron.Impl.Journal;
+using Voron.Schema;
 
 namespace Voron.Impl.FileHeaders
 {
@@ -82,13 +84,8 @@ namespace Voron.Impl.FileHeaders
                     *f2 = *f1;
                 }
 
-                if (f1->Version != Constants.CurrentVersion)
-                    throw new InvalidDataException(
-                        $"The db file is for version {f1->Version}, which is not compatible with the current version {Constants.CurrentVersion} on {_env.Options.BasePath}");
-
                 if (f1->TransactionId < 0)
                     throw new InvalidDataException("The transaction number cannot be negative on " + _env.Options.BasePath);
-
 
                 if (f1->HeaderRevision > f2->HeaderRevision)
                 {
@@ -100,11 +97,39 @@ namespace Voron.Impl.FileHeaders
                 }
                 _revision = _theHeader->HeaderRevision;
 
+                if (_theHeader->Version != Constants.CurrentVersion)
+                {
+                    _locker.ExitWriteLock();
+                    try
+                    {
+                        var updater = new VoronSchemaUpdater(this, _env.Options);
+
+                        updater.Update();
+                    }
+                    finally
+                    {
+                        _locker.EnterWriteLock();
+
+                    }
+
+                    if (_theHeader->Version != Constants.CurrentVersion)
+                    {
+                        throw new SchemaErrorException(
+                            $"The db file is for version {_theHeader->Version}, which is not compatible with the current version {Constants.CurrentVersion} on {_env.Options.BasePath}");
+                    }
+                }
+
                 if (_theHeader->PageSize != Constants.Storage.PageSize)
                 {
                     var message = string.Format("PageSize mismatch, configured to be {0:#,#} but was {1:#,#}, using the actual value in the file {1:#,#}",
                         Constants.Storage.PageSize, _theHeader->PageSize);
                     _env.Options.InvokeRecoveryError(this, message, null);
+                }
+
+                if (IsEmptyHeader(_theHeader))
+                {
+                    // db was not initialized - new db
+                    return true;
                 }
 
                 return false;
@@ -158,7 +183,7 @@ namespace Voron.Impl.FileHeaders
 
 
                 modifyAction(_theHeader);
-
+          
                 _revision++;
                 _theHeader->HeaderRevision = _revision;
 
@@ -183,13 +208,33 @@ namespace Voron.Impl.FileHeaders
             header->LastPageNumber = 1;
             header->Root.RootPageNumber = -1;
             header->Journal.CurrentJournal = -1;
-            header->Journal.JournalFilesCount = 0;
+            Memory.Set(header->Journal.Reserved, 0, JournalInfo.NumberOfReservedBytes);
+            header->Journal.Flags = Journal.JournalInfoFlags.None;
             header->Journal.LastSyncedJournal = -1;
             header->Journal.LastSyncedTransactionId = -1;
             header->IncrementalBackup.LastBackedUpJournal = -1;
             header->IncrementalBackup.LastBackedUpJournalPage = -1;
             header->IncrementalBackup.LastCreatedJournal = -1;
             header->PageSize = _env.Options.PageSize;
+        }
+
+        private  bool IsEmptyHeader(FileHeader* header)
+        {
+            var zeroed = stackalloc byte[JournalInfo.NumberOfReservedBytes];
+            return header->MagicMarker == Constants.MagicMarker &&
+                   header->Version == Constants.CurrentVersion &&
+                   header->HeaderRevision == -1 &&
+                   header->TransactionId == 0 &&
+                   header->LastPageNumber == 1 &&
+                   header->Root.RootPageNumber == -1 &&
+                   header->Journal.CurrentJournal == -1 &&
+                   header->Journal.Flags == Journal.JournalInfoFlags.None &&
+                   Memory.Compare(header->Journal.Reserved, zeroed, 3) == 0 &&
+                   header->Journal.LastSyncedJournal == -1 &&
+                   header->Journal.LastSyncedTransactionId == -1 &&
+                   header->IncrementalBackup.LastBackedUpJournal == -1 &&
+                   header->IncrementalBackup.LastBackedUpJournalPage == -1 &&
+                   header->IncrementalBackup.LastCreatedJournal == -1;
         }
 
         public static ulong CalculateFileHeaderHash(FileHeader* header)

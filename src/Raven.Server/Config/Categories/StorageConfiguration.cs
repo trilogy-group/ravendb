@@ -64,5 +64,38 @@ namespace Raven.Server.Config.Categories
         [ConfigurationEntry("Storage.PrefetchResetThresholdInGb", ConfigurationEntryScope.ServerWideOrPerDatabase)]
         public Size PrefetchResetThreshold { get; set; }
 
+        [Description("Number of Journals files for each storage, before forcing a sync and removing unused journal files.")]
+        [DefaultValue(2)]
+        [ConfigurationEntry("Storage.SyncJournalsCountThreshold", ConfigurationEntryScope.ServerWideOrPerDatabase)]
+        public int SyncJournalsCountThreshold { get; set; }
+
+        [Description("EXPERT: A command or executable to run when creating/opening a directory (storage environment). RavenDB will execute: command [user-arg-1] ... [user-arg-n] <environment-type> <database-name> <data-dir-path> <temp-dir-path> <journal-dir-path>")]
+        [DefaultValue(null)]
+        [ConfigurationEntry("Storage.OnCreateDirectory.Exec", ConfigurationEntryScope.ServerWideOrPerDatabase)]
+        [ConfigurationEntry("Storage.OnDirectoryInitialize.Exec", ConfigurationEntryScope.ServerWideOrPerDatabase)]
+        public string OnDirectoryInitializeExec { get; set; }
+
+        [Description("EXPERT: The optional user arguments for the 'Storage.OnDirectoryInitialize.Exec' command or executable. The arguments must be escaped for the command line.")]
+        [DefaultValue(null)]
+        [ConfigurationEntry("Storage.OnCreateDirectory.Exec.Arguments", ConfigurationEntryScope.ServerWideOrPerDatabase)]
+        [ConfigurationEntry("Storage.OnDirectoryInitialize.Exec.Arguments", ConfigurationEntryScope.ServerWideOrPerDatabase)]
+        public string OnDirectoryInitializeExecArguments { get; set; }
+
+        [Description("EXPERT: The number of seconds to wait for the OnDirectoryInitialize executable to exit. Default: 30 seconds")]
+        [DefaultValue(30)]
+        [TimeUnit(TimeUnit.Seconds)]
+        [ConfigurationEntry("Storage.OnCreateDirectory.Exec.TimeoutInSec", ConfigurationEntryScope.ServerWideOrPerDatabase)]
+        [ConfigurationEntry("Storage.OnDirectoryInitialize.Exec.TimeoutInSec", ConfigurationEntryScope.ServerWideOrPerDatabase)]
+        public TimeSetting OnDirectoryInitializeExecTimeout { get; set; }
+
+        [Description("EXPERT: Allows to load a database regardless journal errors that can be thrown during the recovery operation on startup. Since journals are mandatory to properly start a database, the usage of this option is dangerous")]
+        [DefaultValue(null)]
+        [ConfigurationEntry("Storage.Dangerous.IgnoreInvalidJournalErrors", ConfigurationEntryScope.ServerWideOnly)]
+        public bool? IgnoreInvalidJournalErrors { get; set; }
+
+        [Description("EXPERT: Skip checksum validation on database loading process (applicable only for ARM 32/64)")]
+        [DefaultValue(false)]
+        [ConfigurationEntry("Storage.Dangerous.SkipChecksumValidationOnDatabaseLoading", ConfigurationEntryScope.ServerWideOnly)]
+        public bool SkipChecksumValidationOnDatabaseLoading { get; set; }
     }
 }

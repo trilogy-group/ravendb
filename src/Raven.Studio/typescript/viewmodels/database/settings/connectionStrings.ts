@@ -5,7 +5,6 @@ import saveConnectionStringCommand = require("commands/database/settings/saveCon
 import getConnectionStringsCommand = require("commands/database/settings/getConnectionStringsCommand");
 import getConnectionStringInfoCommand = require("commands/database/settings/getConnectionStringInfoCommand");
 import deleteConnectionStringCommand = require("commands/database/settings/deleteConnectionStringCommand");
-import ongoingTaskModel = require("models/database/tasks/ongoingTaskModel");
 import ongoingTasksCommand = require("commands/database/tasks/getOngoingTasksCommand");
 import eventsCollector = require("common/eventsCollector");
 import generalUtils = require("common/generalUtils");
@@ -137,8 +136,9 @@ class connectionStrings extends viewModelBase {
         }    
     }   
 
-    isConnectionStringInUse(connectionStringName: string) :boolean {
-        return _.includes(Object.keys(this.connectionStringsTasksInfo), connectionStringName);       
+    isConnectionStringInUse(connectionStringName: string, task: string): boolean {
+        return _.includes(Object.keys(this.connectionStringsTasksInfo), connectionStringName)
+            && !!this.connectionStringsTasksInfo[connectionStringName].find(x => x.TaskType === task);
     }
     
     private getAllConnectionStrings() {
@@ -155,7 +155,10 @@ class connectionStrings extends viewModelBase {
 
     confirmDelete(connectionStringName: string, connectionStringtype: Raven.Client.Documents.Operations.ConnectionStrings.ConnectionStringType) {
         const stringType = connectionStringtype === 'Raven' ? 'RavenDB' : 'SQL';
-        this.confirmationMessage("Are you sure?", `Do you want to delete ${stringType} ETL connection string:  ${connectionStringName}`, ["Cancel", "Delete"])
+        this.confirmationMessage("Are you sure?", `Do you want to delete ${stringType} ETL connection string:  ${generalUtils.escapeHtml(connectionStringName)}`, {
+            buttons: ["Cancel", "Delete"],
+            html: true
+        })
             .done(result => {
                 if (result.can) {
                     this.deleteConnectionSring(connectionStringtype, connectionStringName);
@@ -216,11 +219,15 @@ class connectionStrings extends viewModelBase {
             });
     }
     
-    private getTasksThatUseThisString(connectionStringName: string, taskType: Raven.Client.Documents.Operations.OngoingTasks.OngoingTaskType) : { taskName: string; taskId: number }[]{        
-        const tasksData = this.connectionStringsTasksInfo[connectionStringName];               
-               
-        return tasksData ? _.sortBy(tasksData.map((task) => { return { taskName: task.TaskName, taskId: task.TaskId }; }), 
-                                    x => x.taskName.toUpperCase()) : [];    
+    private getTasksThatUseThisString(connectionStringName: string, taskType: Raven.Client.Documents.Operations.OngoingTasks.OngoingTaskType): { taskName: string; taskId: number }[] {
+        if (!this.connectionStringsTasksInfo[connectionStringName]) {
+            return [];
+        } else {
+            const tasksData = this.connectionStringsTasksInfo[connectionStringName].filter(x => x.TaskType === taskType);
+
+            return tasksData ? _.sortBy(tasksData.map((task) => { return { taskName: task.TaskName, taskId: task.TaskId }; }),
+                x => x.taskName.toUpperCase()) : [];  
+        }
     }
 
     onTestConnectionSql() {

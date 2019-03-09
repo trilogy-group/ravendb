@@ -5,9 +5,8 @@ using System.Linq;
 using System.Runtime.CompilerServices;
 using Raven.Client;
 using Raven.Client.Documents.Operations.Revisions;
-using Raven.Client.Exceptions.Documents;
-using Raven.Client.Extensions;
 using Raven.Client.ServerWide;
+using Raven.Server.Json;
 using Raven.Server.NotificationCenter.Notifications;
 using Raven.Server.ServerWide.Context;
 using Raven.Server.Utils;
@@ -251,45 +250,70 @@ namespace Raven.Server.Documents.Revisions
         }
 
         public bool ShouldVersionDocument(CollectionName collectionName, NonPersistentDocumentFlags nonPersistentFlags,
-            BlittableJsonReaderObject existingDocument, BlittableJsonReaderObject document, ref DocumentFlags documentFlags,
-            out RevisionsCollectionConfiguration configuration)
+            BlittableJsonReaderObject existingDocument, BlittableJsonReaderObject document, 
+            DocumentsOperationContext context, string id, 
+            ref DocumentFlags documentFlags, out RevisionsCollectionConfiguration configuration)
         {
             configuration = GetRevisionsConfiguration(collectionName.Name);
-            if (configuration.Disabled)
+
+            if (nonPersistentFlags.Contain(NonPersistentDocumentFlags.FromRevision))
+                return false;
+
+            if (nonPersistentFlags.Contain(NonPersistentDocumentFlags.FromSmuggler))
             {
+                if (nonPersistentFlags.Contain(NonPersistentDocumentFlags.ByCountersUpdate))
+                    return false;
+
+                if (nonPersistentFlags.Contain(NonPersistentDocumentFlags.ByAttachmentUpdate))
+                    return false;
+
+                if (configuration == ConflictConfiguration.Default || configuration.Disabled)
+                    return false;
+            }
+
+            if (nonPersistentFlags.Contain(NonPersistentDocumentFlags.Resolved))
+                return true;
+
+            if (Configuration == null)
+                return false;
+
+            if (configuration.Disabled)
+                return false;
+
+            if (configuration.MinimumRevisionsToKeep == 0)
+            {
+                DeleteRevisionsFor(context, id);
+                documentFlags = documentFlags.Strip(DocumentFlags.HasRevisions);
                 return false;
             }
 
-            try
+            if (existingDocument == null)
             {
-                if ((nonPersistentFlags & NonPersistentDocumentFlags.FromSmuggler) != NonPersistentDocumentFlags.FromSmuggler)
-                    return true;
-                if (existingDocument == null)
+                if (nonPersistentFlags.Contain(NonPersistentDocumentFlags.SkipRevisionCreation))
                 {
-                    if ((nonPersistentFlags & NonPersistentDocumentFlags.SkipRevisionCreation) == NonPersistentDocumentFlags.SkipRevisionCreation)
-                    {
-                        // Smuggler is configured to avoid creating new revisions during import
-                        return false;
-                    }
-
-                    // we are not going to create a revision if it's an import from v3
-                    // (since this import is going to import revisions as well)
-                    return (nonPersistentFlags & NonPersistentDocumentFlags.LegacyHasRevisions) != NonPersistentDocumentFlags.LegacyHasRevisions;
+                    // Smuggler is configured to avoid creating new revisions during import
+                    return false;
                 }
 
-                // compare the contents of the existing and the new document
-                if (DocumentCompare.IsEqualTo(existingDocument, document, false) != DocumentCompareResult.NotEqual)
+                // we are not going to create a revision if it's an import from v3
+                // (since this import is going to import revisions as well)
+                if (nonPersistentFlags.Contain(NonPersistentDocumentFlags.LegacyHasRevisions))
                 {
-                    // no need to create a new revision, both documents have identical content
+                    documentFlags |= DocumentFlags.HasRevisions;
                     return false;
                 }
 
                 return true;
             }
-            finally
+
+            // compare the contents of the existing and the new document
+            if (DocumentCompare.IsEqualTo(existingDocument, document, false) != DocumentCompareResult.NotEqual)
             {
-                documentFlags |= DocumentFlags.HasRevisions;
+                // no need to create a new revision, both documents have identical content
+                return false;
             }
+
+            return true;
         }
 
         public void Put(DocumentsOperationContext context, string id, BlittableJsonReaderObject document,
@@ -306,101 +330,40 @@ namespace Raven.Server.Documents.Revisions
             if (configuration == null)
                 configuration = GetRevisionsConfiguration(collectionName.Name);
 
-            using (DocumentIdWorker.GetLowerIdSliceAndStorageKey(context, id, out Slice lowerId, out Slice idPtr))
+            using (DocumentIdWorker.GetLowerIdSliceAndStorageKey(context, id, out Slice lowerId, out Slice idSlice))
+            using (Slice.From(context.Allocator, changeVector, out Slice changeVectorSlice))
             {
-                var fromReplication = (nonPersistentFlags & NonPersistentDocumentFlags.FromReplication) == NonPersistentDocumentFlags.FromReplication;
-
                 var table = EnsureRevisionTableCreated(context.Transaction.InnerTransaction, collectionName);
+                var revisionExists = table.ReadByKey(changeVectorSlice, out var tvr);
+                
+                if (revisionExists)
+                {
+                    MarkRevisionsAsConflictedIfNeeded(context, lowerId, idSlice, flags, tvr, table, changeVectorSlice);
+                    return;
+                }
 
                 // We want the revision's attachments to have a lower etag than the revision itself
-                if ((flags & DocumentFlags.HasAttachments) == DocumentFlags.HasAttachments)
+                if (flags.Contain(DocumentFlags.HasAttachments) &&
+                    flags.Contain(DocumentFlags.Revision) == false)
                 {
-                    if (flags.Contain(DocumentFlags.Revision) == false)
-                    {
-                        using (Slice.From(context.Allocator, changeVector, out Slice changeVectorSlice))
-                        {
-                            if (table.VerifyKeyExists(changeVectorSlice) == false)
-                            {
-                                _documentsStorage.AttachmentsStorage.RevisionAttachments(context, lowerId, changeVectorSlice);
-                            }
-                        }
-                    }
+                    _documentsStorage.AttachmentsStorage.RevisionAttachments(context, lowerId, changeVectorSlice);
                 }
 
-                if (document.TryGet(Constants.Documents.Metadata.Key, out BlittableJsonReaderObject metadata) &&
-                    metadata.TryGet(Constants.Documents.Metadata.Counters, out BlittableJsonReaderArray counterNames))
-                {
-                    var dvj = new DynamicJsonValue();
-                    for (var i = 0; i < counterNames.Length; i++)
-                    {
-                        var counter = counterNames[i].ToString();
-                        var val = _documentsStorage.CountersStorage.GetCounterValue(context, id, counter);
-                        if (val == null)
-                            continue;
-                        dvj[counter] = val.Value;
-                    }
+                document = RecreateCountersIfNeeded(context, id, document);
 
-                    metadata.Modifications = new DynamicJsonValue(metadata)
-                    {
-                        [Constants.Documents.Metadata.RevisionCounters] = dvj
-                    };
-                    metadata.Modifications.Remove(Constants.Documents.Metadata.Counters);
-                    document.Modifications = new DynamicJsonValue(document)
-                    {
-                        [Constants.Documents.Metadata.Key] = metadata
-                    };
-
-                    document = context.ReadObject(document, id, BlittableJsonDocumentBuilder.UsageMode.ToDisk);
-                }
-
-                if (fromReplication)
-                {
-                    void PutFromRevisionIfChangeVectorIsGreater()
-                    {
-                        bool hasDoc;
-                        TableValueReader tvr;
-                        try
-                        {
-                            hasDoc = _documentsStorage.GetTableValueReaderForDocument(context, lowerId, throwOnConflict: true, tvr: out tvr);
-                        }
-                        catch (DocumentConflictException)
-                        {
-                            // Do not modify the document.
-                            return;
-                        }
-
-                        if (hasDoc == false)
-                        {
-                            PutFromRevision();
-                            return;
-                        }
-
-                        var docChangeVector = TableValueToChangeVector(context, (int)DocumentsTable.ChangeVector, ref tvr);
-                        if (ChangeVectorUtils.GetConflictStatus(changeVector, docChangeVector) == ConflictStatus.Update)
-                            PutFromRevision();
-
-                        void PutFromRevision()
-                        {
-                            _documentsStorage.Put(context, id, null, document, lastModifiedTicks, changeVector,
-                                flags & ~DocumentFlags.Revision, nonPersistentFlags | NonPersistentDocumentFlags.FromRevision);
-                        }
-                    }
-
-                    PutFromRevisionIfChangeVectorIsGreater();
-                }
+                PutFromRevisionIfChangeVectorIsGreater(context, document, id, changeVector, lastModifiedTicks, flags, nonPersistentFlags);
 
                 flags |= DocumentFlags.Revision;
-                var newEtag = _database.DocumentsStorage.GenerateNextEtag();
-                var newEtagSwapBytes = Bits.SwapBytes(newEtag);
+                var etag = _database.DocumentsStorage.GenerateNextEtag();
+                var newEtagSwapBytes = Bits.SwapBytes(etag);
 
                 using (table.Allocate(out TableValueBuilder tvb))
-                using (Slice.From(context.Allocator, changeVector, out var cv))
                 {
-                    tvb.Add(cv.Content.Ptr, cv.Size);
+                    tvb.Add(changeVectorSlice.Content.Ptr, changeVectorSlice.Size);
                     tvb.Add(lowerId);
                     tvb.Add(SpecialChars.RecordSeparator);
                     tvb.Add(newEtagSwapBytes);
-                    tvb.Add(idPtr);
+                    tvb.Add(idSlice);
                     tvb.Add(document.BasePointer, document.Size);
                     tvb.Add((int)flags);
                     tvb.Add(NotDeletedRevisionMarker);
@@ -415,13 +378,82 @@ namespace Raven.Server.Documents.Revisions
                         tvb.Add(0);
                     }
                     tvb.Add(Bits.SwapBytes(lastModifiedTicks));
-                    var isNew = table.Set(tvb);
-                    if (isNew == false)
-                        // It might be just an update from replication as we call this twice, both for the doc delete and for deleteRevision.
-                        return;
+                    table.Insert(tvb);
                 }
 
                 DeleteOldRevisions(context, table, lowerId, collectionName, configuration, nonPersistentFlags, changeVector, lastModifiedTicks);
+            }
+        }
+
+        private BlittableJsonReaderObject RecreateCountersIfNeeded(DocumentsOperationContext context, string id, BlittableJsonReaderObject document)
+        {
+            if (document.TryGet(Constants.Documents.Metadata.Key, out BlittableJsonReaderObject metadata) &&
+                metadata.TryGet(Constants.Documents.Metadata.Counters, out BlittableJsonReaderArray counterNames))
+            {
+                var dvj = new DynamicJsonValue();
+                for (var i = 0; i < counterNames.Length; i++)
+                {
+                    var counter = counterNames[i].ToString();
+                    var val = _documentsStorage.CountersStorage.GetCounterValue(context, id, counter);
+                    if (val == null)
+                        continue;
+                    dvj[counter] = val.Value;
+                }
+
+                metadata.Modifications = new DynamicJsonValue(metadata)
+                {
+                    [Constants.Documents.Metadata.RevisionCounters] = dvj
+                };
+                metadata.Modifications.Remove(Constants.Documents.Metadata.Counters);
+                document.Modifications = new DynamicJsonValue(document)
+                {
+                    [Constants.Documents.Metadata.Key] = metadata
+                };
+
+                document = context.ReadObject(document, id, BlittableJsonDocumentBuilder.UsageMode.ToDisk);
+            }
+
+            return document;
+        }
+
+        private void PutFromRevisionIfChangeVectorIsGreater(
+            DocumentsOperationContext context,
+            BlittableJsonReaderObject document,
+            string id,
+            string changeVector,
+            long lastModifiedTicks,
+            DocumentFlags flags,
+            NonPersistentDocumentFlags nonPersistentFlags,
+            CollectionName collectionName = null)
+        {
+            if (nonPersistentFlags.Contain(NonPersistentDocumentFlags.FromReplication) == false)
+                return;
+
+            if ((flags.Contain(DocumentFlags.Revision) || flags.Contain(DocumentFlags.DeleteRevision)) == false)
+                return; // only revision can overwrite the document
+
+            if (flags.Contain(DocumentFlags.Conflicted))
+                return; // but, conflicted revision can't
+
+            using (DocumentIdWorker.GetLowerIdSliceAndStorageKey(context, id, out var lowerId, out _))
+            {
+                var conflictStatus = ConflictsStorage.GetConflictStatusForDocument(context, id, changeVector, out _, out _);
+                if (conflictStatus != ConflictStatus.Update)
+                    return; // Do not modify the document.
+
+                if (flags.Contain(DocumentFlags.Resolved))
+                {
+                    _database.ReplicationLoader.ConflictResolver.SaveLocalAsRevision(context, id);
+                }
+
+                if (document == null)
+                {
+                    _documentsStorage.Delete(context, lowerId, id, null, lastModifiedTicks, changeVector, collectionName,
+                        nonPersistentFlags | NonPersistentDocumentFlags.FromRevision);
+                    return;
+                }
+                _documentsStorage.Put(context, id, null, document, lastModifiedTicks, changeVector,
+                    flags.Strip(DocumentFlags.Revision), nonPersistentFlags | NonPersistentDocumentFlags.FromRevision);
             }
         }
 
@@ -539,30 +571,56 @@ namespace Raven.Server.Documents.Revisions
             long numberOfRevisionsToDelete, TimeSpan? minimumTimeToKeep, string changeVector, long lastModifiedTicks)
         {
             long maxEtagDeleted = 0;
+            Table writeTable = null;
+            string currentCollection = null;
+            var deletedRevisionsCount = 0;
 
-            var deletedRevisionsCount = table.DeleteForwardFrom(RevisionsSchema.Indexes[IdAndEtagSlice], prefixSlice, true,
-                numberOfRevisionsToDelete,
-                deleted =>
+            while (true)
+            {
+                var hasValue = false;
+
+                foreach (var read in table.SeekForwardFrom(RevisionsSchema.Indexes[IdAndEtagSlice], prefixSlice, skip: 0, startsWith: true))
                 {
-                    var revision = TableValueToRevision(context, ref deleted.Reader);
+                    if (numberOfRevisionsToDelete <= deletedRevisionsCount)
+                        break;
+                   
+                    var tvr = read.Result.Reader;
+                    var revision = TableValueToRevision(context, ref tvr);
 
                     if (minimumTimeToKeep.HasValue &&
                         _database.Time.GetUtcNow() - revision.LastModified <= minimumTimeToKeep.Value)
-                        return false;
+                        return deletedRevisionsCount;
 
-                    using (TableValueToSlice(context, (int)RevisionsTable.ChangeVector, ref deleted.Reader, out Slice key))
-                    {
-                        var revisionEtag = TableValueToEtag((int)RevisionsTable.Etag, ref deleted.Reader);
-                        CreateTombstone(context, key, revisionEtag, collectionName, changeVector, lastModifiedTicks);
-                    }
+                    hasValue = true;
 
-                    maxEtagDeleted = Math.Max(maxEtagDeleted, revision.Etag);
-                    if ((revision.Flags & DocumentFlags.HasAttachments) == DocumentFlags.HasAttachments)
+                    using (Slice.From(context.Allocator, revision.ChangeVector, out var keySlice))
                     {
-                        _documentsStorage.AttachmentsStorage.DeleteRevisionAttachments(context, revision, changeVector, lastModifiedTicks);
+                        CreateTombstone(context, keySlice, revision.Etag, collectionName, changeVector, lastModifiedTicks);
+
+                        maxEtagDeleted = Math.Max(maxEtagDeleted, revision.Etag);
+                        if ((revision.Flags & DocumentFlags.HasAttachments) == DocumentFlags.HasAttachments)
+                        {
+                            _documentsStorage.AttachmentsStorage.DeleteRevisionAttachments(context, revision, changeVector, lastModifiedTicks);
+                        }
+
+                        var docCollection = CollectionName.GetCollectionName(revision.Data);
+                        if (writeTable == null || docCollection != currentCollection)
+                        {
+                            currentCollection = docCollection;
+                            writeTable = EnsureRevisionTableCreated(context.Transaction.InnerTransaction, new CollectionName(docCollection));
+                        }
+
+                        writeTable.DeleteByKey(keySlice);
                     }
-                    return true;
-                });
+                    
+                    deletedRevisionsCount++;
+                    break;
+                }
+
+                if (hasValue == false)
+                    break;
+            }
+            
             _database.DocumentsStorage.EnsureLastEtagIsPersisted(context, maxEtagDeleted);
             return deletedRevisionsCount;
         }
@@ -687,77 +745,102 @@ namespace Raven.Server.Documents.Revisions
 
             var table = EnsureRevisionTableCreated(context.Transaction.InnerTransaction, collectionName);
 
-            if (configuration.Disabled == false && configuration.PurgeOnDelete)
+            using (Slice.From(context.Allocator, changeVector, out var changeVectorSlice))
             {
-                using (GetKeyPrefix(context, lowerId, out var prefixSlice))
+                var revisionExists = table.ReadByKey(changeVectorSlice,out var tvr);
+                if (revisionExists)
                 {
-                    DeleteRevisions(context, table, prefixSlice, collectionName, long.MaxValue, null, changeVector, lastModifiedTicks);
-                    DeleteCountOfRevisions(context, prefixSlice);
+                    MarkRevisionsAsConflictedIfNeeded(context, lowerId, idSlice, flags, tvr, table, changeVectorSlice);
+                    return;
                 }
 
-                return;
-            }
-
-            if (fromReplication)
-            {
-                void DeleteFromRevisionIfChangeVectorIsGreater()
+                if (configuration.Disabled == false && configuration.PurgeOnDelete)
                 {
-                    TableValueReader tvr;
-                    try
+                    using (GetKeyPrefix(context, lowerId, out var prefixSlice))
                     {
-                        var hasDoc = _documentsStorage.GetTableValueReaderForDocument(context, lowerId, throwOnConflict: true, tvr: out tvr);
-                        if (hasDoc == false)
-                            return;
+                        DeleteRevisions(context, table, prefixSlice, collectionName, long.MaxValue, null, changeVector, lastModifiedTicks);
+                        DeleteCountOfRevisions(context, prefixSlice);
                     }
-                    catch (DocumentConflictException)
-                    {
-                        // Do not modify the document.
-                        return;
-                    }
-
-                    var docChangeVector = TableValueToChangeVector(context, (int)DocumentsTable.ChangeVector, ref tvr);
-                    if (ChangeVectorUtils.GetConflictStatus(changeVector, docChangeVector) == ConflictStatus.Update)
-                    {
-                        _documentsStorage.Delete(context, lowerId, id, null, lastModifiedTicks, changeVector, collectionName,
-                            nonPersistentFlags | NonPersistentDocumentFlags.FromRevision);
-                    }
+                    return;
                 }
 
-                DeleteFromRevisionIfChangeVectorIsGreater();
-            }
+                PutFromRevisionIfChangeVectorIsGreater(context, null, id, changeVector, lastModifiedTicks, flags, nonPersistentFlags, collectionName);
 
+                var newEtag = _database.DocumentsStorage.GenerateNextEtag();
+                var newEtagSwapBytes = Bits.SwapBytes(newEtag);
+
+                using (table.Allocate(out TableValueBuilder tvb))
+                {
+                    tvb.Add(changeVectorSlice.Content.Ptr, changeVectorSlice.Size);
+                    tvb.Add(lowerId);
+                    tvb.Add(SpecialChars.RecordSeparator);
+                    tvb.Add(newEtagSwapBytes);
+                    tvb.Add(idSlice);
+                    tvb.Add(deleteRevisionDocument.BasePointer, deleteRevisionDocument.Size);
+                    tvb.Add((int)(DocumentFlags.DeleteRevision | flags));
+                    tvb.Add(newEtagSwapBytes);
+                    tvb.Add(lastModifiedTicks);
+                    tvb.Add(context.GetTransactionMarker());
+                    if (flags.Contain(DocumentFlags.Resolved))
+                    {
+                        tvb.Add((int)DocumentFlags.Resolved);
+                    }
+                    else
+                    {
+                        tvb.Add(0);
+                    }
+                    tvb.Add(Bits.SwapBytes(lastModifiedTicks));
+                    table.Insert(tvb);
+                }
+
+                DeleteOldRevisions(context, table, lowerId, collectionName, configuration, nonPersistentFlags, changeVector, lastModifiedTicks);
+            }
+        }
+
+        private void MarkRevisionsAsConflictedIfNeeded(DocumentsOperationContext context, Slice lowerId, Slice idSlice, DocumentFlags flags, TableValueReader tvr, Table table,
+            Slice changeVectorSlice)
+        {
+            // Revisions are immutable, but if there was a conflict we need to update the flags accordingly with the `Conflicted` flag.
+            if (flags.Contain(DocumentFlags.Conflicted))
+            {
+                var currentFlags = TableValueToFlags((int)RevisionsTable.Flags, ref tvr);
+                if (currentFlags.Contain(DocumentFlags.Conflicted) == false)
+                {
+                    MarkRevisionAsConflicted(context, tvr, table, changeVectorSlice, lowerId, idSlice);
+                }
+            }
+        }
+
+        private void MarkRevisionAsConflicted(DocumentsOperationContext context, TableValueReader tvr, Table table, Slice changeVectorSlice, Slice lowerId, Slice idSlice)
+        {
+            var revisionCopy = context.GetMemory(tvr.Size);
+            // we have to copy it to the side because we might do a defrag during update, and that
+            // can cause corruption if we read from the old value (which we just deleted)
+            Memory.Copy(revisionCopy.Address, tvr.Pointer, tvr.Size);
+            var copyTvr = new TableValueReader(revisionCopy.Address, tvr.Size);
+
+            var revision = TableValueToRevision(context, ref copyTvr);
+            var flags = revision.Flags | DocumentFlags.Conflicted;
             var newEtag = _database.DocumentsStorage.GenerateNextEtag();
-            var newEtagSwapBytes = Bits.SwapBytes(newEtag);
+            var deletedEtag = TableValueToEtag((int)RevisionsTable.DeletedEtag, ref tvr);
+            var resolvedFlag = TableValueToFlags((int)RevisionsTable.Resolved, ref tvr);
 
             using (table.Allocate(out TableValueBuilder tvb))
-            using (Slice.From(context.Allocator, changeVector, out var cv))
             {
-                tvb.Add(cv.Content.Ptr, cv.Size);
+                tvb.Add(changeVectorSlice.Content.Ptr, changeVectorSlice.Size);
                 tvb.Add(lowerId);
                 tvb.Add(SpecialChars.RecordSeparator);
-                tvb.Add(newEtagSwapBytes);
+                tvb.Add(Bits.SwapBytes(newEtag));
                 tvb.Add(idSlice);
-                tvb.Add(deleteRevisionDocument.BasePointer, deleteRevisionDocument.Size);
-                tvb.Add((int)(DocumentFlags.DeleteRevision | flags));
-                tvb.Add(newEtagSwapBytes);
-                tvb.Add(lastModifiedTicks);
+                tvb.Add(revision.Data.BasePointer, revision.Data.Size);
+                tvb.Add((int)flags);
+                tvb.Add(deletedEtag);
+                tvb.Add(revision.LastModified.Ticks);
                 tvb.Add(context.GetTransactionMarker());
-                if (flags.Contain(DocumentFlags.Resolved))
-                {
-                    tvb.Add((int)DocumentFlags.Resolved);
-                }
-                else
-                {
-                    tvb.Add(0);
-                }
-                tvb.Add(Bits.SwapBytes(lastModifiedTicks));
-                var isNew = table.Set(tvb);
-                if (isNew == false)
-                    // It might be just an update from replication as we call this twice, both for the doc delete and for deleteRevision.
-                    return;
+                tvb.Add((int)resolvedFlag);
+                tvb.Add(Bits.SwapBytes(revision.LastModified.Ticks));
+                table.Set(tvb);
             }
-
-            DeleteOldRevisions(context, table, lowerId, collectionName, configuration, nonPersistentFlags, changeVector, lastModifiedTicks);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]

@@ -398,6 +398,10 @@ class importDatabaseFromSql extends viewModelBase {
                 return "ace/mode/sqlserver";
             case "MySQL":
                 return "ace/mode/mysql";
+            case "NpgSQL":
+                return "ace/mode/sql";
+            case "Oracle":
+                return "ace/mode/sql";
             default: 
                 return "ace/mode/sql";
         }
@@ -451,7 +455,10 @@ class importDatabaseFromSql extends viewModelBase {
     onToggleAllClick(_: any, $event: JQueryMouseEventObject) {
         if (this.model.getSelectedTablesCount()) {
             
-            this.confirmationMessage("Deselect all tables", "To maintain connections integrity, all references with action <strong>'link'</strong> will be set to <strong>'skip'</strong>.<br/> Do you want to proceed? ", ["Cancel", "Set references to 'skip' and deselect all"])
+            this.confirmationMessage("Deselect all tables", "To maintain connections integrity, all references with action <strong>'link'</strong> will be set to <strong>'skip'</strong>.<br/> Do you want to proceed? ", {
+                buttons: ["Cancel", "Set references to 'skip' and deselect all"],
+                html: true
+            })
                 .done(result => {
                     if (result.can) {
                         this.model.setAllLinksToSkip();

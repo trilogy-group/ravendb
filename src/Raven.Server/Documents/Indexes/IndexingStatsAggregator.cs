@@ -6,6 +6,7 @@ using Raven.Client.Util;
 using Raven.Server.Documents.Indexes.MapReduce.Exceptions;
 using Raven.Server.Exceptions;
 using Raven.Server.Utils.Stats;
+using Voron.Exceptions;
 
 namespace Raven.Server.Documents.Indexes
 {
@@ -140,7 +141,7 @@ namespace Raven.Server.Documents.Indexes
             _stats.AddCriticalError(e);
         }
 
-        public void AddMemoryError(OutOfMemoryException oome)
+        public void AddMemoryError(Exception oome)
         {
             _stats.AddMemoryError(oome);
         }
@@ -153,6 +154,11 @@ namespace Raven.Server.Documents.Indexes
         public void AddExcessiveNumberOfReduceErrors(ExcessiveNumberOfReduceErrorsException e)
         {
             _stats.AddExcessiveNumberOfReduceErrors(e);
+        }
+
+        public void AddDiskFullError(DiskFullException e)
+        {
+            _stats.AddDiskFullError(e);
         }
 
         public void AddMapError(string key, string message)

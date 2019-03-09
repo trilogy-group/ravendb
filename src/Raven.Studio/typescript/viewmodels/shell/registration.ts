@@ -5,7 +5,6 @@ import licenseActivateCommand = require("commands/licensing/licenseActivateComma
 import moment = require("moment");
 import license = require("models/auth/licenseModel");
 import messagePublisher = require("common/messagePublisher");
-import placeholderUtils = require("common/placeholderUtils");
 import forceLicenseUpdateCommand = require("commands/licensing/forceLicenseUpdateCommand");
 
 class licenseKeyModel {
@@ -48,6 +47,8 @@ class registrationDismissStorage {
 }
 
 class registration extends dialogViewModelBase {
+    
+    static readonly licenseDialogSelector = "#licenseModal";
 
     dismissVisible = ko.observable<boolean>(true);
     canBeClosed = ko.observable<boolean>(false);
@@ -103,6 +104,12 @@ class registration extends dialogViewModelBase {
         });
 
         this.registrationUrl(license.generateLicenseRequestUrl());
+        
+        this.registerDisposable(license.licenseStatus.subscribe(statusUpdated => {
+            if (!statusUpdated.Expired && !statusUpdated.ErrorMessage) {
+                app.closeDialog(this);
+            }
+        }))
     }
 
     static showRegistrationDialogIfNeeded(license: Raven.Server.Commercial.LicenseStatus, skipIfNoLicense = false) {
@@ -188,12 +195,6 @@ class registration extends dialogViewModelBase {
         super.close();
     }
     
-    attached() {
-        super.attached();
-        
-        placeholderUtils.fixPlaceholders($("body"));
-    }
-
     submit() {
         if (!this.isValid(this.licenseKeyModel)) {
             return;

@@ -11,7 +11,6 @@ using Raven.Server.Documents.Indexes.MapReduce.Exceptions;
 using Raven.Server.Documents.Indexes.Persistence.Lucene;
 using Raven.Server.Documents.Indexes.Workers;
 using Raven.Server.ServerWide.Context;
-using Raven.Server.ServerWide.Memory;
 using Raven.Server.Utils;
 using Sparrow;
 using Sparrow.Binary;
@@ -123,6 +122,20 @@ namespace Raven.Server.Documents.Indexes.MapReduce
                             throw new ArgumentOutOfRangeException(modifiedStore.Type.ToString());
                     }
                 }
+
+                if (_mapReduceContext.FreedPages.Count > 0)
+                {
+                    long tmp = 0;
+                    using (treeScopeStats.Start())
+                    using (Slice.External(indexContext.Allocator, (byte*)&tmp, sizeof(long), out Slice pageNumberSlice))
+                    {
+                        foreach (var freedPage in _mapReduceContext.FreedPages)
+                        {
+                            tmp = Bits.SwapBytes(freedPage);
+                            table.DeleteByKey(pageNumberSlice);
+                        }
+                    }
+                }
             }
 
             if (stats.Duration >= MinReduceDurationToCalculateProcessMemoryUsage)
@@ -133,11 +146,13 @@ namespace Raven.Server.Documents.Indexes.MapReduce
             }
 
             WriteLastEtags(indexContext);
+            _mapReduceContext.StoreNextMapResultId();
 
             return false;
         }
 
-        public bool CanContinueBatch(DocumentsOperationContext documentsContext, TransactionOperationContext indexingContext, IndexingStatsScope stats, long currentEtag, long maxEtag, int count)
+        public bool CanContinueBatch(DocumentsOperationContext documentsContext, TransactionOperationContext indexingContext, 
+            IndexingStatsScope stats, IndexWriteOperation indexWriteOperation, long currentEtag, long maxEtag, int count)
         {
             throw new NotSupportedException();
         }
@@ -191,13 +206,15 @@ namespace Raven.Server.Documents.Indexes.MapReduce
                     writer.IndexDocument(reduceKeyHash, output, stats, indexContext);
                 }
 
-                _index.ReducesPerSec.Mark(numberOfEntriesToReduce);
+                _index.ReducesPerSec.MarkSingleThreaded(numberOfEntriesToReduce);
                 _metrics.MapReduceIndexes.ReducedPerSec.Mark(numberOfEntriesToReduce);
 
                 stats.RecordReduceSuccesses(numberOfEntriesToReduce);
-                stats.RecordReduceAllocations(_index._threadAllocations.Allocations);
+
+                _index.UpdateThreadAllocations(indexContext, writer, stats, updateReduceStats: true);
+                
             }
-            catch (Exception e) when (e is OperationCanceledException == false)
+            catch (Exception e) when (e.IsIndexError())
             {
                 _index.ErrorIndexIfCriticalException(e);
 
@@ -209,7 +226,7 @@ namespace Raven.Server.Documents.Indexes.MapReduce
              MapReduceResultsStore modifiedStore, LowLevelTransaction lowLevelTransaction,
             IndexWriteOperation writer, LazyStringValue reduceKeyHash, Table table, CancellationToken token)
         {
-            if (modifiedStore.ModifiedPages.Count == 0 && modifiedStore.FreedPages.Count == 0)
+            if (modifiedStore.ModifiedPages.Count == 0)
                 return;
 
             EnsureValidTreeReductionStats(stats);
@@ -303,12 +320,13 @@ namespace Raven.Server.Documents.Indexes.MapReduce
                                 parentPagesToAggregate.Add(parentPage);
                             }
 
+                            _index.ReducesPerSec.MarkSingleThreaded(leafPage.NumberOfEntries);
                             _metrics.MapReduceIndexes.ReducedPerSec.Mark(leafPage.NumberOfEntries);
 
                             stats.RecordReduceSuccesses(leafPage.NumberOfEntries);
                         }
                     }
-                    catch (Exception e) when (e is OperationCanceledException == false)
+                    catch (Exception e) when (e.IsIndexError())
                     {
                         if (failedAggregatedLeafs == null)
                             failedAggregatedLeafs = new Dictionary<long, Exception>();
@@ -319,16 +337,6 @@ namespace Raven.Server.Documents.Indexes.MapReduce
 
                         HandleReductionError(e, reduceKeyHash, writer, stats, updateStats: parentPage == -1, page: leafPage);
                     }
-                }
-            }
-
-            long tmp = 0;
-            using (Slice.External(indexContext.Allocator, (byte*)&tmp, sizeof(long), out Slice pageNumberSlice))
-            {
-                foreach (var freedPage in modifiedStore.FreedPages)
-                {
-                    tmp = Bits.SwapBytes(freedPage);
-                    table.DeleteByKey(pageNumberSlice);
                 }
             }
 
@@ -372,12 +380,13 @@ namespace Raven.Server.Documents.Indexes.MapReduce
                                 StoreAggregationResult(page, table, result);
                             }
 
+                            _index.ReducesPerSec.MarkSingleThreaded(page.NumberOfEntries);
                             _metrics.MapReduceIndexes.ReducedPerSec.Mark(page.NumberOfEntries);
 
                             stats.RecordReduceSuccesses(page.NumberOfEntries);
                         }
                     }
-                    catch (Exception e) when (e is OperationCanceledException == false)
+                    catch (Exception e) when (e.IsIndexError())
                     {
                         _index.ErrorIndexIfCriticalException(e);
 
@@ -395,7 +404,7 @@ namespace Raven.Server.Documents.Indexes.MapReduce
                     parentPagesToAggregate.Add(branchesToAggregate.First());
                 }
 
-                stats.RecordReduceAllocations(_index._threadAllocations.Allocations);
+                _index.UpdateThreadAllocations(indexContext, writer, stats, updateReduceStats: true);
             }
 
             if (compressedEmptyLeafs != null && compressedEmptyLeafs.Count > 0)
@@ -404,7 +413,6 @@ namespace Raven.Server.Documents.Indexes.MapReduce
                 // let's remove them and reduce the tree once again
 
                 modifiedStore.ModifiedPages.Clear();
-                modifiedStore.FreedPages.Clear();
 
                 foreach (var pageNumber in compressedEmptyLeafs)
                 {
@@ -584,22 +592,26 @@ namespace Raven.Server.Documents.Indexes.MapReduce
                 }
             }
 
-            var message = $"Couldn't find a pre-computed aggregation result for the existing page: {relatedTreePage}. ";
+            var message = $"Couldn't find a pre-computed aggregation result for the existing page: {relatedTreePage.PageNumber}. ";
+
+            var debugDetails = $"Debug details - page: {relatedTreePage}, ";
 
             if (decompressedDebug != null)
-                message += $"Decompressed: {decompressedDebug}). ";
+                debugDetails += $"decompressed: {decompressedDebug}), ";
 
-            message += $"Tree state: {tree.State}. ";
+            debugDetails += $"tree state: {tree.State}. ";
 
             if (failedAggregatedLeafs != null && failedAggregatedLeafs.TryGetValue(pageNumber, out var exception))
             {
                 message += $"The aggregation of this leaf (#{pageNumber}) has failed so the relevant result doesn't exist. " +
-                           "Check the inner exception for leaf aggregation error details";
+                           "Check the inner exception for leaf aggregation error details. ";
 
-                throw new AggregationResultNotFoundException(message, exception);
+                throw new AggregationResultNotFoundException(message + debugDetails, exception);
             }
 
-            throw new AggregationResultNotFoundException(message);
+            message += "Please check if there are other aggregate failures at earlier phase of the reduce stage. They could lead to this error due to missing intermediate results. ";
+
+            throw new AggregationResultNotFoundException(message + debugDetails);
         }
 
         protected abstract AggregationResult AggregateOn(List<BlittableJsonReaderObject> aggregationBatch, TransactionOperationContext indexContext, IndexingStatsScope stats, CancellationToken token);

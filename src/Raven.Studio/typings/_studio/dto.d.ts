@@ -435,7 +435,7 @@ interface sqlMigrationAdvancedSettingsDto {
     DetectManyToMany: boolean 
 }
 
-type virtualNotificationType = "CumulativeBulkInsert" | "AttachmentUpload";
+type virtualNotificationType = "CumulativeBulkInsert" | "AttachmentUpload" | "CumulativeUpdateByQuery" | "CumulativeDeleteByQuery";
 
 declare module Raven.Server.NotificationCenter.Notifications {
     interface Notification  {
@@ -449,11 +449,16 @@ interface explainQueryResponse extends resultsDto<Raven.Server.Documents.Queries
 }
 
 
-interface virtualBulkInsertItem {
+interface virtualBulkOperationItem {
     id: string;
     date: string;
     duration: number;
     items: number;
+}
+
+interface queryBasedVirtualBulkOperationItem extends virtualBulkOperationItem {
+    query: string;
+    indexOrCollectionUsed: string;
 }
 
 type adminLogsHeaderType = "Source" | "Logger";
@@ -478,4 +483,59 @@ interface periodicBackupServerLimitsResponse {
     LocalRootPath: string;
     AllowedAwsRegions: Array<string>;
     AllowedDestinations: Array<backupOptions>;
+}
+
+interface serializedColumnDto {
+    visible: boolean;
+    editable: boolean;
+    column: virtualColumnDto;
+}
+
+type valueProvider<T> = (arg: T) => any;
+type sortMode = "asc" | "desc";
+
+interface textColumnOpts<T> {
+    extraClass?: (item: T) => string;
+    useRawValue?: (item: T) => boolean;
+    title?: (item:T) => string;
+    sortable?: "number" | "string" | valueProvider<T>;
+    defaultSortOrder?: sortMode;
+}
+
+interface hypertextColumnOpts<T> extends textColumnOpts<T> {
+    handler?: (item: T, event: JQueryEventObject) => void;
+}
+
+interface virtualColumnDto {
+    type: "flags" | "checkbox" | "text" | "hyperlink" | "custom"
+    width: string;
+    header: string;
+    serializedValue: string;
+}
+
+interface attachmentItem {
+    documentId: string;
+    name: string;
+    contentType: string;
+    size: number;
+}
+
+interface editDocumentCrudActions {
+    setCounter(counter: counterItem): void;
+    deleteAttachment(file: attachmentItem): void;
+    deleteCounter(counter: counterItem): void;
+    fetchCounters(nameFilter: string, skip: number, take: number): JQueryPromise<pagedResult<counterItem>>;
+    fetchAttachments(nameFilter: string, skip: number, take: number): JQueryPromise<pagedResult<attachmentItem>>;
+    saveRelatedItems(targetDocumentId: string): JQueryPromise<void>;
+    attachmentsCount: KnockoutComputed<number>;
+    countersCount: KnockoutComputed<number>;
+    onDocumentSaved(saveResult: saveDocumentResponseDto, localDoc: any): void;
+}
+
+
+interface confirmationDialogOptions {
+    buttons?: string[];
+    forceRejectWithResolve?: boolean;
+    defaultOption?: string;
+    html?: boolean;
 }

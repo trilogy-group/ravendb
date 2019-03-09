@@ -6,6 +6,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using FastTests.Server.Replication;
 using FastTests.Utils;
+using Raven.Client;
 using Raven.Client.Documents;
 using Raven.Client.Documents.Conventions;
 using Raven.Client.Documents.Indexes;
@@ -15,6 +16,7 @@ using Raven.Client.Documents.Smuggler;
 using Raven.Client.Exceptions;
 using Raven.Client.ServerWide;
 using Raven.Server.Config;
+using Raven.Server.Documents;
 using Raven.Server.Documents.Replication;
 using Raven.Server.ServerWide.Commands;
 using Raven.Server.ServerWide.Context;
@@ -60,6 +62,35 @@ namespace SlowTests.Cluster
                 }
             }
         }
+
+        [Fact]
+        public async Task ServeSeveralClusterTransactionRequests()
+        {
+            using (var store = GetDocumentStore())
+            using (var session = store.OpenAsyncSession(new SessionOptions
+            {
+                TransactionMode = TransactionMode.ClusterWide
+            }))
+            {
+                var user1 = new User()
+                {
+                    Name = "Karmel"
+                };
+
+                session.Advanced.ClusterTransaction.CreateCompareExchangeValue("usernames/karmel", user1);
+                await session.SaveChangesAsync();
+
+                var result = (await session.Advanced.ClusterTransaction.GetCompareExchangeValueAsync<User>("usernames/karmel"));
+                Assert.Equal(user1.Name, result.Value.Name);
+
+                await session.StoreAsync(user1, "users/1");
+                await session.SaveChangesAsync();
+
+                var user = await session.LoadAsync<User>("users/1");
+                Assert.Equal(user1.Name, user.Name);
+            }
+        }
+
         private Random _random = new Random();
         private string RandomString(int length)
         {
@@ -78,60 +109,79 @@ namespace SlowTests.Cluster
         [InlineData(5)]
         public async Task CanPreformSeveralClusterTransactions(int numberOfNodes)
         {
-            var numOfSessions = 10;
-            var docsPerSession = 2;
-            var leader = await CreateRaftClusterAndGetLeader(numberOfNodes);
-            using (var store = GetDocumentStore(new Options
+            NoTimeouts();
+            try
             {
-                Server = leader,
-                ReplicationFactor = numberOfNodes
-            }))
-            {
-                for (int j = 0; j < numOfSessions; j++)
+                var numOfSessions = 10;
+                var docsPerSession = 2;
+                var leader = await CreateRaftClusterAndGetLeader(numberOfNodes);
+                using (var store = GetDocumentStore(new Options
                 {
-                    var trys = 5;
-                    do
+                    Server = leader,
+                    ReplicationFactor = numberOfNodes
+                }))
+                {
+                    for (int j = 0; j < numOfSessions; j++)
                     {
-                        try
+                        var trys = 5;
+                        do
                         {
-                            using (var session = store.OpenAsyncSession(new SessionOptions
+                            try
                             {
-                                TransactionMode = TransactionMode.ClusterWide
-                            }))
-                            {
-                                for (int i = 0; i < docsPerSession; i++)
+                                using (var session = store.OpenAsyncSession(new SessionOptions
                                 {
-                                    var user = new User
+                                    TransactionMode = TransactionMode.ClusterWide
+                                }))
+                                {
+                                    for (int i = 0; i < docsPerSession; i++)
                                     {
-                                        LastName = RandomString(2048),
-                                        Age = i
-                                    };
-                                    await session.StoreAsync(user, "users/" + (docsPerSession * j + i + 1));
+                                        var user = new User
+                                        {
+                                            LastName = RandomString(2048),
+                                            Age = i
+                                        };
+                                        using (var cts = new CancellationTokenSource(TimeSpan.FromMinutes(numberOfNodes)))
+                                        {
+                                            await session.StoreAsync(user, "users/" + (docsPerSession * j + i + 1), cts.Token);
+                                        }
+                                    }
+
+                                    if (numberOfNodes > 1)
+                                        await ActionWithLeader(l =>
+                                        {
+                                            l.ServerStore.Engine.CurrentLeader?.StepDown();
+                                            return Task.CompletedTask;
+                                        });
+                                    using (var cts = new CancellationTokenSource(TimeSpan.FromMinutes(numberOfNodes)))
+                                    {
+                                        await session.SaveChangesAsync(cts.Token);
+                                    }
+
+                                    trys = 5;
                                 }
-
-                                if (numberOfNodes > 1)
-                                    await ActionWithLeader(l =>
-                                    {
-                                        l.ServerStore.Engine.CurrentLeader?.StepDown();
-                                        return Task.CompletedTask;
-                                    });
-                                await session.SaveChangesAsync();
-                                trys = 5;
                             }
-                        }
-                        catch (Exception e) when (e is ConcurrencyException)
-                        {
-                            trys--;
-                        }
-                    } while (trys < 5 && trys > 0);
+                            catch (Exception e) when (e is ConcurrencyException)
+                            {
+                                trys--;
+                            }
+                        } while (trys < 5 && trys > 0);
 
-                    Assert.True(trys > 0, $"Couldn't save a document after 5 retries.");
+                        Assert.True(trys > 0, $"Couldn't save a document after 5 retries.");
+                    }
+
+                    using (var session = store.OpenAsyncSession())
+                    {
+                        using (var cts = new CancellationTokenSource(TimeSpan.FromMinutes(numberOfNodes)))
+                        {
+                            var res = await session.Query<User>().Customize(q => q.WaitForNonStaleResults()).ToListAsync(cts.Token);
+                            Assert.Equal(numOfSessions * docsPerSession, res.Count);
+                        }
+                    }
                 }
-                using (var session = store.OpenSession())
-                {
-                    var res = session.Query<User>().Customize(q => q.WaitForNonStaleResults()).ToArray();
-                    Assert.Equal(numOfSessions * docsPerSession, res.Length);
-                }
+            }
+            finally
+            {
+                SetTimeouts();
             }
         }
 
@@ -177,7 +227,7 @@ namespace SlowTests.Cluster
         [Fact]
         public async Task CanImportExportAndBackupWithClusterTransactions()
         {
-            var file = Path.GetTempFileName();
+            var file = GetTempFileName();
 
             var leader = await CreateRaftClusterAndGetLeader(3);
             var user1 = new User()
@@ -226,7 +276,8 @@ namespace SlowTests.Cluster
                     Assert.Equal(user3.Name, user.Name);
                 }
 
-                await store.Smuggler.ExportAsync(new DatabaseSmugglerExportOptions(), file);
+                var operation = await store.Smuggler.ExportAsync(new DatabaseSmugglerExportOptions(), file);
+                await operation.WaitForCompletionAsync(TimeSpan.FromMinutes(1));
             }
 
             using (var store = GetDocumentStore(new Options { Server = leader, ReplicationFactor = 2 }))
@@ -237,7 +288,8 @@ namespace SlowTests.Cluster
                     await session.SaveChangesAsync();
                     session.Advanced.Evict(user1);
 
-                    await store.Smuggler.ImportAsync(new DatabaseSmugglerImportOptions(), file);
+                    var operation = await store.Smuggler.ImportAsync(new DatabaseSmugglerImportOptions(), file);
+                    await operation.WaitForCompletionAsync(TimeSpan.FromMinutes(1));
                     var user = await session.LoadAsync<User>("foo/bar");
                     session.Advanced.Evict(user);
                     Assert.Equal(user3.Name, user.Name);
@@ -643,6 +695,38 @@ namespace SlowTests.Cluster
             }
         }
 
+        [Fact]
+        public async Task ClusterTxWithCounters()
+        {
+            using (var storeA = GetDocumentStore())
+            {
+                using (var session = storeA.OpenAsyncSession(new SessionOptions
+                {
+                    TransactionMode = TransactionMode.ClusterWide
+                }))
+                {
+                    await session.StoreAsync(new User { Name = "Aviv1" }, "users/1");
+                    await session.SaveChangesAsync();
+                }
+
+
+                using (var session = storeA.OpenAsyncSession())
+                {
+                    session.CountersFor("users/1").Increment("likes", 10);
+                    await session.SaveChangesAsync();
+                }
+
+                using (var session = storeA.OpenAsyncSession())
+                {
+                    var user = await session.LoadAsync<User>("users/1");
+                    var flags = session.Advanced.GetMetadataFor(user)[Constants.Documents.Metadata.Flags];
+                    var list = session.Advanced.GetCountersFor(user);
+                    Assert.Equal((DocumentFlags.HasCounters).ToString(), flags);
+                    Assert.Equal(1, list.Count);
+                }
+            }
+        }
+
         /// <summary>
         /// This is a comprehensive test. The general flow of the test is as following:
         /// - Create cluster with 5 nodes with a database on _all_ of them and enable revisions.
@@ -754,8 +838,12 @@ namespace SlowTests.Cluster
                         var user = await session.LoadAsync<User>("foo/bar");
                         var changeVector = session.Advanced.GetChangeVectorFor(user);
                         Assert.NotNull(await session.Advanced.Revisions.GetAsync<User>(changeVector));
-                        var list = await session.Advanced.Revisions.GetForAsync<User>("foo/bar");
-                        Assert.Equal(2, list.Count);
+                        var count = await WaitForValueAsync((async () =>
+                        {
+                            var list = await session.Advanced.Revisions.GetForAsync<User>("foo/bar");
+                            return list.Count;
+                        }), 2);
+                        Assert.Equal(2, count);
 
                         // revive another node so we should have a functional cluster now
                         Servers[2] = GetNewServer(new Dictionary<string, string>
@@ -772,8 +860,12 @@ namespace SlowTests.Cluster
                         var database = await Servers[1].ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(leaderStore.Database);
                         await database.RachisLogIndexNotifications.WaitForIndexNotification(lastRaftIndex, TimeSpan.FromSeconds(15));
 
-                        list = await session.Advanced.Revisions.GetForAsync<User>("foo/bar");
-                        Assert.Equal(2, list.Count);
+                        count = await WaitForValueAsync((async () =>
+                        {
+                            var list = await session.Advanced.Revisions.GetForAsync<User>("foo/bar");
+                            return list.Count;
+                        }), 2);
+                        Assert.Equal(2, count);
                     }
                 }
             }
@@ -810,7 +902,7 @@ namespace SlowTests.Cluster
         }
 
         [Fact]
-        public async Task ThrowOnOptimisticConcurrencyForSignleDcoument()
+        public async Task ThrowOnOptimisticConcurrencyForSingleDocument()
         {
             using (var store = GetDocumentStore())
             {

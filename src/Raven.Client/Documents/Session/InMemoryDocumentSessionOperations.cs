@@ -853,9 +853,9 @@ more responsive application.
             {
                 foreach (var item in clusterTransactionOperations.StoreCompareExchange)
                 {
-                    var djv = new DynamicJsonValue()
+                    var djv = new DynamicJsonValue
                     {
-                        ["Object"] = EntityToBlittable.ConvertToBlittableIfNeeded(item.Value.Entity)
+                        ["Object"] = EntityToBlittable.ConvertToBlittableIfNeeded(item.Value.Entity, Conventions, Context, JsonSerializer, documentInfo: null, removeIdentityProperty: false)
                     };
                     var blittable = Context.ReadObject(djv, item.Key);
                     result.SessionCommands.Add(new PutCompareExchangeCommandData(item.Key, blittable, item.Value.Index));
@@ -1203,14 +1203,28 @@ more responsive application.
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void DeferInternal(ICommandData command)
         {
-            DeferredCommandsDictionary[(command.Id, command.Type, command.Name)] = command;
-            DeferredCommandsDictionary[(command.Id, CommandType.ClientAnyCommand, null)] = command;
-            if (command.Type != CommandType.AttachmentPUT &&
-                command.Type != CommandType.AttachmentDELETE &&
-                command.Type != CommandType.AttachmentCOPY &&
-                command.Type != CommandType.AttachmentMOVE &&
-                command.Type != CommandType.Counters)
-                DeferredCommandsDictionary[(command.Id, CommandType.ClientModifyDocumentCommand, null)] = command;
+            if (command.Type == CommandType.BatchPATCH)
+            {
+                var batchPathCommand = (BatchPatchCommandData)command;
+                foreach (var kvp in batchPathCommand.Ids)
+                    AddCommand(kvp.Id, CommandType.PATCH, command.Name);
+
+                return;
+            }
+
+            AddCommand(command.Id, command.Type, command.Name);
+
+            void AddCommand(string id, CommandType commandType, string commandName)
+            {
+                DeferredCommandsDictionary[(id, commandType, commandName)] = command;
+                DeferredCommandsDictionary[(id, CommandType.ClientAnyCommand, null)] = command;
+                if (commandType != CommandType.AttachmentPUT &&
+                    commandType != CommandType.AttachmentDELETE &&
+                    commandType != CommandType.AttachmentCOPY &&
+                    commandType != CommandType.AttachmentMOVE &&
+                    commandType != CommandType.Counters)
+                    DeferredCommandsDictionary[(id, CommandType.ClientModifyDocumentCommand, null)] = command;
+            }
         }
 
         public void AssertNotDisposed()
@@ -1247,22 +1261,7 @@ more responsive application.
         public virtual void Dispose()
         {
             Dispose(true);
-        }
-
-        ~InMemoryDocumentSessionOperations()
-        {
-            try
-            {
-                Dispose(false);
-            }
-            catch (ObjectDisposedException)
-            {
-                // nothing can be done here
-            }
-#if DEBUG
-            Debug.WriteLine("Disposing a session for finalizer! It should be disposed by calling session.Dispose()!");
-#endif
-        }
+        }      
 
         public void RegisterMissing(string id)
         {

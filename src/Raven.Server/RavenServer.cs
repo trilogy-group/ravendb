@@ -50,6 +50,7 @@ using Raven.Server.ServerWide.Commands;
 using Raven.Server.ServerWide.Context;
 using Raven.Server.ServerWide.Maintenance;
 using Raven.Server.Utils;
+using Raven.Server.Utils.Cpu;
 using Raven.Server.Web.ResponseCompression;
 using Sparrow;
 using Sparrow.Json;
@@ -88,6 +89,10 @@ namespace Raven.Server
 
         public event EventHandler ServerCertificateChanged;
 
+        public ICpuUsageCalculator CpuUsageCalculator;
+
+        internal bool ThrowOnLicenseActivationFailure;
+
         public RavenServer(RavenConfiguration configuration)
         {
             JsonDeserializationValidator.Validate();
@@ -119,7 +124,11 @@ namespace Raven.Server
             var sp = Stopwatch.StartNew();
             Certificate = LoadCertificate() ?? new CertificateHolder();
 
-            
+            CpuUsageCalculator = string.IsNullOrEmpty(Configuration.Monitoring.CpuUsageMonitorExec) 
+                ? CpuHelper.GetOSCpuUsageCalculator()
+                : CpuHelper.GetExtensionPointCpuUsageCalculator(_tcpContextPool, Configuration.Monitoring, ServerStore.NotificationCenter) ;
+
+            CpuUsageCalculator.Init();
 
             if (Logger.IsInfoEnabled)
                 Logger.Info(string.Format("Server store started took {0:#,#;;0} ms", sp.ElapsedMilliseconds));
@@ -239,27 +248,7 @@ namespace Raven.Server
                         RedirectsHttpTrafficToHttps();
                     }
 
-                    if (PlatformDetails.RunningOnLinux)
-                    {
-                        // When using Let's Encrypt certs, the full certificate chain is not available in the OS store, so it will download it on every connection.
-                        // We will prevent this by registering the entire certificate chain to the intermediates store during startup.
-                        // That store is used for lookup, but not trust, and will eliminate the network call for future chain builds.
-                        // See: https://github.com/dotnet/corefx/issues/30693#issuecomment-401062377
-                        var chain = new X509Chain();
-                        chain.Build(Certificate.Certificate);
-
-                        using (X509Store intermediates = new X509Store(StoreName.CertificateAuthority, StoreLocation.CurrentUser))
-                        {
-                            // Not supported on macOS:
-                            // https://github.com/bartonjs/corefx/blob/37cacaac178150d6040f3f976f1f335a17e7f13c/Documentation/project-docs/cross-platform-cryptography.md#x509store
-                            intermediates.Open(OpenFlags.ReadWrite);
-
-                            foreach (var element in chain.ChainElements)
-                            {
-                                intermediates.Add(element.Certificate);
-                            }
-                        }
-                    }
+                    SecretProtection.AddCertificateChainToTheUserCertificateAuthorityStoreAndCleanExpiredCerts(Certificate.Certificate, Certificate.Certificate.Export(X509ContentType.Cert), Configuration.Security.CertificatePassword);
                 }
 
                 if (Logger.IsInfoEnabled)
@@ -412,6 +401,8 @@ namespace Raven.Server
 
         private Task _currentRefreshTask = Task.CompletedTask;
 
+        public Task RefreshTask => _currentRefreshTask;
+
         public void RefreshClusterCertificateTimerCallback(object state)
         {
             RefreshClusterCertificate(state);
@@ -538,15 +529,15 @@ namespace Raven.Server
                 }
 
                 // same certificate, but now we need to see if we need to auto update it
-                var remainingDays = (currentCertificate.Certificate.NotAfter - Time.GetUtcNow().ToLocalTime()).TotalDays;
-                if (remainingDays > 30 && forceRenew == false)
-                    return; // nothing to do, the certs are the same and we have enough time
-
-                // we want to setup all the renewals for Saturday so we'll have reduced the amount of cert renewals that are counted against our renewals
-                // but if we have less than 20 days, we'll try anyway
-                if (DateTime.Today.DayOfWeek != DayOfWeek.Saturday && remainingDays > 20 && forceRenew == false)
+                var (shouldRenew, renewalDate) = CalculateRenewalDate(currentCertificate, forceRenew);
+                if (shouldRenew == false)
+                {
+                    // We don't want an alert here, this happens frequently.
+                    if (Logger.IsOperationsEnabled)
+                        Logger.Operations($"Renew check: still have time left to renew the server certificate with thumbprint `{currentCertificate.Certificate.Thumbprint}`, estimated renewal date: {renewalDate}");
                     return;
-
+                }                    
+                
                 if (ServerStore.LicenseManager.GetLicenseStatus().Type == LicenseType.Developer && forceRenew == false)
                 {
                     msg = "It's time to renew your Let's Encrypt server certificate but automatic renewal is turned off when using the developer license. Go to the certificate page in the studio and trigger the renewal manually.";
@@ -590,8 +581,36 @@ namespace Raven.Server
             }
         }
 
-        public async Task StartCertificateReplicationAsync(string base64Cert, bool replaceImmediately)
+        public (bool ShouldRenew, DateTime RenewalDate) CalculateRenewalDate(CertificateHolder currentCertificate, bool forceRenew)
         {
+            // we want to setup all the renewals for Saturdays, 30 days before expiration. This is done to reduce the amount of cert renewals that are counted against our renewals
+            // but if we have less than 20 days or user asked to force-renew, we'll try anyway.
+
+            if (forceRenew)
+                return (true, DateTime.UtcNow);
+
+            var remainingDays = (currentCertificate.Certificate.NotAfter - Time.GetUtcNow().ToLocalTime()).TotalDays;
+            if (remainingDays <= 20)
+            {
+                return (true, DateTime.UtcNow);
+            }
+
+            var firstPossibleDate = currentCertificate.Certificate.NotAfter.ToUniversalTime().AddDays(-30);
+            
+            // We can do this because saturday is last in the DayOfWeek enum
+            var daysUntilSaturday = DayOfWeek.Saturday - firstPossibleDate.DayOfWeek; 
+            var firstPossibleSaturday = firstPossibleDate.AddDays(daysUntilSaturday);
+
+            if (firstPossibleSaturday.Date == DateTime.Today)
+                return (true, firstPossibleSaturday);
+
+            return (false, firstPossibleSaturday);
+        }
+
+        public async Task StartCertificateReplicationAsync(string base64CertWithoutPassword, bool replaceImmediately)
+        {
+            // We assume that at this point, the password was already stripped out of the certificate.
+
             // the process of updating a new certificate is the same as deleting a database
             // we first send the certificate to all the nodes, then we get acknowledgments
             // about that from them, and we replace only when they are confirmed to have been
@@ -603,11 +622,11 @@ namespace Raven.Server
                 byte[] certBytes;
                 try
                 {
-                    certBytes = Convert.FromBase64String(base64Cert);
+                    certBytes = Convert.FromBase64String(base64CertWithoutPassword);
                 }
                 catch (Exception e)
                 {
-                    throw new ArgumentException($"Unable to parse the {nameof(base64Cert)} property, expected a Base64 value", e);
+                    throw new ArgumentException($"Unable to parse the {nameof(base64CertWithoutPassword)} property, expected a Base64 value", e);
                 }
 
                 X509Certificate2 newCertificate;
@@ -649,7 +668,7 @@ namespace Raven.Server
 
                 await ServerStore.SendToLeaderAsync(new InstallUpdatedServerCertificateCommand
                 {
-                    Certificate = base64Cert, // includes the private key
+                    Certificate = base64CertWithoutPassword, // includes the private key
                     ReplaceImmediately = replaceImmediately
                 });
             }
@@ -1624,6 +1643,7 @@ namespace Raven.Server
                 ea.Execute(() => ServerMaintenanceTimer?.Dispose());
                 ea.Execute(() => AfterDisposal?.Invoke());
                 ea.Execute(() => _clusterMaintenanceWorker?.Dispose());
+                ea.Execute(() => CpuUsageCalculator.Dispose());
 
                 ea.ThrowIfNeeded();
             }

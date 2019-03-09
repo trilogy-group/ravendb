@@ -22,7 +22,7 @@ namespace SlowTests.Client.Attachments
         [Fact]
         public async Task ExportAndDeleteAttachmentThanCreateAnotherOneAndImport()
         {
-            var file = Path.GetTempFileName();
+            var file = GetTempFileName();
             try
             {
                 using (var store = GetDocumentStore(new Options
@@ -187,7 +187,7 @@ namespace SlowTests.Client.Attachments
         [Fact]
         public async Task ExportAndDeleteAttachmentAndImport()
         {
-            var file = Path.GetTempFileName();
+            var file = GetTempFileName();
             try
             {
                 using (var store = GetDocumentStore(new Options
@@ -257,7 +257,7 @@ namespace SlowTests.Client.Attachments
         [Fact]
         public async Task ExportWithoutAttachmentAndCreateOneAndImport()
         {
-            var file = Path.GetTempFileName();
+            var file = GetTempFileName();
             try
             {
                 using (var store = GetDocumentStore(new Options
@@ -325,7 +325,7 @@ namespace SlowTests.Client.Attachments
         [Fact]
         public async Task ExportEmptyStream()
         {
-            var file = Path.GetTempFileName();
+            var file = GetTempFileName();
             try
             {
                 var dbId2 = new Guid("99999999-48c4-421e-9466-999999999999");
@@ -403,7 +403,7 @@ namespace SlowTests.Client.Attachments
                         using (var attachment = session.Advanced.Attachments.Get("users/1", "empty-file"))
                         {
                             attachment.Stream.CopyTo(attachmentStream);
-                            Assert.Contains("A:1", attachment.Details.ChangeVector);
+                            Assert.Contains("A:2", attachment.Details.ChangeVector);
                             Assert.Equal("empty-file", attachment.Details.Name);
                             Assert.Equal(0, attachment.Details.Size);
                             Assert.Equal("DldRwCblQ7Loqy6wYJnaodHl30d3j3eH+qtFzfEv46g=", attachment.Details.Hash);
@@ -422,7 +422,7 @@ namespace SlowTests.Client.Attachments
         [Fact]
         public async Task CanExportAndImportAttachmentsAndRevisionAttachments()
         {
-            var file = Path.GetTempFileName();
+            var file = GetTempFileName();
             try
             {
                 using (var store1 = GetDocumentStore(new Options

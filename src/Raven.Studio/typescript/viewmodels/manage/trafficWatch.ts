@@ -37,6 +37,7 @@ class trafficWatch extends viewModelBase {
         ["BulkDocs", "Counters", "Documents", "Hilo", "Index", "MultiGet", "None", "Operations", "Queries", "Streams", "Subscriptions"];
     private filteredTypeData = this.allTypeData.map(x => new typeData(x));
     private selectedTypeNames = ko.observableArray<string>(this.allTypeData.splice(0));
+    onlyErrors = ko.observable<boolean>(false);
 
     stats = {
         count: ko.observable<string>(),
@@ -61,6 +62,7 @@ class trafficWatch extends viewModelBase {
         this.updateStats();
 
         this.filter.throttle(500).subscribe(() => this.refresh());
+        this.onlyErrors.subscribe(() => this.refresh());
         this.selectedTypeNames.subscribe(() => this.refresh());
     }
     
@@ -108,10 +110,12 @@ class trafficWatch extends viewModelBase {
         const textFilter = this.filter();
         const uri = item.RequestUri.toLocaleLowerCase();
         
+        
         const textFilterMatch = !textFilter || uri.includes(textFilter.toLocaleLowerCase()); 
         const typeMatch = _.includes(this.selectedTypeNames(), item.Type);
+        const statusMatch = !this.onlyErrors() || item.ResponseStatusCode >= 400;
         
-        return textFilterMatch && typeMatch;
+        return textFilterMatch && typeMatch && statusMatch;
     }
 
     private updateStats() {
@@ -160,30 +164,51 @@ class trafficWatch extends viewModelBase {
 
         $('.traffic-watch [data-toggle="tooltip"]').tooltip();
 
-        const rowHighlightRules = {
-            extraClass: (item: Raven.Client.Documents.Changes.TrafficWatchChange) => {
-                const responseCode = item.ResponseStatusCode.toString();
-                if (responseCode.startsWith("4")) {
-                    return "bg-warning";
-                } else if (responseCode.startsWith("5")) {
-                    return "bg-danger";
-                }
-                return "";
+        const rowHighlightRules = (item: Raven.Client.Documents.Changes.TrafficWatchChange) => {
+            const responseCode = item.ResponseStatusCode.toString();
+            if (responseCode.startsWith("4")) {
+                return "bg-warning";
+            } else if (responseCode.startsWith("5")) {
+                return "bg-danger";
             }
+            return "";
         };
         
         const grid = this.gridController();
         grid.headerVisible(true);
         grid.init((s, t) => this.fetchTraffic(s, t), () =>
             [
-                new textColumn<Raven.Client.Documents.Changes.TrafficWatchChange>(grid, x => generalUtils.formatUtcDateAsLocal(x.TimeStamp), "Timestamp", "20%", rowHighlightRules),
-                new textColumn<Raven.Client.Documents.Changes.TrafficWatchChange>(grid, x => x.ResponseStatusCode, "Status", "8%", rowHighlightRules),
-                new textColumn<Raven.Client.Documents.Changes.TrafficWatchChange>(grid, x => x.DatabaseName, "Database Name", "8%", rowHighlightRules),
-                new textColumn<Raven.Client.Documents.Changes.TrafficWatchChange>(grid, x => x.ElapsedMilliseconds, "Duration", "8%", rowHighlightRules),
-                new textColumn<Raven.Client.Documents.Changes.TrafficWatchChange>(grid, x => x.HttpMethod, "Method", "6%", rowHighlightRules),
-                new textColumn<Raven.Client.Documents.Changes.TrafficWatchChange>(grid, x => x.Type, "Type", "6%", rowHighlightRules),
-                new textColumn<Raven.Client.Documents.Changes.TrafficWatchChange>(grid, x => x.CustomInfo, "CustomInfo", "8%", rowHighlightRules),
-                new textColumn<Raven.Client.Documents.Changes.TrafficWatchChange>(grid, x => x.RequestUri, "URI", "35%", rowHighlightRules)
+                new textColumn<Raven.Client.Documents.Changes.TrafficWatchChange>(grid, x => generalUtils.formatUtcDateAsLocal(x.TimeStamp), "Timestamp", "20%", {
+                    extraClass: rowHighlightRules,
+                    sortable: "string"
+                }),
+                new textColumn<Raven.Client.Documents.Changes.TrafficWatchChange>(grid, x => x.ResponseStatusCode, "Status", "8%", {
+                    extraClass: rowHighlightRules,
+                    sortable: "number"
+                }),
+                new textColumn<Raven.Client.Documents.Changes.TrafficWatchChange>(grid, x => x.DatabaseName, "Database Name", "8%", {
+                    extraClass: rowHighlightRules,
+                    sortable: "string"
+                }),
+                new textColumn<Raven.Client.Documents.Changes.TrafficWatchChange>(grid, x => x.ElapsedMilliseconds, "Duration", "8%", {
+                    extraClass: rowHighlightRules,
+                    sortable: "number"
+                }),
+                new textColumn<Raven.Client.Documents.Changes.TrafficWatchChange>(grid, x => x.HttpMethod, "Method", "6%", {
+                    extraClass: rowHighlightRules,
+                    sortable: "string"
+                }),
+                new textColumn<Raven.Client.Documents.Changes.TrafficWatchChange>(grid, x => x.Type, "Type", "6%", {
+                    extraClass: rowHighlightRules,
+                    sortable: "string"
+                }),
+                new textColumn<Raven.Client.Documents.Changes.TrafficWatchChange>(grid, x => x.CustomInfo, "Custom Info", "8%", {
+                    extraClass: rowHighlightRules
+                }),
+                new textColumn<Raven.Client.Documents.Changes.TrafficWatchChange>(grid, x => x.RequestUri, "URI", "35%", {
+                    extraClass: rowHighlightRules,
+                    sortable: "string"
+                })
             ]
         );
 
@@ -194,7 +219,7 @@ class trafficWatch extends viewModelBase {
                 onValue(item.RequestUri);
             } else if (column.header === "Timestamp") {
                 onValue(moment.utc(item.TimeStamp), item.TimeStamp); 
-            } else if (column.header === "CustomInfo") {
+            } else if (column.header === "Custom Info") {
                 onValue(item.CustomInfo);
             }
         });
@@ -212,8 +237,9 @@ class trafficWatch extends viewModelBase {
     private fetchTraffic(skip: number, take: number): JQueryPromise<pagedResult<Raven.Client.Documents.Changes.TrafficWatchChange>> {
         const textFilterDefined = this.filter();
         const filterUsingType = this.selectedTypeNames().length !== this.filteredTypeData.length;
+        const filterUsingStatus = this.onlyErrors();
         
-        if (textFilterDefined || filterUsingType) {
+        if (textFilterDefined || filterUsingType || filterUsingStatus) {
             this.filteredData = this.allData.filter(item => this.matchesFilters(item));
         } else {
             this.filteredData = this.allData;

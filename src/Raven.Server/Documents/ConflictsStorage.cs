@@ -215,7 +215,7 @@ namespace Raven.Server.Documents
             {
                 //otherwise this is a tombstone conflict and should be treated as such
                 result.Doc = new BlittableJsonReaderObject(read, size, context);
-                DebugDisposeReaderAfterTransaction(context.Transaction, result.Doc);
+                Transaction.DebugDisposeReaderAfterTransaction(context.Transaction.InnerTransaction, result.Doc);
             }
 
             return result;
@@ -331,13 +331,16 @@ namespace Raven.Server.Documents
                     var collection = _documentsStorage.ExtractCollectionName(context, conflicted.Collection);
 
                     if (conflicted.Doc != null)
-                    { 
+                    {
+                        if (conflicted.Flags.Contain(DocumentFlags.HasCounters))
+                            nonPersistentFlags |= NonPersistentDocumentFlags.ResolveCountersConflict;
+
                         _documentsStorage.RevisionsStorage.Put(
-                            context, conflicted.Id, conflicted.Doc, conflicted.Flags | DocumentFlags.Conflicted, nonPersistentFlags, conflicted.ChangeVector,
+                            context, conflicted.Id, conflicted.Doc, conflicted.Flags | DocumentFlags.Conflicted | DocumentFlags.HasRevisions, nonPersistentFlags, conflicted.ChangeVector,
                             conflicted.LastModified.Ticks,
                             collectionName: collection, configuration: RevisionsStorage.ConflictConfiguration.Default);
                     }
-                    else if(conflicted.Flags.Contain(DocumentFlags.FromReplication) == false)
+                    else if (conflicted.Flags.Contain(DocumentFlags.FromReplication) == false)
                     {
                         using (Slice.External(context.Allocator, conflicted.LowerId, out var key))
                         {
@@ -354,8 +357,10 @@ namespace Raven.Server.Documents
                     if (string.IsNullOrEmpty(deleteAttachmentChangeVector))
                     {
                         var newEtag = _documentsStorage.GenerateNextEtag();
-                        deleteAttachmentChangeVector = _documentsStorage.GetNewChangeVector(context, newEtag);
-                        context.LastDatabaseChangeVector = conflicted.ChangeVector;
+                        var currentChangeVector = context.LastDatabaseChangeVector ?? GetDatabaseChangeVector(context);
+                        deleteAttachmentChangeVector = ChangeVectorUtils
+                            .TryUpdateChangeVector(_documentDatabase.ServerStore.NodeTag, _documentDatabase.DbBase64Id, newEtag, currentChangeVector).ChangeVector;
+                        context.LastDatabaseChangeVector = deleteAttachmentChangeVector;
                     }
                     nonPersistentFlags |= DeleteAttachmentConflicts(context, lowerId, document, conflictDocument, deleteAttachmentChangeVector);
                 });
@@ -366,16 +371,16 @@ namespace Raven.Server.Documents
             // will not detect a conflict. It is an optimization only that
             // we have to do, so we'll handle it.
 
-            // Only register the event if we actually deleted any conflicts
             var listCount = changeVectors.Count;
-            if (listCount > 0)
+            if (listCount == 0) // there were no conflicts for this document
+                return (changeVectors, nonPersistentFlags);
+            
+            // Only register the event if we actually deleted any conflicts
+            var tx = context.Transaction.InnerTransaction.LowLevelTransaction;
+            tx.AfterCommitWhenNewReadTransactionsPrevented += () =>
             {
-                var tx = context.Transaction.InnerTransaction.LowLevelTransaction;
-                tx.AfterCommitWhenNewReadTransactionsPrevented += () =>
-                {
-                    Interlocked.Add(ref ConflictsCount, -listCount);
-                };
-            }
+                Interlocked.Add(ref ConflictsCount, -listCount);
+            };
             return (changeVectors, nonPersistentFlags | NonPersistentDocumentFlags.Resolved);
         }
 
@@ -433,7 +438,7 @@ namespace Raven.Server.Documents
                     {
                         var dataPtr = tvr.Result.Reader.Read((int)ConflictsTable.Data, out int size);
                         var doc = size == 0 ? null : new BlittableJsonReaderObject(dataPtr, size, context);
-                        DebugDisposeReaderAfterTransaction(context.Transaction, doc);
+                        Transaction.DebugDisposeReaderAfterTransaction(context.Transaction.InnerTransaction, doc);
                         return new DocumentConflict
                         {
                             ChangeVector = currentChangeVector,
@@ -521,8 +526,8 @@ namespace Raven.Server.Documents
                 "Get conflict information and try resolving again.");
         }
 
-        public (string ChangeVector, NonPersistentDocumentFlags NonPersistentFlags) MergeConflictChangeVectorIfNeededAndDeleteConflicts(
-            string documentChangeVector, DocumentsOperationContext context, string id, long newEtag, BlittableJsonReaderObject document)
+        public (string ChangeVector, NonPersistentDocumentFlags NonPersistentFlags) MergeConflictChangeVectorIfNeededAndDeleteConflicts(string documentChangeVector,
+            DocumentsOperationContext context, string id, long newEtag, BlittableJsonReaderObject document)
         {
             var result = DeleteConflictsFor(context, id, document);
             if (result.ChangeVectors == null ||
@@ -531,25 +536,16 @@ namespace Raven.Server.Documents
                 return (documentChangeVector, result.NonPersistentFlags);
             }
 
-            string mergedChangeVectorEntries = null;
-            var firstTime = true;
-            foreach (var changeVector in result.ChangeVectors)
+            var changeVectorList = new List<string>
             {
-                if (firstTime)
-                {
-                    mergedChangeVectorEntries = changeVector;
-                    firstTime = false;
-                    continue;
-                }
-                mergedChangeVectorEntries = ChangeVectorUtils.MergeVectors(mergedChangeVectorEntries, changeVector);
-            }
-            if (string.IsNullOrEmpty(documentChangeVector) == false)
-                mergedChangeVectorEntries = ChangeVectorUtils.MergeVectors(mergedChangeVectorEntries, documentChangeVector);
-            var newChangeVector =
-                ChangeVectorUtils.NewChangeVector(_documentDatabase.ServerStore.NodeTag, newEtag, _documentDatabase.DbBase64Id);
-            mergedChangeVectorEntries = ChangeVectorUtils.MergeVectors(mergedChangeVectorEntries, newChangeVector);
+                documentChangeVector,
+                context.LastDatabaseChangeVector ?? GetDatabaseChangeVector(context),
+                ChangeVectorUtils.NewChangeVector(_documentDatabase, newEtag)
+            };
+            changeVectorList.AddRange(result.ChangeVectors);
+            var merged = ChangeVectorUtils.MergeVectors(changeVectorList);
 
-            return (mergedChangeVectorEntries, result.NonPersistentFlags);
+            return (merged, result.NonPersistentFlags);
         }
 
         public void AddConflict(
@@ -568,7 +564,7 @@ namespace Raven.Server.Documents
             var tx = context.Transaction.InnerTransaction;
             var conflictsTable = tx.OpenTable(ConflictsSchema, ConflictsSlice);
 
-            var fromSmuggler = (nonPersistentFlags & NonPersistentDocumentFlags.FromSmuggler) == NonPersistentDocumentFlags.FromSmuggler;
+            var fromSmuggler = nonPersistentFlags.Contain(NonPersistentDocumentFlags.FromSmuggler);
 
             using (DocumentIdWorker.GetLowerIdSliceAndStorageKey(context, id, out Slice lowerId, out Slice idPtr))
             {
@@ -579,11 +575,12 @@ namespace Raven.Server.Documents
                 if (existing.Document != null)
                 {
                     var existingDoc = existing.Document;
+                    collectionName = _documentsStorage.ExtractCollectionName(context, existingDoc.Data);
 
                     if (fromSmuggler == false)
                     {
                         using (Slice.From(context.Allocator, existingDoc.ChangeVector, out Slice cv))
-                        using (DocumentIdWorker.GetStringPreserveCase(context, CollectionName.GetLazyCollectionNameFrom(context, existingDoc.Data), out Slice collectionSlice))
+                        using (DocumentIdWorker.GetStringPreserveCase(context, collectionName.Name, out Slice collectionSlice))
                         using (conflictsTable.Allocate(out TableValueBuilder tvb))
                         {
                             tvb.Add(lowerId);
@@ -603,8 +600,6 @@ namespace Raven.Server.Documents
                     // we delete the data directly, without generating a tombstone, because we have a 
                     // conflict instead
                     _documentsStorage.EnsureLastEtagIsPersisted(context, existingDoc.Etag);
-
-                    collectionName = _documentsStorage.ExtractCollectionName(context, existingDoc.Data);
 
                     //make sure that the relevant collection tree exists
                     var table = tx.OpenTable(DocsSchema, collectionName.GetTableName(CollectionTableType.Documents));
@@ -650,6 +645,9 @@ namespace Raven.Server.Documents
                     using (GetConflictsIdPrefix(context, lowerId, out Slice prefixSlice))
                     {
                         var conflicts = GetConflictsFor(context, prefixSlice);
+
+                        ThrowIfNoConflictsWereFound(fromSmuggler, conflicts.Count, id);
+
                         foreach (var conflict in conflicts)
                         {
                             var conflictStatus = ChangeVectorUtils.GetConflictStatus(incomingChangeVector, conflict.ChangeVector);
@@ -664,7 +662,7 @@ namespace Raven.Server.Documents
                                     {
                                         return; // we already have a conflict with equal content, no need to create another one
                                     }
-                                    break; // we'll add this conflict if no one else also includes it
+                                    continue; // we'll add this conflict if no one else also includes it
                                 case ConflictStatus.AlreadyMerged:
                                     return; // we already have a conflict that includes this version
                                 default:
@@ -675,12 +673,6 @@ namespace Raven.Server.Documents
                 }
 
                 var etag = _documentsStorage.GenerateNextEtag();
-                if (context.LastDatabaseChangeVector == null)
-                    context.LastDatabaseChangeVector = GetDatabaseChangeVector(context);
-                
-                var result = ChangeVectorUtils.TryUpdateChangeVector(_documentDatabase.ServerStore.NodeTag, _documentDatabase.DbBase64Id, etag, context.LastDatabaseChangeVector);
-                if (result.IsValid)
-                    context.LastDatabaseChangeVector = result.ChangeVector;
 
                 byte* doc = null;
                 var docSize = 0;
@@ -689,7 +681,7 @@ namespace Raven.Server.Documents
                 {
                     doc = incomingDoc.BasePointer;
                     docSize = incomingDoc.Size;
-                    collection = CollectionName.GetLazyCollectionNameFrom(context, incomingDoc);
+                    collection = _documentsStorage.ExtractCollectionName(context, incomingDoc).Name;
                 }
                 else
                 {
@@ -721,6 +713,13 @@ namespace Raven.Server.Documents
                     Type = DocumentChangeTypes.Conflict,
                 });
             }
+        }
+
+        [Conditional("DEBUG")]
+        private static void ThrowIfNoConflictsWereFound(bool fromSmuggler, int conflictsCount, string id)
+        {
+            if (fromSmuggler == false && conflictsCount == 0)
+                throw new InvalidOperationException($"No existing conflict or document was found for '{id}'.");
         }
 
         public DeleteOperationResult? DeleteConflicts(DocumentsOperationContext context, Slice lowerId,
@@ -784,7 +783,8 @@ namespace Raven.Server.Documents
                     context.GetLazyString(mergedChangeVector),
                     latestConflict.LastModified.Ticks,
                     changeVector,
-                    latestConflict.Flags).Etag;
+                    latestConflict.Flags, 
+                    NonPersistentDocumentFlags.None).Etag;
             }
 
             return collectionName;
@@ -818,30 +818,30 @@ namespace Raven.Server.Documents
             return indexOfLargestEtag;
         }
 
-        public static ConflictStatus GetConflictStatusForDocument(DocumentsOperationContext context, IncomingReplicationHandler.ReplicationItem remote, out string conflictingVector, out bool hasLocalClusterTx)
+        public static ConflictStatus GetConflictStatusForDocument(DocumentsOperationContext context, string id, string changeVector, out string conflictingVector, out bool hasLocalClusterTx)
         {
             hasLocalClusterTx = false;
             conflictingVector = null;
 
             //tombstones also can be a conflict entry
-            var conflicts = context.DocumentDatabase.DocumentsStorage.ConflictsStorage.GetConflictsFor(context, remote.Id);
+            var conflicts = context.DocumentDatabase.DocumentsStorage.ConflictsStorage.GetConflictsFor(context, id);
             ConflictStatus status;
             if (conflicts.Count > 0)
             {
                 foreach (var existingConflict in conflicts)
                 {
-                    status = ChangeVectorUtils.GetConflictStatus(remote.ChangeVector, existingConflict.ChangeVector);
+                    status = ChangeVectorUtils.GetConflictStatus(changeVector, existingConflict.ChangeVector);
                     if (status == ConflictStatus.Conflict)
                     {
                         conflictingVector = existingConflict.ChangeVector;
-                        return status;
+                        return ConflictStatus.Conflict;
                     }
                 }
                 // this document will resolve the conflicts when putted
                 return ConflictStatus.Update;
             }
 
-            var result = context.DocumentDatabase.DocumentsStorage.GetDocumentOrTombstone(context, remote.Id);
+            var result = context.DocumentDatabase.DocumentsStorage.GetDocumentOrTombstone(context, id);
             string local;
 
             if (result.Document != null)
@@ -857,7 +857,7 @@ namespace Raven.Server.Documents
             else
                 return ConflictStatus.Update; //document with 'id' doesn't exist locally, so just do PUT
            
-            status = ChangeVectorUtils.GetConflictStatus(remote.ChangeVector, local);
+            status = ChangeVectorUtils.GetConflictStatus(changeVector, local);
             if (status == ConflictStatus.Conflict)
             {
                 conflictingVector = local;
@@ -879,6 +879,28 @@ namespace Raven.Server.Documents
         {
             var table = new Table(ConflictsSchema, context.Transaction.InnerTransaction);
             return table.GetNumberOfEntriesFor(ConflictsSchema.FixedSizeIndexes[AllConflictedDocsEtagsSlice]);
+        }
+
+        public string GetCollection(DocumentsOperationContext context, string id)
+        {
+            LazyStringValue collection = null;
+            using (DocumentIdWorker.GetSliceFromId(context, id, out Slice lowerId))
+            using (GetConflictsIdPrefix(context, lowerId, out Slice prefixSlice))
+            {
+                foreach (var conflict in GetConflictsFor(context, prefixSlice))
+                {
+                    if (collection == null)
+                        collection = conflict.Collection;
+
+                    if (conflict.Collection.Equals(collection) == false)
+                        throw new NotSupportedException($"Two different collections were found: '{collection}' and '{conflict.Collection}'");
+                }
+
+                if (collection == null)
+                    throw new NotSupportedException($"Collection not found.");
+            }
+
+            return collection;
         }
     }
 }

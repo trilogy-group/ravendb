@@ -1,8 +1,8 @@
 ﻿using System;
 using System.IO;
 using FastTests.Voron;
-using Sparrow;
 using Sparrow.Utils;
+using Tests.Infrastructure;
 using Voron;
 using Voron.Exceptions;
 using Voron.Global;
@@ -95,7 +95,7 @@ namespace SlowTests.Voron
             Assert.Equal(currentJournalInfo.CurrentJournal, Env.Journal.GetCurrentJournalInfo().CurrentJournal);
         }
 
-        [Fact]
+        [Fact64Bit]
         public void CanResetLogInfoAfterBigUncommitedTransaction2()
         {
             using (var tx = Env.WriteTransaction())
@@ -213,7 +213,7 @@ namespace SlowTests.Voron
 
             CorruptJournal(lastJournal - 3, lastJournalPosition + 1);
 
-            Assert.Throws<InvalidDataException>(() => StartDatabase());
+            Assert.Throws<InvalidJournalException>(() => StartDatabase());
         }
 
         [Fact]
@@ -306,7 +306,7 @@ namespace SlowTests.Voron
                 CorruptJournal(middleJournal, pos);
             }
 
-            Assert.Throws<InvalidDataException>(() => StartDatabase());
+            Assert.Throws<InvalidJournalException>(() => StartDatabase());
         }
 
         private void CorruptJournal(long journal, long posOf4KbInJrnl)

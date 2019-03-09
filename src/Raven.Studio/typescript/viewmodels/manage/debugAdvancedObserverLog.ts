@@ -1,7 +1,6 @@
 import viewModelBase = require("viewmodels/viewModelBase");
 
 import virtualGridController = require("widgets/virtualGrid/virtualGridController");
-import columnsSelector = require("viewmodels/partial/columnsSelector");
 import textColumn = require("widgets/virtualGrid/columns/textColumn");
 import columnPreviewPlugin = require("widgets/virtualGrid/columnPreviewPlugin");
 import generalUtils = require("common/generalUtils");
@@ -23,7 +22,6 @@ class clusterObserverLog extends viewModelBase {
     noLeader = ko.observable<boolean>(false);
 
     private gridController = ko.observable<virtualGridController<Raven.Server.ServerWide.Maintenance.ClusterObserverLogEntry>>();
-    columnsSelector = new columnsSelector<Raven.Server.ServerWide.Maintenance.ClusterObserverLogEntry>();
     private columnPreview = new columnPreviewPlugin<Raven.Server.ServerWide.Maintenance.ClusterObserverLogEntry>();
 
     termChanged: KnockoutComputed<boolean>;
@@ -74,8 +72,12 @@ class clusterObserverLog extends viewModelBase {
         grid.headerVisible(true);
         grid.init(fetcher, () =>
             [
-                new textColumn<Raven.Server.ServerWide.Maintenance.ClusterObserverLogEntry>(grid, x => generalUtils.formatUtcDateAsLocal(x.Date), "Date", "20%"),
-                new textColumn<Raven.Server.ServerWide.Maintenance.ClusterObserverLogEntry>(grid, x => x.Database, "Database", "20%"),
+                new textColumn<Raven.Server.ServerWide.Maintenance.ClusterObserverLogEntry>(grid, x => generalUtils.formatUtcDateAsLocal(x.Date), "Date", "20%", {
+                    sortable: x => x.Date
+                }),
+                new textColumn<Raven.Server.ServerWide.Maintenance.ClusterObserverLogEntry>(grid, x => x.Database, "Database", "20%", {
+                    sortable: "string"
+                }),
                 new textColumn<Raven.Server.ServerWide.Maintenance.ClusterObserverLogEntry>(grid, x => x.Message, "Message", "60%")
             ]
         );
@@ -103,7 +105,7 @@ class clusterObserverLog extends viewModelBase {
         }
         
         if (this.gridController()) {
-            this.gridController().reset();    
+            this.gridController().reset(true, true);    
         }
     }
 
@@ -111,7 +113,7 @@ class clusterObserverLog extends viewModelBase {
         const loadTask = $.Deferred<void>();
         
         new getClusterObserverDecisionsCommand()
-            .execute()
+            .execute() 
             .done(response => {
                 response.ObserverLog.reverse();
                 this.decisions(response);
@@ -155,7 +157,9 @@ class clusterObserverLog extends viewModelBase {
     }
 
     suspendObserver() {
-        this.confirmationMessage("Are you sure?", "Do you want to suspend cluster observer?", ["No", "Yes, suspend"])
+        this.confirmationMessage("Are you sure?", "Do you want to suspend cluster observer?", {
+            buttons: ["No", "Yes, suspend"]
+        })
             .done(result => {
                 if (result.can) {
                     eventsCollector.default.reportEvent("observer-log", "suspend");
@@ -171,7 +175,9 @@ class clusterObserverLog extends viewModelBase {
     }
 
     resumeObserver() {
-        this.confirmationMessage("Are you sure?", "Do you want to resume cluster observer?", ["No", "Yes, resume"])
+        this.confirmationMessage("Are you sure?", "Do you want to resume cluster observer?", {
+            buttons: ["No", "Yes, resume"]
+        })
             .done(result => {
                 if (result.can) {
                     eventsCollector.default.reportEvent("observer-log", "resume");

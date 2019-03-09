@@ -26,6 +26,7 @@ import changeSubscription = require("common/changeSubscription");
 import databasesManager = require("common/shell/databasesManager");
 import generalUtils = require("common/generalUtils");
 import popoverUtils = require("common/popoverUtils");
+import database = require("models/resources/database");
 import eventsCollector = require("common/eventsCollector");
 
 class databases extends viewModelBase {
@@ -54,6 +55,9 @@ class databases extends viewModelBase {
 
     accessManager = accessManager.default.databasesView;
     isAboveUserAccess = accessManager.default.operatorAndAbove;
+
+    environmentClass = (source: KnockoutObservable<Raven.Client.Documents.Operations.Configuration.StudioConfiguration.StudioEnvironment>) => 
+        database.createEnvironmentColorComputed("label", source);
    
     constructor() {
         super();
@@ -490,7 +494,10 @@ class databases extends viewModelBase {
     compactDatabase(db: databaseInfo) {
         eventsCollector.default.reportEvent("databases", "compact");
         
-        this.confirmationMessage("Are you sure?", "Do you want to compact '" + db.name + "'?", ["No", "Yes, compact"])
+        this.confirmationMessage("Are you sure?", `Do you want to compact '${generalUtils.escapeHtml(db.name)}'?`, {
+            buttons: ["No", "Yes, compact"],
+            html: true
+        })
             .done(result => {
                 if (result.can) {
                     

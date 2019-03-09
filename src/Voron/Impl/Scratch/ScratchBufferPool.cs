@@ -5,8 +5,10 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.CompilerServices;
+using System.Threading;
 using Sparrow.LowMemory;
 using Sparrow.Threading;
+using Voron.Exceptions;
 using Voron.Global;
 using Voron.Impl.Paging;
 
@@ -45,6 +47,8 @@ namespace Voron.Impl.Scratch
         private readonly long _lowMemoryIntervalTicks = TimeSpan.FromMinutes(3).Ticks;
         private readonly MultipleUseFlag _lowMemoryFlag = new MultipleUseFlag();
 
+        private readonly ScratchSpaceUsageMonitor _scratchSpaceMonitor; // it tracks total size of all scratches (active and recycled)
+
         public ScratchBufferPool(StorageEnvironment env)
         {
             _disposeOnceRunner = new DisposeOnce<ExceptionRetry>(() =>
@@ -60,13 +64,30 @@ namespace Voron.Impl.Scratch
                 foreach (var scratch in _scratchBuffers)
                 {
                     scratch.Value.File.Dispose();
+                    _scratchSpaceMonitor.Decrease(scratch.Value.File.NumberOfAllocatedPages * Constants.Storage.PageSize);
                 }
 
                 _scratchBuffers.Clear();
+
+                while (_recycleArea.First != null)
+                {
+                    var recycledScratch = _recycleArea.First.Value;
+
+                    if (recycledScratch.File.IsDisposed == false)
+                    {
+                        recycledScratch.File.Dispose();
+                        _scratchSpaceMonitor.Decrease(recycledScratch.File.NumberOfAllocatedPages * Constants.Storage.PageSize);
+                    }
+
+                    _recycleArea.RemoveFirst();
+                }
+
+                _current = null;
             });
 
             _env = env;
             _options = env.Options;
+            _scratchSpaceMonitor = env.Options.ScratchSpaceUsage;
             _current = NextFile(_options.InitialLogFileSize, null);
             UpdateCacheForPagerStatesOfAllScratches();
 
@@ -131,6 +152,8 @@ namespace Voron.Impl.Scratch
                     _recycleArea.Remove(current);
                     AddScratchBufferFile(recycled);
 
+                    _scratchSpaceMonitor.Increase(recycled.File.NumberOfAllocatedPages * Constants.Storage.PageSize);
+
                     return recycled;
                 }
 
@@ -165,6 +188,8 @@ namespace Voron.Impl.Scratch
 
             AddScratchBufferFile(item);
 
+            _scratchSpaceMonitor.Increase(item.File.NumberOfAllocatedPages * Constants.Storage.PageSize);
+
             return item;
         }
         public PagerState GetPagerState(int scratchNumber)
@@ -191,7 +216,16 @@ namespace Voron.Impl.Scratch
                 return current.File.Allocate(tx, numberOfPages, size);
 
             if (current.File.Size < _options.MaxScratchBufferSize)
-                return current.File.Allocate(tx, numberOfPages, size);
+            {
+                var numberOfPagesBeforeAllocate = current.File.NumberOfAllocatedPages;
+
+                var page = current.File.Allocate(tx, numberOfPages, size);
+
+                if (current.File.NumberOfAllocatedPages > numberOfPagesBeforeAllocate)
+                    _scratchSpaceMonitor.Increase((current.File.NumberOfAllocatedPages - numberOfPagesBeforeAllocate) * Constants.Storage.PageSize);
+
+                return page;
+            }
 
             var minSize = numberOfPages * Constants.Storage.PageSize;
             var requestedSize = Math.Max(minSize, Math.Min(_current.File.Size * 2, _options.MaxScratchBufferSize));
@@ -239,6 +273,7 @@ namespace Voron.Impl.Scratch
 
                 _scratchBuffers.TryRemove(recycledScratch.Number, out var _);
                 recycledScratch.File.Dispose();
+                _scratchSpaceMonitor.Decrease(recycledScratch.File.NumberOfAllocatedPages * Constants.Storage.PageSize);
             }
 
             if (scratch == _current)
@@ -329,7 +364,7 @@ namespace Voron.Impl.Scratch
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public byte* AcquirePagePointerWithOverflowHandling(LowLevelTransaction tx, int scratchNumber, long p)
+        public byte* AcquirePagePointerWithOverflowHandling(IPagerLevelTransactionState tx, int scratchNumber, long p)
         {
             var item = GetScratchBufferFile(scratchNumber);
 
@@ -371,7 +406,11 @@ namespace Voron.Impl.Scratch
                     ThrowUnableToRemoveScratch(scratchBufferItem);
 
                 if (_recycleArea.Contains(scratchBufferItem) == false)
+                {
                     scratchBufferItem.File.Dispose();
+
+                    _scratchSpaceMonitor.Decrease(scratchBufferItem.File.NumberOfAllocatedPages * Constants.Storage.PageSize);
+                }
             }
         }
 
@@ -408,7 +447,17 @@ namespace Voron.Impl.Scratch
                 txIdAllowingToReleaseOldScratches = Math.Max(txIdAllowingToReleaseOldScratches,
                     scratchBufferItem.Value.File.TxIdAfterWhichLatestFreePagesBecomeAvailable);
             }
-            
+
+            ByteStringContext byteStringContext;
+            try
+            {
+                byteStringContext = new ByteStringContext(SharedMultipleUseFlag.None);
+            }
+            catch (Exception e) when (e is OutOfMemoryException || e is EarlyOutOfMemoryException)
+            {
+                return;
+            }
+
             while (_env.CurrentReadTransactionId <= txIdAllowingToReleaseOldScratches)
             {
                 // we've just flushed and had no more writes after that, let us bump id of next read transactions to ensure
@@ -417,7 +466,7 @@ namespace Voron.Impl.Scratch
                 try
                 {
                     using (var tx = _env.NewLowLevelTransaction(new TransactionPersistentContext(),
-                            TransactionFlags.ReadWrite, timeout: TimeSpan.FromMilliseconds(500)))
+                        TransactionFlags.ReadWrite, timeout: TimeSpan.FromMilliseconds(500), context: byteStringContext))
                     {
                         tx.ModifyPage(0);
                         tx.Commit();
@@ -427,26 +476,50 @@ namespace Voron.Impl.Scratch
                 {
                     break;
                 }
+                catch (DiskFullException)
+                {
+                    break;
+                }
             }
 
             // we need to ensure that no access to _recycleArea and _scratchBuffers will take place in the same time
             // and only methods that access this are used within write transaction
-            using (_env.WriteTransaction())
+            try
             {
-                RemoveInactiveScratches(_current);
-
-                if (_recycleArea.Count == 0)
-                    return;
-
-                while (_recycleArea.First != null)
+                using (_env.WriteTransaction(context: byteStringContext))
                 {
-                    var recycledScratch = _recycleArea.First.Value;
+                    RemoveInactiveScratches(_current);
 
-                    ScratchBufferItem _;
+                    RemoveInactiveRecycledScratches();
+                }
+            }
+            catch (TimeoutException)
+            {
+                
+            }
+        }
+
+        private void RemoveInactiveRecycledScratches()
+        {
+            if (_recycleArea.Count == 0)
+                return;
+
+            var scratchNode = _recycleArea.First;
+            while (scratchNode != null)
+            {
+                var next = scratchNode.Next;
+
+                var recycledScratch = scratchNode.Value;
+                if (recycledScratch.File.HasActivelyUsedBytes(_env.PossibleOldestReadTransaction(null)) == false)
+                {
                     _scratchBuffers.TryRemove(recycledScratch.Number, out _);
                     recycledScratch.File.Dispose();
-                    _recycleArea.RemoveFirst();
+                    _scratchSpaceMonitor.Decrease(recycledScratch.File.NumberOfAllocatedPages * Constants.Storage.PageSize);
+
+                    _recycleArea.Remove(scratchNode);
                 }
+
+                scratchNode = next;
             }
         }
 

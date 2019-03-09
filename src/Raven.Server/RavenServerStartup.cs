@@ -22,8 +22,11 @@ using Raven.Client.Exceptions.Routing;
 using Raven.Client.Exceptions.Security;
 using Raven.Client.Properties;
 using Raven.Server.Config;
+using Raven.Server.Rachis;
 using Raven.Server.Routing;
+using Raven.Server.ServerWide;
 using Raven.Server.TrafficWatch;
+using Raven.Server.Utils;
 using Raven.Server.Web;
 using Sparrow.Json;
 using Sparrow.Json.Parsing;
@@ -151,44 +154,44 @@ namespace Raven.Server
 
         private async Task RequestHandler(HttpContext context)
         {
-            string database = null;
+            var requestHandlerContext = new RequestHandlerContext
+            {
+                HttpContext = context
+            };
+            Exception exception = null;
+            Stopwatch sp = null;
+
             try
             {
                 context.Response.StatusCode = (int)HttpStatusCode.OK;
                 context.Response.Headers["Content-Type"] = "application/json; charset=utf-8";
                 context.Response.Headers[Constants.Headers.ServerVersion] = RavenVersionAttribute.Instance.AssemblyVersion;
 
-                var sp = Stopwatch.StartNew();
+                if (_server.ServerStore.Initialized == false)
+                    await _server.ServerStore.InitializationCompleted.WaitAsync();
 
-                database = await _router.HandlePath(context, context.Request.Method, context.Request.Path.Value);
-
-                if (_logger.IsInfoEnabled && SkipHttpLogging == false)
-                {
-                    _logger.Info($"{context.Request.Method} {context.Request.Path.Value}?{context.Request.QueryString.Value} - {context.Response.StatusCode} - {sp.ElapsedMilliseconds:#,#;;0} ms");
-                }
-
-                // check if TW has clients
-                if (TrafficWatchManager.HasRegisteredClients)
-                    LogTrafficWatch(context, sp.ElapsedMilliseconds, database);
-
+                sp = Stopwatch.StartNew();
+                await _router.HandlePath(requestHandlerContext);
                 sp.Stop();
             }
             catch (Exception e)
             {
-                if (TrafficWatchManager.HasRegisteredClients)
-                    LogTrafficWatch(context, 0, database ?? "N/A");
-
-                if (context.RequestAborted.IsCancellationRequested)
-                    return;
+                sp?.Stop();
+                exception = e;
 
                 if (context.Request.Headers.TryGetValue(Constants.Headers.ClientVersion, out var versions))
                 {
                     var version = versions.ToString();
                     if (version.Length > 0 && version[0] != RavenVersionAttribute.Instance.MajorVersionAsChar)
-                        e = new ClientVersionMismatchException($"RavenDB does not support interaction between Client API and Server when major version does not match. Client: {version}. Server: {RavenVersionAttribute.Instance.AssemblyVersion}", e);
+                        e = new ClientVersionMismatchException(
+                            $"RavenDB does not support interaction between Client API and Server when major version does not match. Client: {version}. Server: {RavenVersionAttribute.Instance.AssemblyVersion}",
+                            e);
                 }
 
-                MaybeSetExceptionStatusCode(context, e);
+                MaybeSetExceptionStatusCode(context, _server.ServerStore, e);
+
+                if (context.RequestAborted.IsCancellationRequested)
+                    return;
 
                 using (_server.ServerStore.ContextPool.AllocateOperationContext(out JsonOperationContext ctx))
                 {
@@ -220,6 +223,20 @@ namespace Raven.Server
 
                 }
             }
+            finally
+            {
+                // check if TW has clients
+                if (TrafficWatchManager.HasRegisteredClients)
+                {
+                    var database = requestHandlerContext.Database?.Name;
+                    LogTrafficWatch(context, sp?.ElapsedMilliseconds ?? 0, database);
+                }
+
+                if (_logger.IsInfoEnabled && SkipHttpLogging == false)
+                {
+                    _logger.Info($"{context.Request.Method} {context.Request.Path.Value}{context.Request.QueryString.Value} - {context.Response.StatusCode} - {(sp?.ElapsedMilliseconds ?? 0):#,#;;0} ms", exception);
+                }
+            }
         }
 
         /// <summary>
@@ -246,9 +263,7 @@ namespace Raven.Server
                 AbsoluteUri = $"{context.Request.Scheme}://{context.Request.Host}",
                 DatabaseName = database ?? "N/A",
                 CustomInfo = twTuple.CustomInfo,
-                Type = twTuple.Type,
-                InnerRequestsCount = 0,
-                QueryTimings = null
+                Type = twTuple.Type
             };
 
             TrafficWatchManager.DispatchMessage(twn);
@@ -270,7 +285,7 @@ namespace Raven.Server
             }
         }
 
-        private static void MaybeSetExceptionStatusCode(HttpContext httpContext, Exception exception)
+        private static void MaybeSetExceptionStatusCode(HttpContext httpContext, ServerStore serverStore, Exception exception)
         {
             var response = httpContext.Response;
 
@@ -279,14 +294,15 @@ namespace Raven.Server
 
             if (exception is InsufficientTransportLayerProtectionException)
             {
-                Web.RequestHandler.SetupCORSHeaders(httpContext);
+                Web.RequestHandler.SetupCORSHeaders(httpContext, serverStore);
                 response.StatusCode = (int)HttpStatusCode.BadRequest;
                 return;
             }
 
             if (exception is LowMemoryException ||
                 exception is OutOfMemoryException ||
-                exception is VoronUnrecoverableErrorException)
+                exception is VoronUnrecoverableErrorException ||
+                exception is DiskFullException)
             {
                 response.StatusCode = (int)HttpStatusCode.ServiceUnavailable;
                 return;
@@ -294,7 +310,8 @@ namespace Raven.Server
 
             if (exception is DocumentConflictException ||
                 exception is ConflictException ||
-                exception is ConcurrencyException)
+                exception is ConcurrencyException ||
+                exception is RachisConcurrencyException)
             {
                 response.StatusCode = (int)HttpStatusCode.Conflict;
                 return;
@@ -305,7 +322,8 @@ namespace Raven.Server
                 exception is DatabaseLoadTimeoutException ||
                 exception is DatabaseConcurrentLoadTimeoutException ||
                 exception is NodeIsPassiveException ||
-                exception is ClientVersionMismatchException)
+                exception is ClientVersionMismatchException ||
+                exception is DatabaseSchemaErrorException)
             {
                 response.StatusCode = (int)HttpStatusCode.ServiceUnavailable;
                 return;

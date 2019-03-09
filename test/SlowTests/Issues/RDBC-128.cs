@@ -117,7 +117,7 @@ update {
                 using (var session = store.OpenSession())
                 {
                     var s = session.Query<Invoices_Search.Result, Invoices_Search>()
-                        .Customize(x=>x.WaitForNonStaleResults())
+                        .Customize(x => x.WaitForNonStaleResults())
                         .ToList();
                     Assert.Equal(500, s.Count);
                     foreach (var item in s)
@@ -171,11 +171,11 @@ update {
                         });
                     }
                 }
-                
+
                 GetDatabase(store.Database).Result.IndexStore.GetIndex(invoicesSearch.IndexName).SimulateLowMemory();
 
                 store.Maintenance.Send(new StartIndexingOperation());
-                
+
                 using (var session = store.OpenSession())
                 {
                     var s = session.Query<Invoices_Search.Result, Invoices_Search>()

@@ -3,7 +3,9 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.IO.Compression;
+using System.Linq;
 using System.Net;
+using System.Net.Http;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
@@ -14,6 +16,9 @@ using Microsoft.AspNetCore.Http.Features.Authentication;
 using Microsoft.AspNetCore.WebUtilities;
 using Microsoft.Extensions.Primitives;
 using Raven.Client;
+using Raven.Client.Exceptions;
+using Raven.Client.Exceptions.Cluster;
+using Raven.Client.Extensions;
 using Raven.Client.Http;
 using Raven.Client.ServerWide.Commands;
 using Raven.Client.ServerWide.Operations.Certificates;
@@ -140,6 +145,8 @@ namespace Raven.Server.Web
 
         protected async Task WaitForExecutionOnSpecificNode(TransactionOperationContext context, ClusterTopology clusterTopology, string node, long index)
         {
+            await ServerStore.Cluster.WaitForIndexNotification(index); // first let see if we commit this in the leader
+
             using (var requester = ClusterRequestExecutor.CreateForSingleNode(clusterTopology.GetUrlFromTag(node), ServerStore.Server.Certificate.Certificate))
             {
                 await requester.ExecuteAsync(new WaitForRaftIndexCommand(index), context);
@@ -148,50 +155,93 @@ namespace Raven.Server.Web
 
         protected async Task WaitForExecutionOnRelevantNodes(JsonOperationContext context, string database, ClusterTopology clusterTopology, List<string> members, long index)
         {
+            await ServerStore.Cluster.WaitForIndexNotification(index); // first let see if we commit this in the leader
             if (members.Count == 0)
                 throw new InvalidOperationException("Cannot wait for execution when there are no nodes to execute ON.");
 
             var executors = new List<ClusterRequestExecutor>();
-            var timeoutTask = TimeoutManager.WaitFor(TimeSpan.FromMilliseconds(10000));
-            var waitingTasks = new List<Task>
-            {
-                timeoutTask
-            };
-            var cts = CancellationTokenSource.CreateLinkedTokenSource(ServerStore.ServerShutdown);
+
             try
             {
-                foreach (var member in members)
+                using (var cts = CancellationTokenSource.CreateLinkedTokenSource(ServerStore.ServerShutdown))
                 {
-                    var url = member == ServerStore.NodeTag ?
-                        Server.WebUrl :
-                        clusterTopology.GetUrlFromTag(member);
-                    var requester = ClusterRequestExecutor.CreateForSingleNode(url, ServerStore.Server.Certificate.Certificate);
-                    executors.Add(requester);
-                    waitingTasks.Add(requester.ExecuteAsync(new WaitForRaftIndexCommand(index), context, token: cts.Token));
-                }
+                    cts.CancelAfter(ServerStore.Configuration.Cluster.OperationTimeout.AsTimeSpan);
 
-                while (true)
-                {
-                    var task = await Task.WhenAny(waitingTasks);
-                    if (task == timeoutTask)
-                        throw new TimeoutException($"Waited too long for the raft command (number {index}) to be executed on any of the relevant nodes to this command.");
-                    if (task.IsCompletedSuccessfully)
+                    var waitingTasks = new List<Task<Exception>>();
+                    List<Exception> exceptions = null;
+
+                    foreach (var member in members)
                     {
-                        break;
+                        var url = clusterTopology.GetUrlFromTag(member);
+                        var executor = ClusterRequestExecutor.CreateForSingleNode(url, ServerStore.Server.Certificate.Certificate);
+                        executors.Add(executor);
+                        waitingTasks.Add(ExecuteTask(executor, member, cts.Token));
                     }
-                    waitingTasks.Remove(task);
-                    if (waitingTasks.Count == 1) // only the timeout task is left
-                        throw new InvalidDataException($"The database '{database}' was created but is not accessible, because all of the nodes on which this database was supposed to reside on, threw an exception.", task.Exception);
+
+                    while (waitingTasks.Count > 0)
+                    {
+                        var task = await Task.WhenAny(waitingTasks);
+                        waitingTasks.Remove(task);
+
+                        if (task.Result == null)
+                            continue;
+
+                        var exception = task.Result.ExtractSingleInnerException();
+
+                        if (exceptions == null)
+                            exceptions = new List<Exception>();
+
+                        exceptions.Add(exception);
+                    }
+
+                    if (exceptions != null)
+                    {
+                        var allTimeouts = true;
+                        foreach (var exception in exceptions)
+                        {
+                            if (exception is OperationCanceledException)
+                                continue;
+
+                            allTimeouts = false;
+                        }
+
+                        var aggregateException = new AggregateException(exceptions);
+
+                        if (allTimeouts)
+                            throw new TimeoutException($"Waited too long for the raft command (number {index}) to be executed on any of the relevant nodes to this command.", aggregateException);
+
+                        throw new InvalidDataException($"The database '{database}' was created but is not accessible, because all of the nodes on which this database was supposed to reside on, threw an exception.", aggregateException);
+                    }
                 }
             }
             finally
             {
-                cts.Cancel();
-                foreach (var clusterRequestExecutor in executors)
+                foreach (var executor in executors)
                 {
-                    clusterRequestExecutor.Dispose();
+                    executor.Dispose();
                 }
-                cts.Dispose();
+            }
+
+            async Task<Exception> ExecuteTask(RequestExecutor executor, string nodeTag, CancellationToken token)
+            {
+                try
+                {
+                    await executor.ExecuteAsync(new WaitForRaftIndexCommand(index), context, token: token);
+                    return null;
+                }
+                catch (RavenException re) when (re.InnerException is HttpRequestException)
+                {
+                    // we want to throw for self-checks
+                    if (nodeTag == ServerStore.NodeTag)
+                        return re;
+
+                    // ignore - we are ok when connection with a node cannot be established (test: AddDatabaseOnDisconnectedNode)
+                    return null;
+                }
+                catch (Exception e)
+                {
+                    return e;
+                }
             }
         }
 
@@ -524,18 +574,94 @@ namespace Raven.Server.Web
             throw new ArgumentOutOfRangeException("Unknown authentication status: " + status);
         }
 
-        public static void SetupCORSHeaders(HttpContext httpContext)
+        public static void SetupCORSHeaders(HttpContext httpContext, ServerStore serverStore)
         {
+            httpContext.Response.Headers.Add("Vary", "Origin");
+            
+            var requestedOrigin = httpContext.Request.Headers["Origin"];
 
-            httpContext.Response.Headers.Add("Access-Control-Allow-Origin", httpContext.Request.Headers["Origin"]);
+            if (requestedOrigin.Count == 0)
+            {
+                // no CORS headers needed
+                return;
+            }
+
+            string allowedOrigin = null; // prevent access by default
+            
+            if (IsOriginAllowed(requestedOrigin, serverStore))
+            {
+                allowedOrigin = requestedOrigin;
+            }
+            
+            httpContext.Response.Headers.Add("Access-Control-Allow-Origin", allowedOrigin);
             httpContext.Response.Headers.Add("Access-Control-Allow-Methods", "PUT, POST, GET, OPTIONS, DELETE");
             httpContext.Response.Headers.Add("Access-Control-Allow-Headers", httpContext.Request.Headers["Access-Control-Request-Headers"]);
             httpContext.Response.Headers.Add("Access-Control-Max-Age", "86400");
         }
 
+        private static bool IsOriginAllowed(string origin, ServerStore serverStore)
+        {
+            if (serverStore.Server.Certificate.Certificate == null)
+            {
+                // running in unsafe mode - since server can be access via multiple urls/aliases accept them 
+                return true;
+            }
+            
+            var topology = serverStore.GetClusterTopology();
+            
+            // check explicitly each topology type to avoid allocations in topology.AllNodes
+            foreach (var kvp in topology.Members)
+            {
+                if (kvp.Value.Equals(origin, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+            
+            foreach (var kvp in topology.Watchers)
+            {
+                if (kvp.Value.Equals(origin, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+            
+            foreach (var kvp in topology.Promotables)
+            {
+                if (kvp.Value.Equals(origin, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
         protected void SetupCORSHeaders()
         {
-            SetupCORSHeaders(HttpContext);
+            SetupCORSHeaders(HttpContext, ServerStore);
+        }
+
+        protected void RedirectToLeader()
+        {
+            if (ServerStore.LeaderTag == null)
+                throw new NoLeaderException();
+
+            ClusterTopology topology;
+            using (ServerStore.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
+            using (context.OpenReadTransaction())
+            {
+                topology = ServerStore.GetClusterTopology(context);
+            }
+            var url = topology.GetUrlFromTag(ServerStore.LeaderTag);
+            if (string.Equals(url, ServerStore.GetNodeHttpServerUrl(), StringComparison.OrdinalIgnoreCase))
+            {
+                throw new NoLeaderException($"This node is not the leader, but the current topology does mark it as the leader. Such confusion is usually an indication of a network or configuration problem.");
+            }
+            var leaderLocation = url + HttpContext.Request.Path + HttpContext.Request.QueryString;
+            HttpContext.Response.StatusCode = (int)HttpStatusCode.TemporaryRedirect;
+            HttpContext.Response.Headers.Remove("Content-Type");
+            HttpContext.Response.Headers.Add("Location", leaderLocation);
         }
     }
 }

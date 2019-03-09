@@ -4,7 +4,6 @@ using System.Reflection;
 using System.Threading.Tasks;
 using FastTests;
 using FastTests.Server.Basic.Entities;
-using FastTests.Server.Documents.Revisions;
 using FastTests.Utils;
 using Raven.Client;
 using Raven.Client.Documents.Operations;
@@ -27,7 +26,8 @@ namespace SlowTests.Smuggler
             {
                 Assert.NotNull(stream);
 
-                await store.Smuggler.ImportAsync(new DatabaseSmugglerImportOptions(), stream);
+                var operation = await store.Smuggler.ImportAsync(new DatabaseSmugglerImportOptions(), stream);
+                await operation.WaitForCompletionAsync(TimeSpan.FromMinutes(1));
 
                 var stats = await store.Maintenance.SendAsync(new GetStatisticsOperation());
 
@@ -60,20 +60,26 @@ namespace SlowTests.Smuggler
             }
         }
 
-        [Theory]
-        [InlineData("SlowTests.Smuggler.Indexes_And_Transformers_3.5.ravendbdump")]
-        public async Task CanImportIndexesAndTransformers(string file)
+        [Fact]
+        public async Task CanImportIndexesAndTransformers()
         {
-            using (var stream = GetType().GetTypeInfo().Assembly.GetManifestResourceStream(file))
+            using (var stream = GetType().GetTypeInfo().Assembly.GetManifestResourceStream("SlowTests.Smuggler.Indexes_And_Transformers_3.5.ravendbdump"))
             using (var store = GetDocumentStore())
             {
                 Assert.NotNull(stream);
 
                 await store.Maintenance.SendAsync(new StopIndexingOperation());
 
+                var progresses = new List<IOperationProgress>();
                 var operation = await store.Smuggler.ImportAsync(new DatabaseSmugglerImportOptions(), stream);
+                operation.OnProgressChanged += progress =>
+                {
+                    progresses.Add(progress);
+                };
 
-                var result = operation.WaitForCompletion<SmugglerResult>();
+                var result = operation.WaitForCompletion<SmugglerResult>(TimeSpan.FromMinutes(15));
+
+                Assert.True(progresses.Count > 0);
 
                 var stats = await store.Maintenance.SendAsync(new GetStatisticsOperation());
 
@@ -143,12 +149,13 @@ namespace SlowTests.Smuggler
 
                 await RevisionsHelper.SetupRevisions(Server.ServerStore, store.Database);
 
-                await store.Smuggler.ImportAsync(new DatabaseSmugglerImportOptions(), stream);
+                var operation = await store.Smuggler.ImportAsync(new DatabaseSmugglerImportOptions(), stream);
+                await operation.WaitForCompletionAsync(TimeSpan.FromMinutes(1));
 
                 var stats = await store.Maintenance.SendAsync(new GetStatisticsOperation());
                 Assert.Equal(2, stats.CountOfDocuments);
                 Assert.Equal(5, stats.CountOfRevisionDocuments);
-                Assert.Equal(6, stats.LastDocEtag);
+                Assert.Equal(8, stats.LastDocEtag);
 
                 var collectionStats = await store.Maintenance.SendAsync(new GetCollectionStatisticsOperation());
                 Assert.Equal(2, collectionStats.CountOfDocuments);
@@ -164,7 +171,7 @@ namespace SlowTests.Smuggler
                     var metadata = session.Advanced.GetMetadataFor(user);
                     Assert.Equal(5, metadata.Count);
                     Assert.Equal("Users", metadata.GetString(Constants.Documents.Metadata.Collection));
-                    Assert.StartsWith("A:6-", metadata.GetString(Constants.Documents.Metadata.ChangeVector));
+                    Assert.StartsWith("A:7-", metadata.GetString(Constants.Documents.Metadata.ChangeVector));
                     Assert.Equal(DocumentFlags.HasRevisions.ToString(), metadata.GetString(Constants.Documents.Metadata.Flags));
                     Assert.Equal("users/1", metadata.GetString(Constants.Documents.Metadata.Id));
                     Assert.NotEqual(DateTime.MinValue.ToString(DefaultFormat.DateTimeOffsetFormatsToWrite), metadata.GetString(Constants.Documents.Metadata.LastModified));

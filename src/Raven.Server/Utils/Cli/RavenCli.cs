@@ -100,6 +100,7 @@ namespace Raven.Server.Utils.Cli
         private RavenServer _server;
         private bool _experimental;
         private bool _consoleColoring;
+        private bool _usingNamedPipes;
 
         private enum Command
         {
@@ -189,7 +190,7 @@ namespace Raven.Server.Utils.Cli
                 Console.ForegroundColor = PromptHeaderColor;
             try
             {
-                Prompt.Invoke(cli._promptArgs, false, cli._server, cli._writer);
+                Prompt(cli._promptArgs, false, cli._server, cli._writer);
             }
             catch (Exception ex)
             {
@@ -226,7 +227,7 @@ namespace Raven.Server.Utils.Cli
 
         private static char ReadKey(RavenCli cli)
         {
-            if (cli._consoleColoring)
+            if (!cli._usingNamedPipes)
             {
                 var rc = Console.ReadKey().KeyChar;
                 cli._writer.Flush();
@@ -241,20 +242,20 @@ namespace Raven.Server.Utils.Cli
 
         private string ReadLine(RavenCli cli)
         {
-            if (cli._consoleColoring == false)
+            if (cli._usingNamedPipes)
             {
                 cli._writer.Write(GetDelimiterString(Delimiter.ReadLine));
                 cli._writer.Flush();
             }
 
-            var rc = _consoleColoring ? Console.ReadLine() : cli._reader.ReadLine();
+            var rc = !_usingNamedPipes ? Console.ReadLine() : cli._reader.ReadLine();
             cli._writer.Flush();
             return rc;
         }
 
         private static bool CommandLogout(List<string> args, RavenCli cli)
         {
-            if (cli._consoleColoring)
+            if (!cli._usingNamedPipes)
             {
                 WriteText("'logout' command not supported on console cli", WarningColor, cli);
                 return true;
@@ -279,7 +280,7 @@ namespace Raven.Server.Utils.Cli
 
         private static bool CommandOpenBrowser(List<string> args, RavenCli cli)
         {
-            if (cli._consoleColoring == false)
+            if (cli._usingNamedPipes)
             {
                 WriteText("'openBrowser' command not supported on remote pipe connection", WarningColor, cli);
                 return true;
@@ -307,7 +308,7 @@ namespace Raven.Server.Utils.Cli
 
         private static bool CommandStats(List<string> args, RavenCli cli)
         {
-            if (cli._consoleColoring == false)
+            if (cli._usingNamedPipes)
             {
                 // beware not to allow this from remote - will disable local console!                
                 WriteText("'stats' command not supported on remote pipe connection. Use `info` or `prompt %M` instead", TextColor, cli);
@@ -327,7 +328,7 @@ namespace Raven.Server.Utils.Cli
 
         private static bool CommandTopThreads(List<string> args, RavenCli cli)
         {
-            if (cli._consoleColoring == false)
+            if (cli._usingNamedPipes)
             {
                 // beware not to allow this from remote - will disable local console!                
                 WriteText("'topThreads' command not supported on remote pipe connection.", TextColor, cli);
@@ -516,7 +517,7 @@ namespace Raven.Server.Utils.Cli
 
         private static bool CommandClear(List<string> args, RavenCli cli)
         {
-            if (cli._consoleColoring)
+            if (!cli._usingNamedPipes)
                 Console.Clear();
             else
                 cli._writer.Write(GetDelimiterString(Delimiter.Clear));
@@ -553,10 +554,9 @@ namespace Raven.Server.Utils.Cli
 
         private static bool CommandLogo(List<string> args, RavenCli cli)
         {
-            if (args == null || args.Count == 0 || args.First().Equals("no-clear") == false)
-                if (cli._consoleColoring)
-                    Console.Clear();
-            if (cli._consoleColoring)
+            if (!cli._usingNamedPipes && (args == null || args.Count == 0 || args.First().Equals("no-clear") == false))
+                Console.Clear();
+            if (!cli._usingNamedPipes)
                 new WelcomeMessage(Console.Out).Print();
             else
                 new WelcomeMessage(cli._writer).Print();
@@ -825,17 +825,12 @@ namespace Raven.Server.Utils.Cli
 
             cli._server.ServerStore.EnsureNotPassive();
 
-            // This restriction should be removed when updating to .net core 2.1 when export of collection is fixed.
-            // With export, we'll be able to load the certificate and export it without a password, and propagate it through the cluster.
-            if (string.IsNullOrWhiteSpace(password) == false)
-                throw new NotSupportedException("Replacing the cluster certificate with a password protected certificates is currently not supported.");
-
-            X509Certificate2 cert;
+            X509Certificate2Collection cert = new X509Certificate2Collection();
             byte[] certBytes;
             try
             {
                 certBytes = File.ReadAllBytes(path);
-                cert = new X509Certificate2(path, password, X509KeyStorageFlags.Exportable | X509KeyStorageFlags.PersistKeySet | X509KeyStorageFlags.MachineKeySet);
+                cert.Import(certBytes, password, X509KeyStorageFlags.Exportable | X509KeyStorageFlags.MachineKeySet);
             }
             catch (Exception e)
             {
@@ -843,8 +838,35 @@ namespace Raven.Server.Utils.Cli
                 return false;
             }
 
-            WriteText("Successfully read certificate: " + cert.Thumbprint, TextColor, cli);
-            WriteText(cert.ToString(), TextColor, cli);
+            // Export the certificate without a password, to send it through the cluster.
+            if (string.IsNullOrWhiteSpace(password) == false)
+            {
+                try
+                {
+                    // With the private key, without the password
+                    certBytes = cert.Export(X509ContentType.Pkcs12);
+                }
+                catch (Exception e)
+                {
+                    WriteError("Failed to export the password provided certificate." + e, cli);
+                    return false;
+                }
+            }
+
+            // Ensure we'll be able to load the certificate
+            X509Certificate2 loadedCert;
+            try
+            {
+                loadedCert = new X509Certificate2(certBytes, (string)null, X509KeyStorageFlags.Exportable | X509KeyStorageFlags.MachineKeySet);
+            }
+            catch (Exception e)
+            {
+                WriteError("Failed to load the provided certificate." + e, cli);
+                return false;
+            }
+
+            WriteText("Successfully read certificate: " + loadedCert.Thumbprint, TextColor, cli);
+            WriteText(loadedCert.ToString(), TextColor, cli);
 
             try
             {
@@ -854,15 +876,18 @@ namespace Raven.Server.Utils.Cli
 
                 Task.WhenAny(replicationTask, timeoutTask).Wait();
                 if (replicationTask.IsCompleted == false)
-                    throw new TimeoutException("Timeout when trying to replace the server certificate.");
+                {
+                    WriteError("Timeout when trying to replace the server certificate.", cli);
+                    return false;
+                }
             }
             catch (Exception e)
             {
-                throw new InvalidOperationException("Failed to replace the server certificate. Check the logs for details.", e);
+                WriteError("Failed to replace the server certificate. Check the logs for details." + e, cli);
+                return false;
             }
 
             WriteText("Successfully replaced the server certificate.", TextColor, cli);
-
             return true;
         }
 
@@ -882,7 +907,8 @@ namespace Raven.Server.Utils.Cli
             }
             catch (Exception e)
             {
-                throw new InvalidOperationException("Failed to trigger a certificate refresh cycle.", e);
+                WriteError("Failed to trigger a certificate refresh cycle." + e, cli);
+                return false;
             }
 
             WriteText("Triggered a certificate refresh cycle.", TextColor, cli);
@@ -1040,9 +1066,9 @@ namespace Raven.Server.Utils.Cli
         private static bool CommandImportDir(List<string> args, RavenCli cli)
         {
             // ImportDir <databaseName> <path-to-dir>
-            WriteText($"ImportDir for database {args[0]} from dir `{args[1]}` to {cli._server.WebUrl}", ConsoleColor.Yellow, cli);
+            WriteText($"ImportDir for database {args[0]} from dir `{args[1]}` to {cli._server.ServerStore.GetNodeHttpServerUrl()}", ConsoleColor.Yellow, cli);
 
-            var url = $"{cli._server.WebUrl}/databases/{args[0]}/smuggler/import-dir?dir={args[1]}";
+            var url = $"{cli._server.ServerStore.GetNodeHttpServerUrl()}/databases/{args[0]}/smuggler/import-dir?dir={args[1]}";
             using (var client = new HttpClient())
             {
                 WriteText("Sending at " + DateTime.UtcNow, TextColor, cli);
@@ -1058,7 +1084,7 @@ namespace Raven.Server.Utils.Cli
             // CreateDb <databaseName> <DataDir>
             WriteText($"Create database {args[0]} with DataDir `{args[1]}`", ConsoleColor.Yellow, cli);
 
-            var port = new Uri(cli._server.WebUrl).Port;
+            var port = new Uri(cli._server.ServerStore.GetNodeHttpServerUrl()).Port;
 
             using (var store = new DocumentStore
             {
@@ -1110,7 +1136,7 @@ namespace Raven.Server.Utils.Cli
                 new[] {"generateClientCert <name> <path-to-output-folder> [password]", "Generate a new trusted client certificate with 'ClusterAdmin' security clearance."},
                 new[] {"trustServerCert <name> <path-to-pfx> [password]", "Register a server certificate of another node to be trusted on this server."},
                 new[] {"trustClientCert <name> <path-to-pfx> [password]", "Register a client certificate to be trusted on this server with 'ClusterAdmin' security clearance."},
-                new[] {"replaceClusterCert [-replaceImmediately] <name> <path-to-pfx> [password]", "Replace the cluster certificate."},
+                new[] {"replaceClusterCert [-replaceImmediately] <path-to-pfx> [password]", "Replace the cluster certificate."},
                 new[] {"triggerCertificateRefresh [-replaceImmediately]", "Trigger a certificate refresh check (normally happens once an hour)."}
             };
 
@@ -1180,12 +1206,13 @@ namespace Raven.Server.Utils.Cli
             [Command.Print] = new SingleAction { NumOfArgs = 1, DelegateFunc = CommandPrint, Experimental = true }, // test cli
         };
 
-        public bool Start(RavenServer server, TextWriter textWriter, TextReader textReader, bool consoleColoring)
+        public bool Start(RavenServer server, TextWriter textWriter, TextReader textReader, bool consoleColoring, bool usingNamedPipes)
         {
             _server = server;
             _writer = textWriter;
             _reader = textReader;
             _consoleColoring = consoleColoring;
+            _usingNamedPipes = usingNamedPipes;
 
             var parentProcessId = server.Configuration.Embedded.ParentProcessId;
             if (parentProcessId != null)
@@ -1203,6 +1230,7 @@ namespace Raven.Server.Utils.Cli
                     OnParentProcessExit(this, EventArgs.Empty);
                     return false;
                 }
+
                 parent.EnableRaisingEvents = true;
                 parent.Exited += OnParentProcessExit;
                 if (parent.HasExited)
@@ -1252,7 +1280,7 @@ namespace Raven.Server.Utils.Cli
         private bool StartCli()
         {
             var ctrlCPressed = false;
-            if (_consoleColoring)
+            if (!_usingNamedPipes)
                 Console.CancelKeyPress += (sender, args) =>
                 {
                     Console.ResetColor();
@@ -1270,13 +1298,12 @@ namespace Raven.Server.Utils.Cli
                 PrintCliHeader(this);
                 var line = ReadLine(this);
                 _writer.Flush();
-
                 if (line == null)
                 {
-                    if (_consoleColoring == false)
+                    if (_usingNamedPipes)
                     {
                         // for some reason remote pipe couldn't ReadLine
-                        WriteText("End of standard input detected. Remote console might not support input", ErrorColor, this);
+                        WriteText("End of standard input detected, failed to execute ReadLine(). Remote console might not support input.", ErrorColor, this);
                         // simulate logout:
                         line = "logout";
                     }
@@ -1369,7 +1396,7 @@ namespace Raven.Server.Utils.Cli
                         {
                             if (Program.IsRunningNonInteractive || _writer == Console.Out)
                             {
-                                if (_consoleColoring == false)
+                                if (_usingNamedPipes)
                                 {
                                     const string str = "Restarting Server";
                                     PrintBothToConsoleAndRemotePipe(str, this, Delimiter.RestartServer);
@@ -1384,7 +1411,7 @@ namespace Raven.Server.Utils.Cli
                         {
                             if (Program.IsRunningNonInteractive || _writer == Console.Out)
                             {
-                                if (_consoleColoring == false)
+                                if (_usingNamedPipes)
                                 {
                                     const string str = "Shutting down the server";
                                     PrintBothToConsoleAndRemotePipe(str, this, Delimiter.Shutdown);

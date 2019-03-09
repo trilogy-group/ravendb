@@ -1,10 +1,9 @@
 using System;
+using System.Collections;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.IO;
 using System.Linq;
-using System.Net;
 using System.Runtime.CompilerServices;
 using Sparrow;
 using Sparrow.Binary;
@@ -33,7 +32,7 @@ namespace Voron.Impl.Paging
         private long _increaseSize;
         private DateTime _lastIncrease;
         private readonly object _pagerStateModificationLocker = new object();
-        public bool UsePageProtection { get; } = false;
+        public readonly bool UsePageProtection;
         private readonly MultipleUseFlag _lowMemoryFlag = new MultipleUseFlag();
         private readonly bool _canPrefetchAhead;
 
@@ -55,30 +54,37 @@ namespace Voron.Impl.Paging
             {
                 newState.AddRef();
 
-                if (LockMemory)
+                if (ShouldLockMemoryAtPagerLevel())
                 {
+                    // Note: This is handled differently in 32-bits.
+                    // Locking/unlocking the memory is done separately for each mapping.
                     try
                     {
                         foreach (var info in newState.AllocationInfos)
                         {
+                            if (info.Size == 0 || info.BaseAddress == null)
+                                continue;
+
                             if (Sodium.sodium_mlock(info.BaseAddress, (UIntPtr)info.Size) != 0)
                             {
                                 if (DoNotConsiderMemoryLockFailureAsCatastrophicError)
                                     continue; // okay, can skip this, then
 
-                                if (TryHandleFailureToLockMemory(newState, info))
+                                var sumOfAllocations = Bits.NextPowerOf2(newState.AllocationInfos.Sum(x => x.Size) * 2);
+
+                                if (TryHandleFailureToLockMemory(info.BaseAddress, info.Size, sumOfAllocations))
                                     break;
                             }
                         }
                     }
-                    catch 
+                    catch
                     {
                         // need to restore the state to the way it was, so we'll dispose the pager state
                         newState.Release();
                         throw;
                     }
                 }
-                
+
                 _debugInfo = GetSourceName();
                 var oldState = _pagerState;
                 _pagerState = newState;
@@ -87,22 +93,26 @@ namespace Voron.Impl.Paging
             }
         }
 
-        private bool TryHandleFailureToLockMemory(PagerState newState, PagerState.AllocationInfo info)
+        public virtual bool ShouldLockMemoryAtPagerLevel()
+        {
+            return LockMemory;
+        }
+
+        protected bool TryHandleFailureToLockMemory(byte* addressToLock, long sizeToLock, long sumOfAllocationsInBytes)
         {
             var currentProcess = Process.GetCurrentProcess();
-            var sum = Bits.NextPowerOf2(newState.AllocationInfos.Sum(x => x.Size) * 2);
 
             if (PlatformDetails.RunningOnPosix == false)
             {
                 // From: https://msdn.microsoft.com/en-us/library/windows/desktop/ms686234(v=vs.85).aspx
                 // "The maximum number of pages that a process can lock is equal to the number of pages in its minimum working set minus a small overhead"
                 // let's increase the max size of memory we can lock by increasing the MinWorkingSet. On Windows, that is available for all users
-                var nextSize = Bits.NextPowerOf2(currentProcess.MinWorkingSet.ToInt64() + sum);
+                var nextSize = Bits.NextPowerOf2(currentProcess.MinWorkingSet.ToInt64() + sumOfAllocationsInBytes + sizeToLock);
                 if (nextSize > int.MaxValue && IntPtr.Size == sizeof(int))
                 {
                     nextSize = int.MaxValue;
                 }
-                
+
                 // Minimum working set size must be less than or equal to the maximum working set size.
                 // Let's increase the max as well.
                 if (nextSize > (long)currentProcess.MaxWorkingSet)
@@ -114,7 +124,7 @@ namespace Voron.Impl.Paging
                     catch (Exception e)
                     {
                         throw new InsufficientMemoryException($"Need to increase the min working set size from {(long)currentProcess.MinWorkingSet:#,#;;0} to {nextSize:#,#;;0} but the max working set size was too small: {(long)currentProcess.MaxWorkingSet:#,#;;0}. " +
-                                                              $"Failed to increase the max working set size so we can lock {info.Size:#,#;;0} for {FileName}. With encrypted " +
+                                                              $"Failed to increase the max working set size so we can lock {sizeToLock:#,#;;0} for {FileName}. With encrypted " +
                                                               "databases we lock some memory in order to avoid leaking secrets to disk. Treating this as a catastrophic error " +
                                                               "and aborting the current operation.", e);
                     }
@@ -126,22 +136,22 @@ namespace Voron.Impl.Paging
                 }
                 catch (Exception e)
                 {
-                    throw new InsufficientMemoryException($"Failed to increase the min working set size so we can lock {info.Size:#,#;;0} for {FileName}. With encrypted " +
+                    throw new InsufficientMemoryException($"Failed to increase the min working set size so we can lock {sizeToLock:#,#;;0} for {FileName}. With encrypted " +
                                                           "databases we lock some memory in order to avoid leaking secrets to disk. Treating this as a catastrophic error " +
                                                           "and aborting the current operation.", e);
                 }
 
                 // now we can try again, after we raised the limit, we only do so once, though
-                if (Sodium.sodium_mlock(info.BaseAddress, (UIntPtr)info.Size) == 0)
+                if (Sodium.sodium_mlock(addressToLock, (UIntPtr)sizeToLock) == 0)
                     return false;
             }
 
             var msg =
-                $"Unable to lock memory for {FileName} with size {info.Size:#,#;;0}), with encrypted databases we lock some memory in order to avoid leaking secrets to disk. Treating this as a catastrophic error and aborting the current operation.{Environment.NewLine}";
+                $"Unable to lock memory for {FileName} with size {sizeToLock:#,#;;0}), with encrypted databases we lock some memory in order to avoid leaking secrets to disk. Treating this as a catastrophic error and aborting the current operation.{Environment.NewLine}";
             if (PlatformDetails.RunningOnPosix)
             {
                 msg +=
-                    $"The admin may configure higher limits using: 'sudo prlimit --pid {currentProcess.Id} --memlock={sum}' to increase the limit. (It's recommended to do that as part of the startup script){Environment.NewLine}";
+                    $"The admin may configure higher limits using: 'sudo prlimit --pid {currentProcess.Id} --memlock={sumOfAllocationsInBytes}' to increase the limit. (It's recommended to do that as part of the startup script){Environment.NewLine}";
             }
             else
             {
@@ -273,8 +283,10 @@ namespace Voron.Impl.Paging
 
             return state.MapBase + pageNumber * Constants.Storage.PageSize;
 
-            AlreadyDisposed: ThrowAlreadyDisposedException();
-            InvalidPageNumber: ThrowOnInvalidPageNumber(pageNumber);
+        AlreadyDisposed:
+            ThrowAlreadyDisposedException();
+        InvalidPageNumber:
+            ThrowOnInvalidPageNumber(pageNumber);
             return null; // Will never happen. 
         }
 
@@ -294,7 +306,7 @@ namespace Voron.Impl.Paging
         }
 
         public abstract void Sync(long totalUnsynced);
-        
+
         public PagerState EnsureContinuous(long requestedPageNumber, int numberOfPages)
         {
             if (DisposeOnceRunner.Disposed)
@@ -311,6 +323,9 @@ namespace Voron.Impl.Paging
             {
                 allocationSize = GetNewLength(allocationSize, minRequested);
             }
+
+            if (_options.CopyOnWriteMode && FileName.FullPath.EndsWith(Constants.DatabaseFilename))
+                ThrowIncreasingDataFileInCopyOnWriteModeException(FileName.FullPath, allocationSize);
 
             return AllocateMorePages(allocationSize);
         }
@@ -336,7 +351,7 @@ namespace Voron.Impl.Paging
         /// so it will not go to the swap / core dumps
         /// </summary>
         public bool LockMemory;
-        
+
         /// <summary>
         /// Control whatever we should treat memory lock errors as catastrophic errors
         /// or not. By default, we consider them catastrophic and fail immediately to
@@ -371,7 +386,7 @@ namespace Voron.Impl.Paging
             {
                 _lastIncrease = now;
                 // cannot return less than the minRequested
-                return Bits.NextPowerOf2(minRequested);
+                return GetNearestFileSize(minRequested);
             }
 
             TimeSpan timeSinceLastIncrease = (now - _lastIncrease);
@@ -397,18 +412,24 @@ namespace Voron.Impl.Paging
 
             // we then want to get the next power of two number, to get pretty file size
             var totalSize = current + actualIncrease;
-            if (totalSize < 512 * 1024 * 1024L)
-                return Bits.NextPowerOf2(totalSize);
-
-            // if it is over 0.5 GB, then we grow at 1 GB intervals
-            var remainder = totalSize%Constants.Size.Gigabyte;
-            if (remainder == 0)
-                return totalSize;
-
-            // above 0.5GB we need to round to the next GB number
-            return totalSize + Constants.Size.Gigabyte - remainder;
+            return GetNearestFileSize(totalSize);
         }
 
+        private static readonly long IncreaseByPowerOf2Threshold = new Size(512, SizeUnit.Megabytes).GetValue(SizeUnit.Bytes);
+
+        private static long GetNearestFileSize(long neededSize)
+        {
+            if (neededSize < IncreaseByPowerOf2Threshold)
+                return Bits.NextPowerOf2(neededSize);
+
+            // if it is over 0.5 GB, then we grow at 1 GB intervals
+            var remainder = neededSize % Constants.Size.Gigabyte;
+            if (remainder == 0)
+                return neededSize;
+
+            // above 0.5GB we need to round to the next GB number
+            return neededSize + Constants.Size.Gigabyte - remainder;
+        }
 
         public abstract override string ToString();
 
@@ -419,7 +440,6 @@ namespace Voron.Impl.Paging
             throw new ObjectDisposedException("The pager is already disposed");
         }
 
-
         protected void ThrowOnInvalidPageNumber(long pageNumber)
         {
             // this is a separate method because we don't want to have an exception throwing in the hot path
@@ -429,11 +449,16 @@ namespace Voron.Impl.Paging
                 GetSourceName());
         }
 
+        public static void ThrowIncreasingDataFileInCopyOnWriteModeException(string dataFilePath, long requestedSize)
+        {
+            throw new IncreasingDataFileInCopyOnWriteModeException(dataFilePath, requestedSize);
+        }
+
         public virtual void ReleaseAllocationInfo(byte* baseAddress, long size)
         {
-            if (LockMemory == false) 
+            if (LockMemory == false)
                 return;
-            
+
             // intentionally skipping verification of the result, nothing that we
             // can do about this here, and we are going to free the memory anyway
             // that at any rate, we don't care about the memory zeroing, since
@@ -455,6 +480,48 @@ namespace Voron.Impl.Paging
         }
 
         protected internal abstract unsafe void PrefetchRanges(Win32MemoryMapNativeMethods.WIN32_MEMORY_RANGE_ENTRY* list, int count);
+
+        private struct PageIterator : IEnumerator<long>
+        {
+            private readonly long _startPage;
+            private readonly long _endPage;
+            private long _currentPage;
+
+            public PageIterator(long pageNumber, int pagesToPrefetch)
+            {
+                this._startPage = pageNumber;
+                this._endPage = pageNumber + pagesToPrefetch;
+                this._currentPage = pageNumber;
+            }
+
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            public bool MoveNext()
+            {
+                this._currentPage++;
+                return _currentPage < _endPage;
+            }
+
+            public void Reset()
+            {
+                this._currentPage = this._startPage;
+            }
+
+            public long Current
+            {
+                [MethodImpl(MethodImplOptions.AggressiveInlining)]
+                get => _currentPage;
+            }
+
+            object IEnumerator.Current => Current;
+
+            public void Dispose() {}
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void MaybePrefetchMemory(long pageNumber, int pagesToPrefetch)
+        {
+            MaybePrefetchMemory(new PageIterator(pageNumber, pagesToPrefetch));
+        }
 
         public void MaybePrefetchMemory<T>(T pagesToPrefetch) where T : struct, IEnumerator<long>
         {
@@ -555,7 +622,7 @@ namespace Voron.Impl.Paging
             {
                 numberOfPages = VirtualPagerLegacyExtensions.GetNumberOfOverflowPages(pageHeader->OverflowSize);
             }
-            const int adjustPageSize = (Constants.Storage.PageSize)/(4*Constants.Size.Kilobyte);
+            const int adjustPageSize = (Constants.Storage.PageSize) / (4 * Constants.Size.Kilobyte);
             destwI4KbBatchWrites.Write(pageHeader->PageNumber * (long)adjustPageSize, numberOfPages * adjustPageSize, src);
 
             return numberOfPages;

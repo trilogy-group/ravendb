@@ -2,8 +2,11 @@
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using System.Threading;
 using Sparrow.Binary;
+using Sparrow.Global;
 using Sparrow.LowMemory;
+using Sparrow.Platform;
 using Sparrow.Threading;
 #if MEM_GUARD
 using Sparrow.Platform;
@@ -15,6 +18,7 @@ namespace Sparrow.Json
     public unsafe class ArenaMemoryAllocator : IDisposable
     {
         private const int MaxArenaSize = 1024 * 1024 * 1024;
+        private static readonly int? SingleAllocationSizeLimit = PlatformDetails.Is32Bits ? 8 * Constants.Size.Megabyte : (int?)null;
 
         private byte* _ptrStart;
         private byte* _ptrCurrent;
@@ -169,11 +173,12 @@ namespace Sparrow.Json
 
             byte* newBuffer;
             NativeMemory.ThreadStats thread;
+
             try
             {
                 newBuffer = NativeMemory.AllocateMemory(newSize, out thread);
             }
-            catch (OutOfMemoryException oom ) 
+            catch (OutOfMemoryException oom)
                 when (oom.Data?.Contains("Recoverable") != true) // this can be raised if the commit charge is low
             {
                 // we were too eager with memory allocations?
@@ -197,13 +202,27 @@ namespace Sparrow.Json
 
         private int GetPreferredSize(int requestedSize)
         {
-            if (AvoidOverAllocation)
-                return Bits.NextPowerOf2(requestedSize);
+            if (AvoidOverAllocation || PlatformDetails.Is32Bits)
+                return ApplyLimit(Bits.NextPowerOf2(requestedSize));
             
             // we need the next allocation to cover at least the next expansion (also doubling)
             // so we'll allocate 3 times as much as was requested, or as much as we already have
             // the idea is that a single allocation can server for multiple (increasing in size) calls
-            return Math.Max(Bits.NextPowerOf2(requestedSize) * 3, _initialSize);
+            return ApplyLimit(Math.Max(Bits.NextPowerOf2(requestedSize) * 3, _initialSize));
+
+            int ApplyLimit(int size)
+            {
+                if (SingleAllocationSizeLimit == null)
+                    return size;
+
+                if (size > SingleAllocationSizeLimit.Value)
+                {
+                    var sizeInMb = requestedSize / Constants.Size.Megabyte + (requestedSize % Constants.Size.Megabyte == 0 ? 0 : 1);
+                    return sizeInMb * Constants.Size.Megabyte;
+                }
+
+                return size;
+            }
         }
 
         public void RenewArena()
@@ -266,6 +285,8 @@ namespace Sparrow.Json
             TotalUsed = 0;
             if (_allocated > MaxArenaSize)
                 _allocated = MaxArenaSize;
+            if (SingleAllocationSizeLimit != null && _allocated > SingleAllocationSizeLimit.Value)
+                _allocated = SingleAllocationSizeLimit.Value;
             _ptrCurrent = _ptrStart = null;
         }
 
@@ -289,10 +310,17 @@ namespace Sparrow.Json
 
         public void Dispose()
         {
+            Dispose(true);
+        }
+        public void Dispose(bool disposing)
+        {
             if (!_isDisposed.Raise())
                 return;
 
-            lock (this)
+            if (disposing)
+                Monitor.Enter(this);
+
+            try
             {
                 if (_olderBuffers != null)
                 {
@@ -310,7 +338,13 @@ namespace Sparrow.Json
 
                 GC.SuppressFinalize(this);
             }
+            finally
+            {
+                if (disposing)
+                    Monitor.Exit(this);
+            }
         }
+
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void Return(AllocatedMemoryData allocation)

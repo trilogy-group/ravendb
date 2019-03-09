@@ -63,6 +63,8 @@ namespace Raven.Server.Documents.ETL
 
         public abstract void NotifyAboutWork(DocumentChange documentChange, CounterChange counterChange);
 
+        public abstract bool ShouldTrackCounters();
+
         public abstract EtlPerformanceStats[] GetPerformanceStats();
 
         public abstract Dictionary<string, long> GetLastProcessedTombstonesPerCollection();
@@ -86,7 +88,9 @@ namespace Raven.Server.Documents.ETL
         }
     }
 
-    public abstract class EtlProcess<TExtracted, TTransformed, TConfiguration, TConnectionString> : EtlProcess where TExtracted : ExtractedItem where TConfiguration : EtlConfiguration<TConnectionString> where TConnectionString : ConnectionString
+    public abstract class EtlProcess<TExtracted, TTransformed, TConfiguration, TConnectionString> : EtlProcess where TExtracted : ExtractedItem
+        where TConfiguration : EtlConfiguration<TConnectionString>
+        where TConnectionString : ConnectionString
     {
         private readonly ManualResetEventSlim _waitForChanges = new ManualResetEventSlim();
         private readonly CancellationTokenSource _cts;
@@ -137,8 +141,6 @@ namespace Raven.Server.Documents.ETL
         protected abstract IEnumerator<TExtracted> ConvertCountersEnumerator(IEnumerator<CounterDetail> counters, string collection);
 
         protected abstract bool ShouldTrackAttachmentTombstones();
-
-        protected abstract bool ShouldTrackCounters();
 
         public virtual IEnumerable<TExtracted> Extract(DocumentsOperationContext context, long fromEtag, EtlItemType type, EtlStatsScope stats)
         {
@@ -287,7 +289,7 @@ namespace Raven.Server.Documents.ETL
 
                         try
                         {
-                            if (CanContinueBatch(stats, item) == false)
+                            if (CanContinueBatch(stats, item, context) == false)
                                 break;
 
                             transformer.Transform(item);
@@ -375,7 +377,7 @@ namespace Raven.Server.Documents.ETL
 
         protected abstract void LoadInternal(IEnumerable<TTransformed> items, JsonOperationContext context);
 
-        public bool CanContinueBatch(EtlStatsScope stats, TExtracted currentItem)
+        public bool CanContinueBatch(EtlStatsScope stats, TExtracted currentItem, JsonOperationContext ctx)
         {
             if (currentItem.Type == EtlItemType.Counter)
             {
@@ -420,21 +422,29 @@ namespace Raven.Server.Documents.ETL
                 return false;
             }
 
-            var currentlyInUse = new Size(_threadAllocations.Allocations, SizeUnit.Bytes);
+            var totalAllocated = _threadAllocations.TotalAllocated;
+            _threadAllocations.CurrentlyAllocatedForProcessing = totalAllocated;
+            var currentlyInUse = new Size(totalAllocated, SizeUnit.Bytes);
             if (currentlyInUse > _currentMaximumAllowedMemory)
             {
                 if (MemoryUsageGuard.TryIncreasingMemoryUsageForThread(_threadAllocations, ref _currentMaximumAllowedMemory,
                         currentlyInUse,
-                        Database.DocumentsStorage.Environment.Options.RunningOn32Bits, Logger, out ProcessMemoryUsage memoryUsage) == false)
+                        Database.DocumentsStorage.Environment.Options.RunningOn32Bits, Logger, out var memoryUsage) == false)
                 {
-                    var reason = $"Stopping the batch because cannot budget additional memory. Current budget: {_threadAllocations.TotalAllocated}. Current memory usage: " +
-                                 $"{nameof(memoryUsage.WorkingSet)} = {memoryUsage.WorkingSet}," +
-                                 $"{nameof(memoryUsage.PrivateMemory)} = {memoryUsage.PrivateMemory}";
+                    var reason = $"Stopping the batch because cannot budget additional memory. Current budget: {currentlyInUse}.";
+                    if (memoryUsage != null)
+                    {
+                        reason += " Current memory usage: " +
+                                   $"{nameof(memoryUsage.WorkingSet)} = {memoryUsage.WorkingSet}," +
+                                   $"{nameof(memoryUsage.PrivateMemory)} = {memoryUsage.PrivateMemory}";
+                    }
 
                     if (Logger.IsInfoEnabled)
                         Logger.Info(reason);
 
                     stats.RecordBatchCompleteReason(reason);
+
+                    ctx.DoNotReuse = true;
 
                     return false;
                 }
@@ -445,7 +455,7 @@ namespace Raven.Server.Documents.ETL
 
         protected void UpdateMetrics(DateTime startTime, EtlStatsScope stats)
         {
-            Metrics.BatchSizeMeter.Mark(stats.NumberOfExtractedItems.Sum(x => x.Value));
+            Metrics.BatchSizeMeter.MarkSingleThreaded(stats.NumberOfExtractedItems.Sum(x => x.Value));
         }
 
         public override void Reset()
@@ -460,7 +470,10 @@ namespace Raven.Server.Documents.ETL
 
         public override void NotifyAboutWork(DocumentChange documentChange, CounterChange counterChange)
         {
-            if (Transformation.ApplyToAllDocuments || (documentChange != null && _collections.Contains(documentChange.CollectionName)) || counterChange != null)
+            if (documentChange != null && (Transformation.ApplyToAllDocuments || _collections.Contains(documentChange.CollectionName)))
+                _waitForChanges.Set();
+
+            if (counterChange != null && ShouldTrackCounters())
                 _waitForChanges.Set();
         }
 
@@ -616,7 +629,8 @@ namespace Raven.Server.Documents.ETL
                     if (didWork)
                     {
                         var command = new UpdateEtlProcessStateCommand(Database.Name, Configuration.Name, Transformation.Name, Statistics.LastProcessedEtag,
-                            ChangeVectorUtils.MergeVectors(Statistics.LastChangeVector, state.ChangeVector), _serverStore.NodeTag, _serverStore.LicenseManager.HasHighlyAvailableTasks());
+                            ChangeVectorUtils.MergeVectors(Statistics.LastChangeVector, state.ChangeVector), _serverStore.NodeTag,
+                            _serverStore.LicenseManager.HasHighlyAvailableTasks());
 
                         var sendToLeaderTask = _serverStore.SendToLeaderAsync(command);
                         sendToLeaderTask.Wait(CancellationToken);
@@ -679,6 +693,11 @@ namespace Raven.Server.Documents.ETL
                 {
                     if (Logger.IsOperationsEnabled)
                         Logger.Operations($"Unexpected error in {Tag} process: '{Name}'", e);
+                }
+                finally
+                {
+                    _threadAllocations.CurrentlyAllocatedForProcessing = 0;
+                    _currentMaximumAllowedMemory = new Size(32, SizeUnit.Megabytes);
                 }
             }
         }
@@ -788,116 +807,135 @@ namespace Raven.Server.Documents.ETL
         public static TestEtlScriptResult TestScript(TestEtlScript<TConfiguration, TConnectionString> testScript, DocumentDatabase database, ServerStore serverStore,
             DocumentsOperationContext context)
         {
-            var document = database.DocumentsStorage.Get(context, testScript.DocumentId);
-
-            if (document == null)
-                throw new InvalidOperationException($"Document {testScript.DocumentId} does not exist");
-
-            TConnectionString connection = null;
-
-            var sqlTestScript = testScript as TestSqlEtlScript;
-
-            if (sqlTestScript != null)
+            using (testScript.IsDelete ? context.OpenWriteTransaction() : context.OpenReadTransaction()) // we open write tx to test deletion but we won't commit it
             {
-                // we need to have connection string when testing SQL ETL because we need to have the factory name
-                // and if PerformRolledBackTransaction = true is specified then we need make a connection to SQL
+                var document = database.DocumentsStorage.Get(context, testScript.DocumentId);
 
-                var csErrors = new List<string>();
+                if (document == null)
+                    throw new InvalidOperationException($"Document {testScript.DocumentId} does not exist");
 
-                if (sqlTestScript.Connection != null)
+                TConnectionString connection = null;
+
+                var sqlTestScript = testScript as TestSqlEtlScript;
+
+                if (sqlTestScript != null)
                 {
-                    if (sqlTestScript.Connection.Validate(ref csErrors) == false)
-                        throw new InvalidOperationException($"Invalid connection string due to {string.Join(";", csErrors)}");
+                    // we need to have connection string when testing SQL ETL because we need to have the factory name
+                    // and if PerformRolledBackTransaction = true is specified then we need make a connection to SQL
 
-                    connection = sqlTestScript.Connection as TConnectionString;
-                }
-                else
-                {
-                    if (serverStore.LoadDatabaseRecord(database.Name, out _).SqlConnectionStrings
-                            .TryGetValue(testScript.Configuration.ConnectionStringName, out var sqlConnection) == false)
+                    var csErrors = new List<string>();
+
+                    if (sqlTestScript.Connection != null)
                     {
-                        throw new InvalidOperationException($"Connection string named '{testScript.Configuration.ConnectionStringName}' was not found in the database record");
+                        if (sqlTestScript.Connection.Validate(ref csErrors) == false)
+                            throw new InvalidOperationException($"Invalid connection string due to {string.Join(";", csErrors)}");
+
+                        connection = sqlTestScript.Connection as TConnectionString;
                     }
-
-                    if (sqlConnection.Validate(ref csErrors) == false)
-                        throw new InvalidOperationException($"Invalid '{testScript.Configuration.ConnectionStringName}' connection string due to {string.Join(";", csErrors)}");
-
-                    connection = sqlConnection as TConnectionString;
-                }
-            }
-
-            testScript.Configuration.Initialize(connection);
-
-            testScript.Configuration.TestMode = true;
-
-            if (testScript.Configuration.Validate(out List<string> errors) == false)
-            {
-                throw new InvalidOperationException($"Invalid ETL configuration for '{testScript.Configuration.Name}'. " +
-                                                    $"Reason{(errors.Count > 1 ? "s" : string.Empty)}: {string.Join(";", errors)}.");
-            }
-
-            if (testScript.Configuration.Transforms.Count != 1)
-            {
-                throw new InvalidOperationException($"Invalid number of transformations. You have provided {testScript.Configuration.Transforms.Count} " +
-                                                    "while ETL test expects to get exactly 1 transformation script");
-            }
-
-            var docCollection = database.DocumentsStorage.ExtractCollectionName(context, document.Data).Name;
-
-            if (testScript.Configuration.Transforms[0].ApplyToAllDocuments == false && testScript.Configuration.Transforms[0].Collections.Contains(docCollection, StringComparer.OrdinalIgnoreCase) == false)
-            {
-                throw new InvalidOperationException($"Document '{document.Id}' belongs to {docCollection} collection " +
-                                                    $"while tested ETL script works on the following collections: {string.Join(", ", testScript.Configuration.Transforms[0].Collections)}");
-            }
-
-            if (testScript.Configuration.Transforms[0].ApplyToAllDocuments)
-            {
-                // when ETL script has ApplyToAllDocuments then it extracts docs without
-                // providing collection name to ExtractedItem
-                // it is retrieved from metadata then
-                // let's do the same to ensure we have the same behavior in test mode
-
-                docCollection = null;
-            }
-
-            List<string> debugOutput;
-
-            switch (testScript.Configuration.EtlType)
-            {
-                case EtlType.Sql:
-                    using (var sqlEtl = new SqlEtl(testScript.Configuration.Transforms[0], testScript.Configuration as SqlEtlConfiguration, database, null))
-                    using (sqlEtl.EnterTestMode(out debugOutput))
+                    else
                     {
-                        sqlEtl.EnsureThreadAllocationStats();
-
-                        var transformed = sqlEtl.Transform(new[] {new ToSqlItem(document, docCollection)}, context, new EtlStatsScope(new EtlRunStats()),
-                            new EtlProcessState());
-
-                        Debug.Assert(sqlTestScript != null);
-
-                        var result = sqlEtl.RunTest(context, transformed, sqlTestScript.PerformRolledBackTransaction);
-                        result.DebugOutput = debugOutput;
-
-                        return result;
-                    }
-                case EtlType.Raven:
-                    using (var ravenEtl = new RavenEtl(testScript.Configuration.Transforms[0], testScript.Configuration as RavenEtlConfiguration, database, null))
-                    using (ravenEtl.EnterTestMode(out debugOutput))
-                    {
-                        ravenEtl.EnsureThreadAllocationStats();
-
-                        var results = ravenEtl.Transform(new[] { new RavenEtlItem(document, docCollection) }, context, new EtlStatsScope(new EtlRunStats()),
-                            new EtlProcessState());
-
-                        return new RavenEtlTestScriptResult
+                        if (serverStore.LoadDatabaseRecord(database.Name, out _).SqlConnectionStrings
+                                .TryGetValue(testScript.Configuration.ConnectionStringName, out var sqlConnection) == false)
                         {
-                            TransformationErrors = ravenEtl.Statistics.TransformationErrorsInCurrentBatch.Errors.ToList(),
-                            Commands = results.ToList(),
-                            DebugOutput = debugOutput
-                        };
+                            throw new InvalidOperationException(
+                                $"Connection string named '{testScript.Configuration.ConnectionStringName}' was not found in the database record");
+                        }
+
+                        if (sqlConnection.Validate(ref csErrors) == false)
+                            throw new InvalidOperationException(
+                                $"Invalid '{testScript.Configuration.ConnectionStringName}' connection string due to {string.Join(";", csErrors)}");
+
+                        connection = sqlConnection as TConnectionString;
                     }
-                default:
-                    throw new NotSupportedException($"Unknown ETL type in script test: {testScript.Configuration.EtlType}");
+                }
+
+                testScript.Configuration.Initialize(connection);
+
+                testScript.Configuration.TestMode = true;
+
+                if (testScript.Configuration.Validate(out List<string> errors) == false)
+                {
+                    throw new InvalidOperationException($"Invalid ETL configuration for '{testScript.Configuration.Name}'. " +
+                                                        $"Reason{(errors.Count > 1 ? "s" : string.Empty)}: {string.Join(";", errors)}.");
+                }
+
+                if (testScript.Configuration.Transforms.Count != 1)
+                {
+                    throw new InvalidOperationException($"Invalid number of transformations. You have provided {testScript.Configuration.Transforms.Count} " +
+                                                        "while ETL test expects to get exactly 1 transformation script");
+                }
+
+                var docCollection = database.DocumentsStorage.ExtractCollectionName(context, document.Data).Name;
+
+                if (testScript.Configuration.Transforms[0].ApplyToAllDocuments == false &&
+                    testScript.Configuration.Transforms[0].Collections.Contains(docCollection, StringComparer.OrdinalIgnoreCase) == false)
+                {
+                    throw new InvalidOperationException($"Document '{document.Id}' belongs to {docCollection} collection " +
+                                                        $"while tested ETL script works on the following collections: {string.Join(", ", testScript.Configuration.Transforms[0].Collections)}");
+                }
+
+                if (testScript.Configuration.Transforms[0].ApplyToAllDocuments)
+                {
+                    // when ETL script has ApplyToAllDocuments then it extracts docs without
+                    // providing collection name to ExtractedItem
+                    // it is retrieved from metadata then
+                    // let's do the same to ensure we have the same behavior in test mode
+
+                    docCollection = null;
+                }
+
+                Tombstone tombstone = null;
+
+                if (testScript.IsDelete)
+                {
+                    var deleteResult = database.DocumentsStorage.Delete(context, testScript.DocumentId, null);
+
+                    tombstone = database.DocumentsStorage.GetTombstoneByEtag(context, deleteResult.Value.Etag);
+                }
+
+                List<string> debugOutput;
+
+                switch (testScript.Configuration.EtlType)
+                {
+                    case EtlType.Sql:
+                        using (var sqlEtl = new SqlEtl(testScript.Configuration.Transforms[0], testScript.Configuration as SqlEtlConfiguration, database, null))
+                        using (sqlEtl.EnterTestMode(out debugOutput))
+                        {
+                            sqlEtl.EnsureThreadAllocationStats();
+
+                            var sqlItem = testScript.IsDelete ? new ToSqlItem(tombstone, docCollection) : new ToSqlItem(document, docCollection);
+
+                            var transformed = sqlEtl.Transform(new[] {sqlItem}, context, new EtlStatsScope(new EtlRunStats()),
+                                new EtlProcessState());
+
+                            Debug.Assert(sqlTestScript != null);
+
+                            var result = sqlEtl.RunTest(context, transformed, sqlTestScript.PerformRolledBackTransaction);
+                            result.DebugOutput = debugOutput;
+
+                            return result;
+                        }
+                    case EtlType.Raven:
+                        using (var ravenEtl = new RavenEtl(testScript.Configuration.Transforms[0], testScript.Configuration as RavenEtlConfiguration, database, null))
+                        using (ravenEtl.EnterTestMode(out debugOutput))
+                        {
+                            ravenEtl.EnsureThreadAllocationStats();
+
+                            var ravenEtlItem = testScript.IsDelete ? new RavenEtlItem(tombstone, docCollection, EtlItemType.Document) : new RavenEtlItem(document, docCollection);
+
+                            var results = ravenEtl.Transform(new[] {ravenEtlItem}, context, new EtlStatsScope(new EtlRunStats()),
+                                new EtlProcessState());
+
+                            return new RavenEtlTestScriptResult
+                            {
+                                TransformationErrors = ravenEtl.Statistics.TransformationErrorsInCurrentBatch.Errors.ToList(),
+                                Commands = results.ToList(),
+                                DebugOutput = debugOutput
+                            };
+                        }
+                    default:
+                        throw new NotSupportedException($"Unknown ETL type in script test: {testScript.Configuration.EtlType}");
+                }
             }
         }
 

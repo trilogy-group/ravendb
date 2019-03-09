@@ -24,6 +24,8 @@ namespace Raven.Client.Documents.Queries
 
         public bool IsCustomFunction { get; set; }
 
+        public bool IsMapReduce { get; set; }
+
         public QueryData(string[] fields, IEnumerable<string> projections, string fromAlias = null, DeclareToken declareToken= null, List<LoadToken> loadTokens= null, bool isCustomFunction = false)
         {
             Fields = fields;
@@ -33,7 +35,6 @@ namespace Raven.Client.Documents.Queries
             LoadTokens = loadTokens;
             IsCustomFunction = isCustomFunction;
         }
-
 
         public static QueryData CustomFunction(string alias, string func)
         {

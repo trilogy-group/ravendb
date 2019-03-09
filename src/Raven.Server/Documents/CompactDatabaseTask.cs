@@ -1,15 +1,18 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Configuration;
 using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Raven.Client.Documents.Operations;
+using Raven.Client.ServerWide.Operations;
 using Raven.Server.Config;
 using Raven.Server.Config.Settings;
 using Raven.Server.ServerWide;
 using Raven.Server.Utils;
 using Sparrow;
+using Sparrow.Logging;
 using Voron;
 using Voron.Exceptions;
 using Voron.Impl.Compaction;
@@ -18,6 +21,9 @@ namespace Raven.Server.Documents
 {
     public class CompactDatabaseTask
     {
+        private const string ResourceName = nameof(CompactDatabaseTask);
+        private static readonly Logger Logger = LoggingSource.Instance.GetLogger<CompactDatabaseTask>(ResourceName);
+
         private readonly ServerStore _serverStore;
         private readonly string _database;
         private CancellationToken _token;
@@ -42,17 +48,23 @@ namespace Raven.Server.Documents
             bool done = false;
             string compactDirectory = null;
             string tmpDirectory = null;
-
+            string compactTempDirectory = null;
+            byte[] encryptionKey = null;
             try
             {
                 var documentDatabase = await _serverStore.DatabasesLandlord.TryGetOrCreateResourceStore(_database);
                 var configuration = _serverStore.DatabasesLandlord.CreateDatabaseConfiguration(_database);
 
+                // save the key before unloading the database (it is zeroed when disposing DocumentDatabase). 
+                if (documentDatabase.MasterKey != null)
+                    encryptionKey = documentDatabase.MasterKey.ToArray(); 
+
                 using (await _serverStore.DatabasesLandlord.UnloadAndLockDatabase(_database, "it is being compacted"))
                 using (var src = DocumentsStorage.GetStorageEnvironmentOptionsFromConfiguration(configuration, new IoChangesNotifications(),
                 new CatastrophicFailureNotification((endId, path, exception) => throw new InvalidOperationException($"Failed to compact database {_database} ({path})", exception))))
                 {
-                    InitializeOptions(src, configuration, documentDatabase);
+                    InitializeOptions(src, configuration, documentDatabase, encryptionKey);
+                    DirectoryExecUtils.SubscribeToOnDirectoryInitializeExec(src, configuration.Storage, documentDatabase.Name, DirectoryExecUtils.EnvironmentType.Compaction, Logger);
 
                     var basePath = configuration.Core.DataDirectory.FullPath;
                     compactDirectory = basePath + "-compacting";
@@ -62,11 +74,24 @@ namespace Raven.Server.Documents
 
                     IOExtensions.DeleteDirectory(compactDirectory);
                     IOExtensions.DeleteDirectory(tmpDirectory);
+
                     configuration.Core.DataDirectory = new PathSetting(compactDirectory);
+
+                    if (configuration.Storage.TempPath != null)
+                    {
+                        compactTempDirectory = configuration.Storage.TempPath.FullPath + "-temp-compacting";
+
+                        EnsureDirectoriesPermission(compactTempDirectory);
+                        IOExtensions.DeleteDirectory(compactTempDirectory);
+
+                        configuration.Storage.TempPath = new PathSetting(compactTempDirectory);
+                    }
+
                     using (var dst = DocumentsStorage.GetStorageEnvironmentOptionsFromConfiguration(configuration, new IoChangesNotifications(),
                         new CatastrophicFailureNotification((envId, path, exception) => throw new InvalidOperationException($"Failed to compact database {_database} ({path})", exception))))
                     {
-                        InitializeOptions(dst, configuration, documentDatabase);
+                        InitializeOptions(dst, configuration, documentDatabase, encryptionKey);
+                        DirectoryExecUtils.SubscribeToOnDirectoryInitializeExec(dst, configuration.Storage, documentDatabase.Name, DirectoryExecUtils.EnvironmentType.Compaction, Logger);
 
                         _token.ThrowIfCancellationRequested();
                         StorageCompaction.Execute(src, (StorageEnvironmentOptions.DirectoryStorageEnvironmentOptions)dst, progressReport =>
@@ -102,8 +127,13 @@ namespace Raven.Server.Documents
                 if (done)
                 {
                     IOExtensions.DeleteDirectory(tmpDirectory);
+
+                    if (compactTempDirectory != null)
+                        IOExtensions.DeleteDirectory(compactTempDirectory);
                 }
                 _isCompactionInProgress = false;
+                if (encryptionKey != null)
+                    Sodium.ZeroBuffer(encryptionKey);
             }
         }
 
@@ -126,7 +156,7 @@ namespace Raven.Server.Documents
             }
         }
 
-        private static void InitializeOptions(StorageEnvironmentOptions options, RavenConfiguration configuration, DocumentDatabase documentDatabase)
+        private static void InitializeOptions(StorageEnvironmentOptions options, RavenConfiguration configuration, DocumentDatabase documentDatabase, byte[] key)
         {
             options.ForceUsing32BitsPager = configuration.Storage.ForceUsing32BitsPager;
             options.OnNonDurableFileSystemError += documentDatabase.HandleNonDurableFileSystemError;
@@ -134,12 +164,14 @@ namespace Raven.Server.Documents
             options.CompressTxAboveSizeInBytes = configuration.Storage.CompressTxAboveSize.GetValue(SizeUnit.Bytes);
             options.TimeToSyncAfterFlashInSec = (int)configuration.Storage.TimeToSyncAfterFlash.AsTimeSpan.TotalSeconds;
             options.NumOfConcurrentSyncsPerPhysDrive = configuration.Storage.NumberOfConcurrentSyncsPerPhysicalDrive;
-            options.MasterKey = documentDatabase.MasterKey?.ToArray(); // clone 
+            options.MasterKey = key?.ToArray(); // clone 
             options.DoNotConsiderMemoryLockFailureAsCatastrophicError = documentDatabase.Configuration.Security.DoNotConsiderMemoryLockFailureAsCatastrophicError;
             if (configuration.Storage.MaxScratchBufferSize.HasValue)
                 options.MaxScratchBufferSize = configuration.Storage.MaxScratchBufferSize.Value.GetValue(SizeUnit.Bytes);
             options.PrefetchSegmentSize = configuration.Storage.PrefetchBatchSize.GetValue(SizeUnit.Bytes);
             options.PrefetchResetThreshold = configuration.Storage.PrefetchResetThreshold.GetValue(SizeUnit.Bytes);
+            options.SyncJournalsCountThreshold = documentDatabase.Configuration.Storage.SyncJournalsCountThreshold;
+            options.SkipChecksumValidationOnDatabaseLoading = documentDatabase.Configuration.Storage.SkipChecksumValidationOnDatabaseLoading;
         }
 
         private static void SwitchDatabaseDirectories(string basePath, string backupDirectory, string compactDirectory)

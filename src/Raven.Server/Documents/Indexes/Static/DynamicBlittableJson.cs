@@ -18,9 +18,10 @@ namespace Raven.Server.Documents.Indexes.Static
         private const int MetadataHasValueIndex = 2;
         private const int MetadataKeyIndex = 3;
         private const int MetadataIdIndex = 4;
-        private const int MetadataEtagIndex = 5;
+        private const int MetadataChangeVectorIndex = 5;
         private const int MetadataLastModifiedIndex = 6;
         private const int CountIndex = 7;
+        private const int MetadataEtagIndex = 8;
 
         private static readonly CompareKey[] PrecomputedTable;
 
@@ -35,7 +36,8 @@ namespace Raven.Server.Documents.Indexes.Static
                 new CompareKey(Constants.Documents.Metadata.Id, 1),
                 new CompareKey(Constants.Documents.Metadata.ChangeVector, 1),
                 new CompareKey(Constants.Documents.Metadata.LastModified, 1),
-                new CompareKey("Count", 2)
+                new CompareKey("Count", 2),
+                new CompareKey(Constants.Documents.Metadata.Etag, 1),
             };
         }
 
@@ -116,6 +118,8 @@ namespace Raven.Server.Documents.Indexes.Static
                 getResult = true;
                 if (FastCompare(name, MetadataIdIndex))
                     result = _doc.Id;
+                else if (FastCompare(name, MetadataChangeVectorIndex))
+                    result = _doc.ChangeVector;
                 else if (FastCompare(name, MetadataEtagIndex))
                     result = _doc.Etag;
                 else if (FastCompare(name, MetadataLastModifiedIndex))
@@ -195,9 +199,54 @@ namespace Raven.Server.Documents.Indexes.Static
             return new DynamicArray(Enumerable.Select(this, func));
         }
 
+        public IEnumerable<object> Where(Func<object, bool> predicate)
+        {
+            return new DynamicArray(Enumerable.Where(this, predicate));
+        }
+
         public IEnumerable<object> OrderBy(Func<object, object> func)
         {
             return new DynamicArray(Enumerable.OrderBy(this, func));
+        }
+
+        public IEnumerable<object> OrderByDescending(Func<object, object> func)
+        {
+            return new DynamicArray(Enumerable.OrderByDescending(this, func));
+        }
+
+        public IEnumerable<object> Take(int count)
+        {
+            return new DynamicArray(Enumerable.Take(this, count));
+        }
+
+        public IEnumerable<object> Skip(int count)
+        {
+            return new DynamicArray(Enumerable.Skip(this, count));
+        }
+
+        public IEnumerable<object> Reverse()
+        {
+            return new DynamicArray(Enumerable.Reverse(this));
+        }
+
+        public dynamic DefaultIfEmpty(object defaultValue = null)
+        {
+            return Enumerable.DefaultIfEmpty(this, defaultValue ?? DynamicNullObject.Null);
+        }
+
+        public dynamic GroupBy(Func<dynamic, dynamic> keySelector)
+        {
+            return new DynamicArray(Enumerable.GroupBy(this, keySelector).Select(x => new DynamicArray.DynamicGrouping(x)));
+        }
+
+        public dynamic GroupBy(Func<dynamic, dynamic> keySelector, Func<dynamic, dynamic> selector)
+        {
+            return new DynamicArray(Enumerable.GroupBy(this, keySelector, selector).Select(x => new DynamicArray.DynamicGrouping(x)));
+        }
+
+        public IEnumerable<object> OfType<T>()
+        {
+            return new DynamicArray(Enumerable.OfType<T>(this));
         }
 
         public override string ToString()

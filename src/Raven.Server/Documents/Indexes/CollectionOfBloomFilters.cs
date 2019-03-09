@@ -195,13 +195,18 @@ namespace Raven.Server.Documents.Indexes
             AddFilter(CreateNewFilter(_filters.Length, _mode));
         }
 
-        public void Dispose()
+        public void Flush()
         {
             if (_filters == null || _filters.Length == 0)
                 return;
 
             foreach (var filter in _filters)
-                filter.Dispose();
+                filter.Flush();
+        }
+
+        public void Dispose()
+        {
+
         }
 
         public class BloomFilter32 : BloomFilter
@@ -385,7 +390,7 @@ namespace Raven.Server.Documents.Indexes
                 using (_tree.DirectAdd(partition.Key, Partition.PartitionSize, out byte* ptr))
                 {
                     if (partition.IsEmpty == false)
-                        UnmanagedMemory.Copy(ptr, partition.Ptr, Partition.PartitionSize);
+                        Memory.Copy(ptr, partition.Ptr, Partition.PartitionSize);
 
                     partition.Writable = true;
                     partition.IsEmpty = false;
@@ -424,7 +429,7 @@ namespace Raven.Server.Documents.Indexes
                 partition.Ptr[ptrPosition] |= (byte)(1 << bitPosition);
             }
 
-            public void Dispose()
+            public void Flush()
             {
                 if (Count == _initialCount)
                     return;
@@ -433,6 +438,11 @@ namespace Raven.Server.Documents.Indexes
                     return; // avoid re-throwing it
 
                 _tree.Increment(_keySlice, Count - _initialCount);
+            }
+
+            public void Dispose()
+            {
+
             }
 
             private class Partition

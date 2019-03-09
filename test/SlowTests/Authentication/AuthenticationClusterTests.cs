@@ -6,6 +6,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Security.Cryptography.X509Certificates;
 using System.Threading;
@@ -77,7 +78,7 @@ namespace SlowTests.Authentication
                     await session.SaveChangesAsync();
                 }
 
-                var certBytes = CertificateUtils.CreateSelfSignedCertificate(Environment.MachineName, "RavenTestsServerReplacementCert");
+                var certBytes = CertificateUtils.CreateSelfSignedTestCertificate(Environment.MachineName, "RavenTestsServerReplacementCert");
                 var newServerCert = new X509Certificate2(certBytes, (string)null, X509KeyStorageFlags.Exportable | X509KeyStorageFlags.PersistKeySet | X509KeyStorageFlags.MachineKeySet);
 
                 var mre = new ManualResetEventSlim();
@@ -92,10 +93,8 @@ namespace SlowTests.Authentication
 
                     requestExecutor.Execute(command, context);
                 }
-
-                Assert.True(mre.Wait(5000));
-
-                Assert.True(leader.Certificate.Certificate.Thumbprint.Equals(newServerCert.Thumbprint));
+                Assert.True(mre.Wait(Debugger.IsAttached ? TimeSpan.FromMinutes(10) : TimeSpan.FromMinutes(2)), "Waited too long");
+                Assert.True(leader.Certificate.Certificate.Thumbprint.Equals(newServerCert.Thumbprint), "New cert is identical");
 
                 using (var session = store.OpenSession())
                 {

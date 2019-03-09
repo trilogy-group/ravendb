@@ -8,8 +8,10 @@ using System.Threading;
 using System.Threading.Tasks;
 using Raven.Client.Documents.Changes;
 using Raven.Client.Documents.Subscriptions;
+using Raven.Client.Exceptions;
 using Raven.Client.Exceptions.Cluster;
 using Raven.Client.Exceptions.Documents.Subscriptions;
+using Raven.Client.ServerWide.Tcp;
 using Raven.Client.Util;
 using Raven.Server.Documents.Includes;
 using Raven.Server.Documents.Queries;
@@ -17,6 +19,7 @@ using Raven.Server.Documents.Queries.AST;
 using Raven.Server.Documents.Replication;
 using Raven.Server.Documents.Subscriptions;
 using Raven.Server.Json;
+using Raven.Server.Rachis;
 using Raven.Server.ServerWide.Context;
 using Raven.Server.Utils;
 using Sparrow;
@@ -70,9 +73,8 @@ namespace Raven.Server.Documents.TcpHandlers
             _tcpConnectionDisposable = tcpConnectionDisposable;
             ClientUri = connectionOptions.TcpClient.Client.RemoteEndPoint.ToString();
             _logger = LoggingSource.Instance.GetLogger<SubscriptionConnection>(connectionOptions.DocumentDatabase.Name);
-            CancellationTokenSource =
-                CancellationTokenSource.CreateLinkedTokenSource(TcpConnection.DocumentDatabase.DatabaseShutdown);
-
+            CancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(TcpConnection.DocumentDatabase.DatabaseShutdown);
+            _supportedFeatures = TcpConnectionHeaderMessage.GetSupportedFeaturesFor(TcpConnectionHeaderMessage.OperationTypes.Subscription, connectionOptions.ProtocolVersion);
             _waitForMoreDocuments = new AsyncManualResetEvent(CancellationTokenSource.Token);
             Stats = new SubscriptionConnectionStats();
 
@@ -120,6 +122,13 @@ namespace Raven.Server.Documents.TcpHandlers
             // first, validate details and make sure subscription exists
             SubscriptionState = await TcpConnection.DocumentDatabase.SubscriptionStorage.AssertSubscriptionConnectionDetails(SubscriptionId, _options.SubscriptionName);
 
+            if (_supportedFeatures.Subscription.Includes == false)
+            {
+                Subscription = ParseSubscriptionQuery(SubscriptionState.Query);
+                if (Subscription.Includes != null && Subscription.Includes.Length > 0)
+                    throw new SubscriptionInvalidStateException($"Subscription with ID '{SubscriptionId}' cannot be opened because it requires the protocol to support Includes.");
+            }
+
             _connectionState = TcpConnection.DocumentDatabase.SubscriptionStorage.OpenSubscription(this);
             var timeout = TimeSpan.FromMilliseconds(16);
 
@@ -144,8 +153,6 @@ namespace Raven.Server.Documents.TcpHandlers
                     shouldRetry = true;
                 }
             } while (shouldRetry);
-
-
 
             // refresh subscription data (change vector may have been updated, because in the meanwhile, another subscription could have just completed a batch)            
             SubscriptionState = await TcpConnection.DocumentDatabase.SubscriptionStorage.AssertSubscriptionConnectionDetails(SubscriptionId, _options.SubscriptionName);
@@ -354,7 +361,7 @@ namespace Raven.Server.Documents.TcpHandlers
                         [nameof(SubscriptionConnectionServerMessage.Exception)] = ex.ToString()
                     });
                 }
-                else if (ex is CommandExecutionException commandExecution && commandExecution.InnerException is SubscriptionException)
+                else if (ex is RachisApplyException commandExecution && commandExecution.InnerException is SubscriptionException)
                 {
                     await ReportExceptionToClient(connection, commandExecution.InnerException, recursionDepth - 1);
                 }
@@ -455,6 +462,7 @@ namespace Raven.Server.Documents.TcpHandlers
         private SubscriptionDocumentsFetcher _documentsFetcher;
         private readonly IDisposable _tcpConnectionDisposable;
         private readonly (IDisposable ReleaseBuffer, JsonOperationContext.ManagedPinnedBuffer Buffer) _copiedBuffer;
+        private readonly TcpConnectionHeaderMessage.SupportedFeatures _supportedFeatures;
 
         private async Task ProcessSubscriptionAsync()
         {
@@ -479,46 +487,49 @@ namespace Raven.Server.Documents.TcpHandlers
                 {
                     _buffer.SetLength(0);
 
-                    using (TcpConnection.DocumentDatabase.DocumentsStorage.ContextPool.AllocateOperationContext(out DocumentsOperationContext docsContext))
+                    using (this.TcpConnection.DocumentDatabase.DatabaseInUse(false))
                     {
-                        var sendingCurrentBatchStopwatch = Stopwatch.StartNew();
-
-                        var anyDocumentsSentInCurrentIteration = await TrySendingBatchToClient(docsContext, sendingCurrentBatchStopwatch);
-
-                        if (anyDocumentsSentInCurrentIteration == false)
+                        using (TcpConnection.DocumentDatabase.DocumentsStorage.ContextPool.AllocateOperationContext(out DocumentsOperationContext docsContext))
                         {
-                            if (_logger.IsInfoEnabled)
+                            var sendingCurrentBatchStopwatch = Stopwatch.StartNew();
+
+                            var anyDocumentsSentInCurrentIteration = await TrySendingBatchToClient(docsContext, sendingCurrentBatchStopwatch);
+
+                            if (anyDocumentsSentInCurrentIteration == false)
                             {
-                                _logger.Info(
-                                    $"Did not find any documents to send for subscription {Options.SubscriptionName}");
-                            }
+                                if (_logger.IsInfoEnabled)
+                                {
+                                    _logger.Info(
+                                        $"Did not find any documents to send for subscription {Options.SubscriptionName}");
+                                }
 
-                            await TcpConnection.DocumentDatabase.SubscriptionStorage.AcknowledgeBatchProcessed(SubscriptionId,
-                                Options.SubscriptionName,
-                                // if this is a new subscription that we sent anything in this iteration, 
-                                // _lastChangeVector is null, so let's not change it
-                                _lastChangeVector ??
-                                    nameof(Client.Constants.Documents.SubscriptionChangeVectorSpecialStates.DoNotChange),
-                                subscriptionChangeVectorBeforeCurrentBatch);
+                                await TcpConnection.DocumentDatabase.SubscriptionStorage.AcknowledgeBatchProcessed(SubscriptionId,
+                                    Options.SubscriptionName,
+                                    // if this is a new subscription that we sent anything in this iteration, 
+                                    // _lastChangeVector is null, so let's not change it
+                                    _lastChangeVector ??
+                                        nameof(Client.Constants.Documents.SubscriptionChangeVectorSpecialStates.DoNotChange),
+                                    subscriptionChangeVectorBeforeCurrentBatch);
 
 
-                            subscriptionChangeVectorBeforeCurrentBatch = _lastChangeVector ?? SubscriptionState.ChangeVectorForNextBatchStartingPoint;
+                                subscriptionChangeVectorBeforeCurrentBatch = _lastChangeVector ?? SubscriptionState.ChangeVectorForNextBatchStartingPoint;
 
-                            if (sendingCurrentBatchStopwatch.ElapsedMilliseconds > 1000)
-                                await SendHeartBeat();
+                                if (sendingCurrentBatchStopwatch.ElapsedMilliseconds > 1000)
+                                    await SendHeartBeat();
 
-                            using (docsContext.OpenReadTransaction())
-                            {
-                                long globalEtag = TcpConnection.DocumentDatabase.DocumentsStorage.GetLastDocumentEtag(docsContext, Subscription.Collection);
+                                using (docsContext.OpenReadTransaction())
+                                {
+                                    long globalEtag = TcpConnection.DocumentDatabase.DocumentsStorage.GetLastDocumentEtag(docsContext, Subscription.Collection);
 
-                                if (globalEtag > _startEtag)
+                                    if (globalEtag > _startEtag)
+                                        continue;
+                                }
+
+                                AssertCloseWhenNoDocsLeft();
+
+                                if (await WaitForChangedDocuments(replyFromClientTask))
                                     continue;
                             }
-
-                            AssertCloseWhenNoDocsLeft();
-
-                            if (await WaitForChangedDocuments(replyFromClientTask))
-                                continue;
                         }
                     }
 
@@ -615,11 +626,14 @@ namespace Raven.Server.Documents.TcpHandlers
             {
                 using (docsContext.OpenReadTransaction())
                 {
-                    var includeCmd = new IncludeDocumentsCommand(TcpConnection.DocumentDatabase.DocumentsStorage,
-                                docsContext, Subscription.Includes);
-                   
+                    IncludeDocumentsCommand includeCmd = null;
+                    if (_supportedFeatures.Subscription.Includes)
+                        includeCmd = new IncludeDocumentsCommand(TcpConnection.DocumentDatabase.DocumentsStorage, docsContext, Subscription.Includes, isProjection: _filterAndProjectionScript != null);
+
                     foreach (var result in _documentsFetcher.GetDataToSend(docsContext, includeCmd, _startEtag))
                     {
+                        CancellationTokenSource.Token.ThrowIfCancellationRequested();
+
                         _startEtag = result.Doc.Etag;
                         _lastChangeVector = string.IsNullOrEmpty(SubscriptionState.ChangeVectorForNextBatchStartingPoint)
                             ? result.Doc.ChangeVector

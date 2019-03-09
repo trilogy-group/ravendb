@@ -236,6 +236,9 @@ namespace Raven.Server.Documents
                 options.MaxScratchBufferSize = DocumentDatabase.Configuration.Storage.MaxScratchBufferSize.Value.GetValue(SizeUnit.Bytes);
             options.PrefetchSegmentSize = DocumentDatabase.Configuration.Storage.PrefetchBatchSize.GetValue(SizeUnit.Bytes);
             options.PrefetchResetThreshold = DocumentDatabase.Configuration.Storage.PrefetchResetThreshold.GetValue(SizeUnit.Bytes);
+            options.SyncJournalsCountThreshold = DocumentDatabase.Configuration.Storage.SyncJournalsCountThreshold;
+            options.IgnoreInvalidJournalErrors = DocumentDatabase.Configuration.Storage.IgnoreInvalidJournalErrors;
+            options.SkipChecksumValidationOnDatabaseLoading = DocumentDatabase.Configuration.Storage.SkipChecksumValidationOnDatabaseLoading;
 
             try
             {
@@ -273,8 +276,10 @@ namespace Raven.Server.Documents
             options.SchemaUpgrader = SchemaUpgrader.Upgrader(SchemaUpgrader.StorageType.Documents, null, this);
             try
             {
+                DirectoryExecUtils.SubscribeToOnDirectoryInitializeExec(options, DocumentDatabase.Configuration.Storage, DocumentDatabase.Name, DirectoryExecUtils.EnvironmentType.Database, _logger);
+
                 ContextPool = new DocumentsContextPool(DocumentDatabase);
-                Environment = LayoutUpdater.OpenEnvironment(options);
+                Environment = StorageLoader.OpenEnvironment(options, StorageEnvironmentWithType.StorageEnvironmentType.Documents);
 
                 using (var tx = Environment.WriteTransaction())
                 {
@@ -339,14 +344,31 @@ namespace Raven.Server.Documents
             return Encodings.Utf8.GetString(val.Reader.Base, val.Reader.Length);
         }
 
+        public string CreateNextDatabaseChangeVector(DocumentsOperationContext context, string changeVector)
+        {
+            var databaseChangeVector = context.LastDatabaseChangeVector ?? GetDatabaseChangeVector(context);
+            changeVector = ChangeVectorUtils.MergeVectors(databaseChangeVector, changeVector);
+            return ChangeVectorUtils.TryUpdateChangeVector(DocumentDatabase, changeVector).ChangeVector;
+        }
+
         public string GetNewChangeVector(DocumentsOperationContext context, long newEtag)
         {
-            var changeVector = GetDatabaseChangeVector(context);
-            if (string.IsNullOrEmpty(changeVector))
-                return ChangeVectorUtils.NewChangeVector(DocumentDatabase.ServerStore.NodeTag, newEtag, DocumentDatabase.DbBase64Id);
+            var changeVector = context.LastDatabaseChangeVector ??
+                               (context.LastDatabaseChangeVector = GetDatabaseChangeVector(context));
 
-            var result = ChangeVectorUtils.TryUpdateChangeVector(DocumentDatabase.ServerStore.NodeTag, Environment.Base64Id, newEtag, changeVector);
-            return result.ChangeVector;
+            if (string.IsNullOrEmpty(changeVector))
+            {
+                context.LastDatabaseChangeVector = ChangeVectorUtils.NewChangeVector(DocumentDatabase, newEtag);
+                return context.LastDatabaseChangeVector;
+            }
+
+            var result = ChangeVectorUtils.TryUpdateChangeVector(DocumentDatabase, changeVector, newEtag);
+            if (result.IsValid)
+            {
+                context.LastDatabaseChangeVector = result.ChangeVector;
+            }
+
+            return context.LastDatabaseChangeVector;
         }
 
         public string GetNewChangeVector(DocumentsOperationContext context)
@@ -356,10 +378,28 @@ namespace Raven.Server.Documents
 
         public static void SetDatabaseChangeVector(DocumentsOperationContext context, string changeVector)
         {
+            ThrowOnNotUpdatedChangeVector(context, changeVector);
+
             var tree = context.Transaction.InnerTransaction.ReadTree(GlobalTreeSlice);
             using (Slice.From(context.Allocator, changeVector, out var slice))
             {
                 tree.Add(GlobalChangeVectorSlice, slice);
+            }
+        }
+
+        [Conditional("DEBUG")]
+        private static void ThrowOnNotUpdatedChangeVector(DocumentsOperationContext context, string changeVector)
+        {
+            var globalChangeVector = GetDatabaseChangeVector(context);
+
+            if (globalChangeVector != changeVector && 
+                globalChangeVector != null &&
+                globalChangeVector.ToChangeVector().OrderByDescending(x => x).SequenceEqual(changeVector.ToChangeVector().OrderByDescending(x => x)) == false && 
+                ChangeVectorUtils.GetConflictStatus(changeVector, globalChangeVector) != ConflictStatus.Update)
+            {
+                throw new InvalidOperationException($"Global Change Vector wasn't updated correctly. " +
+                                                    $"Conflict status: {ChangeVectorUtils.GetConflictStatus(changeVector, globalChangeVector)}, " + System.Environment.NewLine +
+                                                    $"Current global Change Vector: {globalChangeVector}, New Change Vector: {changeVector}");
             }
         }
 
@@ -737,12 +777,12 @@ namespace Raven.Server.Documents
             }
         }
 
-        public Document Get(DocumentsOperationContext context, Slice lowerId, bool throwOnConflict = true)
+        public Document Get(DocumentsOperationContext context, Slice lowerId, bool throwOnConflict = true, bool skipValidationInDebug = false)
         {
             if (GetTableValueReaderForDocument(context, lowerId, throwOnConflict, out TableValueReader tvr) == false)
                 return null;
 
-            var doc = TableValueToDocument(context, ref tvr);
+            var doc = TableValueToDocument(context, ref tvr, skipValidationInDebug);
 
             context.DocumentDatabase.HugeDocuments.AddIfDocIsHuge(doc);
 
@@ -804,6 +844,7 @@ namespace Raven.Server.Documents
                 return (tvr.Size, allocated);
             }
         }
+
         public bool GetTableValueReaderForDocument(DocumentsOperationContext context, Slice lowerId, bool throwOnConflict, out TableValueReader tvr)
         {
             var table = new Table(DocsSchema, context.Transaction.InnerTransaction);
@@ -995,27 +1036,18 @@ namespace Raven.Server.Documents
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static Document TableValueToDocument(DocumentsOperationContext context, ref TableValueReader tvr)
+        private static Document TableValueToDocument(DocumentsOperationContext context, ref TableValueReader tvr, bool skipValidationInDebug = false)
         {
             var document = ParseDocument(context, ref tvr);
 #if DEBUG
-            DebugDisposeReaderAfterTransaction(context.Transaction, document.Data);
-            DocumentPutAction.AssertMetadataWasFiltered(document.Data);
-            AttachmentsStorage.AssertAttachments(document.Data, document.Flags);
+            if (skipValidationInDebug == false)
+            {
+                Transaction.DebugDisposeReaderAfterTransaction(context.Transaction.InnerTransaction, document.Data);
+                DocumentPutAction.AssertMetadataWasFiltered(document.Data);
+                AttachmentsStorage.AssertAttachments(document.Data, document.Flags);
+            } 
 #endif
             return document;
-        }
-
-        [Conditional("DEBUG")]
-        public static void DebugDisposeReaderAfterTransaction(DocumentsTransaction tx, BlittableJsonReaderObject reader)
-        {
-            if (reader == null)
-                return;
-            Debug.Assert(tx != null);
-            // this method is called to ensure that after the transaction is completed, all the readers are disposed
-            // so we won't have read-after-tx use scenario, which can in rare case corrupt memory. This is a debug
-            // helper that is used across the board, but it is meant to assert stuff during debug only
-            tx.InnerTransaction.LowLevelTransaction.OnDispose += state => reader.Dispose();
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -1081,12 +1113,12 @@ namespace Raven.Server.Documents
             return result;
         }
 
-        public DeleteOperationResult? Delete(DocumentsOperationContext context, string id, string expectedChangeVector, string changeVector = null)
+        public DeleteOperationResult? Delete(DocumentsOperationContext context, string id, string expectedChangeVector)
         {
             using (DocumentIdWorker.GetSliceFromId(context, id, out Slice lowerId))
             using (var cv = context.GetLazyString(expectedChangeVector))
             {
-                return Delete(context, lowerId, id, expectedChangeVector: cv, changeVector: changeVector);
+                return Delete(context, lowerId, id, expectedChangeVector: cv);
             }
         }
 
@@ -1140,7 +1172,8 @@ namespace Raven.Server.Documents
                     local.Tombstone.ChangeVector,
                     modifiedTicks,
                     changeVector,
-                    flags).Etag;
+                    flags, 
+                    nonPersistentFlags).Etag;
 
                 EnsureLastEtagIsPersisted(context, etag);
 
@@ -1171,7 +1204,7 @@ namespace Raven.Server.Documents
                 if (expectedChangeVector != null && doc.ChangeVector.CompareTo(expectedChangeVector) != 0)
                 {
                     throw new ConcurrencyException(
-                        $"Document {lowerId} has etag {doc.Etag}, but Delete was called with change vector '{expectedChangeVector}'. " +
+                        $"Document {id} has change vector {doc.ChangeVector}, but Delete was called with change vector '{expectedChangeVector}'. " +
                         "Optimistic concurrency violation, transaction will be aborted.")
                     {
                         ActualChangeVector = doc.ChangeVector,
@@ -1187,11 +1220,20 @@ namespace Raven.Server.Documents
                 var flags = TableValueToFlags((int)DocumentsTable.Flags, ref tvr).Strip(DocumentFlags.FromClusterTransaction) | documentFlags;
 
                 long etag;
-                using (TableValueToSlice(context, (int)DocumentsTable.LowerId, ref tvr, out Slice tombstone))
+                using (TableValueToSlice(context, (int)DocumentsTable.LowerId, ref tvr, out Slice tombstoneId))
                 {
-                    var tombstoneEtag = CreateTombstone(context, tombstone, doc.Etag, collectionName, doc.ChangeVector, modifiedTicks, changeVector, flags);
-                    changeVector = tombstoneEtag.ChangeVector;
-                    etag = tombstoneEtag.Etag;
+                    var tombstone = CreateTombstone(
+                        context, 
+                        tombstoneId, 
+                        doc.Etag, 
+                        collectionName, 
+                        doc.ChangeVector, 
+                        modifiedTicks, 
+                        changeVector, 
+                        flags, 
+                        nonPersistentFlags);
+                    changeVector = tombstone.ChangeVector;
+                    etag = tombstone.Etag;
                 }
 
                 EnsureLastEtagIsPersisted(context, etag);
@@ -1250,10 +1292,11 @@ namespace Raven.Server.Documents
                     lowerId,
                     GenerateNextEtagForReplicatedTombstoneMissingDocument(context),
                     collectionName,
-                    changeVector,
-                    DateTime.UtcNow.Ticks,
                     null,
-                    documentFlags).Etag;
+                    DateTime.UtcNow.Ticks,
+                    changeVector,
+                    documentFlags,
+                    nonPersistentFlags).Etag;
 
                 return new DeleteOperationResult
                 {
@@ -1285,7 +1328,7 @@ namespace Raven.Server.Documents
         }
 
         // Note: Make sure to call this with a separator, so you won't delete "users/11" for "users/1"
-        public List<DeleteOperationResult> DeleteDocumentsStartingWith(DocumentsOperationContext context, string prefix, string changeVector = null)
+        public List<DeleteOperationResult> DeleteDocumentsStartingWith(DocumentsOperationContext context, string prefix)
         {
             var deleteResults = new List<DeleteOperationResult>();
 
@@ -1303,7 +1346,7 @@ namespace Raven.Server.Documents
                         hasMore = true;
                         var id = TableValueToId(context, (int)DocumentsTable.Id, ref holder.Value.Reader);
 
-                        var deleteOperationResult = Delete(context, id, null, changeVector: changeVector);
+                        var deleteOperationResult = Delete(context, id, null);
                         if (deleteOperationResult != null)
                             deleteResults.Add(deleteOperationResult.Value);
                     }
@@ -1338,19 +1381,20 @@ namespace Raven.Server.Documents
                 etagTree.Add(LastEtagSlice, etagSlice);
         }
 
-        public (long Etag, string ChangeVector) CreateTombstone(
-            DocumentsOperationContext context,
+        public (long Etag, string ChangeVector) CreateTombstone(DocumentsOperationContext context,
             Slice lowerId,
             long documentEtag,
             CollectionName collectionName,
             string docChangeVector,
             long lastModifiedTicks,
             string changeVector,
-            DocumentFlags flags)
+            DocumentFlags flags, 
+            NonPersistentDocumentFlags nonPersistentFlags)
         {
             var newEtag = GenerateNextEtag();
 
-            if (string.IsNullOrEmpty(changeVector))
+            if (string.IsNullOrEmpty(changeVector) && 
+                nonPersistentFlags.Contain(NonPersistentDocumentFlags.FromReplication) == false)
             {
                 changeVector = ConflictsStorage.GetMergedConflictChangeVectorsAndDeleteConflicts(
                     context,
@@ -1360,6 +1404,11 @@ namespace Raven.Server.Documents
 
                 if (string.IsNullOrEmpty(changeVector))
                     ChangeVectorUtils.ThrowConflictingEtag(lowerId.ToString(), docChangeVector, newEtag, Environment.Base64Id, DocumentDatabase.ServerStore.NodeTag);
+
+                if (context.LastDatabaseChangeVector == null)
+                    context.LastDatabaseChangeVector = GetDatabaseChangeVector(context);
+
+                changeVector = ChangeVectorUtils.MergeVectors(context.LastDatabaseChangeVector, changeVector);
 
                 context.LastDatabaseChangeVector = changeVector;
             }

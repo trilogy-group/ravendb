@@ -9,11 +9,13 @@ using System.Net.Http;
 using System.Net.WebSockets;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Lucene.Net.Search;
 using NCrontab.Advanced.Extensions;
 using Raven.Client;
+using Raven.Client.Documents.Changes;
 using Raven.Client.Documents.Operations.ConnectionStrings;
 using Raven.Client.Documents.Operations.ETL;
 using Raven.Client.Documents.Operations.OngoingTasks;
@@ -33,6 +35,7 @@ using Raven.Server.Commercial;
 using Raven.Server.Config;
 using Raven.Server.Dashboard;
 using Raven.Server.Documents;
+using Raven.Server.Documents.Indexes;
 using Raven.Server.Documents.Operations;
 using Raven.Server.Documents.TcpHandlers;
 using Raven.Server.Json;
@@ -80,7 +83,7 @@ namespace Raven.Server.ServerWide
 
         public CancellationToken ServerShutdown => _shutdownNotification.Token;
 
-        private StorageEnvironment _env;
+        internal StorageEnvironment _env;
 
         private readonly NotificationsStorage _notificationsStorage;
         private readonly OperationsStorage _operationsStorage;
@@ -95,6 +98,9 @@ namespace Raven.Server.ServerWide
         public readonly LicenseManager LicenseManager;
         public readonly FeedbackSender FeedbackSender;
         public readonly SecretProtection Secrets;
+        public readonly AsyncManualResetEvent InitializationCompleted;
+        public readonly GlobalIndexingScratchSpaceMonitor GlobalIndexingScratchSpaceMonitor;
+        public bool Initialized;
 
         private readonly TimeSpan _frequencyToCheckForIdleDatabases;
 
@@ -115,7 +121,7 @@ namespace Raven.Server.ServerWide
 
             _notificationsStorage = new NotificationsStorage(ResourceName);
 
-            NotificationCenter = new NotificationCenter.NotificationCenter(_notificationsStorage, null, ServerShutdown);
+            NotificationCenter = new NotificationCenter.NotificationCenter(_notificationsStorage, null, ServerShutdown, configuration);
 
             ServerDashboardNotifications = new ServerDashboardNotifications(this, ServerShutdown);
 
@@ -130,6 +136,11 @@ namespace Raven.Server.ServerWide
             DatabaseInfoCache = new DatabaseInfoCache();
 
             Secrets = new SecretProtection(configuration.Security);
+
+            InitializationCompleted = new AsyncManualResetEvent(_shutdownNotification.Token);
+
+            if (Configuration.Indexing.GlobalScratchSpaceLimit != null)
+                GlobalIndexingScratchSpaceMonitor = new GlobalIndexingScratchSpaceMonitor(Configuration.Indexing.GlobalScratchSpaceLimit.Value);
 
             _frequencyToCheckForIdleDatabases = Configuration.Databases.FrequencyToCheckForIdle.AsTimeSpan;
 
@@ -172,6 +183,9 @@ namespace Raven.Server.ServerWide
         public ClusterMaintenanceSupervisor ClusterMaintenanceSupervisor;
         private int _serverCertificateChanged;
 
+        private PoolOfThreads.LongRunningWork _clusterMaintenanceSetupTask;
+        private PoolOfThreads.LongRunningWork _updateTopologyChangeNotification;
+
         public Dictionary<string, ClusterNodeStatusReport> ClusterStats()
         {
             if (_engine.LeaderTag != NodeTag)
@@ -179,121 +193,158 @@ namespace Raven.Server.ServerWide
             return ClusterMaintenanceSupervisor?.GetStats();
         }
 
-        public async Task UpdateTopologyChangeNotification()
+        public void UpdateTopologyChangeNotification()
         {
-            var delay = 500;
-            while (ServerShutdown.IsCancellationRequested == false)
+            try
             {
-                await _engine.WaitForState(RachisState.Follower, ServerShutdown);
-                if (ServerShutdown.IsCancellationRequested)
-                    return;
-
-                try
+                var delay = 500;
+                while (ServerShutdown.IsCancellationRequested == false)
                 {
+                    Task leaderChangedTask = null;
                     using (var cts = CancellationTokenSource.CreateLinkedTokenSource(ServerShutdown))
                     {
-                        var leaderChangedTask = _engine.WaitForLeaderChange(cts.Token);
-                        if (await Task.WhenAny(NotificationCenter.WaitForAnyWebSocketClient, leaderChangedTask).WithCancellation(ServerShutdown) == leaderChangedTask)
+                        try
                         {
-                            continue;
-                        }
+                            _engine.WaitForState(RachisState.Follower, cts.Token).Wait(cts.Token);
+                            if (cts.IsCancellationRequested)
+                                return;
 
-                        var cancelTask = Task.WhenAny(NotificationCenter.WaitForRemoveAllWebSocketClients, leaderChangedTask)
-                            .ContinueWith(state =>
+                            leaderChangedTask = _engine.WaitForLeaderChange(cts.Token);
+                            if (Task.WaitAny(new[] { NotificationCenter.WaitForAnyWebSocketClient, leaderChangedTask }, cts.Token) == 1)
                             {
-                                try
-                                {
-                                    // ReSharper disable once AccessToDisposedClosure
-                                    cts.Cancel();
-                                }
-                                catch
-                                {
-                                    // ignored
-                                }
-                            }, ServerShutdown);
+                                // leaderChangedTask has completed
+                                continue;
+                            }
 
-                        while (cancelTask.IsCompleted == false)
-                        {
-                            var topology = GetClusterTopology();
-                            var leaderUrl = topology.GetUrlFromTag(_engine.LeaderTag);
-                            if (leaderUrl == null)
-                                break; // will continue from the top of the loop
+                            var cancelTask = Task.WhenAny(NotificationCenter.WaitForRemoveAllWebSocketClients, leaderChangedTask);
 
-                            if (IsLeader())
-                                break;
-
-                            using (var ws = new ClientWebSocket())
-                            using (ContextPool.AllocateOperationContext(out JsonOperationContext context))
+                            while (cancelTask.IsCompleted == false)
                             {
-                                var leaderWsUrl = new Uri($"{leaderUrl.Replace("http", "ws", StringComparison.OrdinalIgnoreCase)}/server/notification-center/watch");
+                                var topology = GetClusterTopology();
+                                var leader = _engine.LeaderTag;
+                                if (leader == null || leader == _engine.Tag)
+                                    break;
 
-                                if (Server.Certificate?.Certificate != null)
+                                var leaderUrl = topology.GetUrlFromTag(leader);
+                                if (leaderUrl == null)
+                                    break; // will continue from the top of the loop
+
+                                using (var ws = new ClientWebSocket())
+                                using (ContextPool.AllocateOperationContext(out JsonOperationContext context))
                                 {
-                                    ws.Options.ClientCertificates.Add(Server.Certificate.Certificate);
-                                }
-                                await ws.ConnectAsync(leaderWsUrl, cts.Token);
-                                while (ws.State == WebSocketState.Open || ws.State == WebSocketState.CloseSent)
-                                {
-                                    using (var notification = await context.ReadFromWebSocket(ws, "ws from Leader", cts.Token))
+                                    var leaderWsUrl = new Uri($"{leaderUrl.Replace("http", "ws", StringComparison.OrdinalIgnoreCase)}/server/notification-center/watch");
+
+                                    if (Server.Certificate?.Certificate != null)
                                     {
-                                        if (notification == null)
-                                            break;
-
-                                        if (notification.TryGet(nameof(ClusterTopologyChanged.Type), out NotificationType notificationType) == false ||
-                                            notificationType != NotificationType.ClusterTopologyChanged)
-                                            continue;
-
-                                        var topologyNotification = JsonDeserializationServer.ClusterTopologyChanged(notification);
-                                        if (topologyNotification == null)
-                                            continue;
-
-                                        if (_engine.LeaderTag != topologyNotification.Leader)
-                                            break;
-
-                                        delay = 500; // on successful read, reset the delay
-                                        topologyNotification.NodeTag = _engine.Tag;
-                                        NotificationCenter.Add(topologyNotification);
+                                        ws.Options.ClientCertificates.Add(Server.Certificate.Certificate);
                                     }
+
+                                    ws.ConnectAsync(leaderWsUrl, cts.Token).Wait(cts.Token);
+                                    while (cancelTask.IsCompleted == false && 
+                                           (ws.State == WebSocketState.Open || ws.State == WebSocketState.CloseSent))
+                                    {
+                                        var readTask = context.ReadFromWebSocket(ws, "ws from Leader", cts.Token);
+                                        using (var notification = readTask.Result)
+                                        {
+                                            if (notification == null)
+                                                break;
+
+                                            if (notification.TryGet(nameof(ClusterTopologyChanged.Type), out NotificationType notificationType) == false ||
+                                                notificationType != NotificationType.ClusterTopologyChanged)
+                                                continue;
+
+                                            var topologyNotification = JsonDeserializationServer.ClusterTopologyChanged(notification);
+                                            if (topologyNotification == null)
+                                                continue;
+
+                                            if (_engine.LeaderTag != topologyNotification.Leader)
+                                                break;
+
+                                            delay = 500; // on successful read, reset the delay
+                                            topologyNotification.NodeTag = _engine.Tag;
+                                            NotificationCenter.Add(topologyNotification);
+                                        }
+                                    }
+
+                                    delay = ReconnectionBackoff(delay);
                                 }
-                                delay = await ReconnectionBackoff(delay);
                             }
                         }
+                        catch (Exception e) when (IsOperationCanceled(e))
+                        {
+                        }
+                        catch (Exception e)
+                        {
+                            if (Logger.IsInfoEnabled)
+                            {
+                                Logger.Info($"Error during receiving topology updates from the leader. Waiting {delay} [ms] before trying again.", e);
+                            }
+
+                            delay = ReconnectionBackoff(delay);
+                        }
+                        finally
+                        {
+                            cts.Cancel();
+                            WaitForLeaderChangeTaskToComplete(leaderChangedTask);
+                        }
                     }
                 }
-                catch (OperationCanceledException)
+            }
+            catch (Exception e) when (IsOperationCanceled(e))
+            {
+            }
+            catch (Exception e)
+            {
+                if (Logger.IsOperationsEnabled)
                 {
-                }
-                catch (Exception e)
-                {
-                    if (Logger.IsInfoEnabled)
-                    {
-                        Logger.Info($"Error during receiving topology updates from the leader. Waiting {delay} [ms] before trying again.", e);
-                    }
-                    delay = await ReconnectionBackoff(delay);
+                    Logger.Operations($"Failed to execute {nameof(UpdateTopologyChangeNotification)} task", e);
                 }
             }
         }
 
-        private async Task<int> ReconnectionBackoff(int delay)
+        private void WaitForLeaderChangeTaskToComplete(Task leaderChangedTask)
         {
-            await TimeoutManager.WaitFor(TimeSpan.FromMilliseconds(delay), ServerShutdown);
+            // wait for leader change task to complete
+            try
+            {
+                if (leaderChangedTask == null || leaderChangedTask.IsCompleted)
+                    return;
+
+                leaderChangedTask.Wait(ServerShutdown);
+            }
+            catch (Exception e) when (IsOperationCanceled(e))
+            {
+                // ignored
+            }
+        }
+
+        private static bool IsOperationCanceled(Exception e)
+        {
+            var inner = e.ExtractSingleInnerException();
+            return inner is OperationCanceledException;
+        }
+
+        private int ReconnectionBackoff(int delay)
+        {
+            TimeoutManager.WaitFor(TimeSpan.FromMilliseconds(delay), ServerShutdown).Wait(ServerShutdown);
             return Math.Min(15_000, delay * 2);
         }
 
         internal ClusterObserver Observer { get; set; }
 
-        public async Task ClusterMaintenanceSetupTask()
+        public void ClusterMaintenanceSetupTask()
         {
-            while (true)
+            while (ServerShutdown.IsCancellationRequested == false)
             {
                 try
                 {
                     if (_engine.LeaderTag != NodeTag)
                     {
-                        await _engine.WaitForState(RachisState.Leader, ServerShutdown)
-                            .WithCancellation(ServerShutdown);
+                        _engine.WaitForState(RachisState.Leader, ServerShutdown)
+                            .Wait(ServerShutdown);
                         continue;
                     }
+
                     var term = _engine.CurrentTerm;
                     using (ClusterMaintenanceSupervisor = new ClusterMaintenanceSupervisor(this, _engine.Tag, term))
                     using (Observer = new ClusterObserver(this, ClusterMaintenanceSupervisor, _engine, term, ContextPool, ServerShutdown))
@@ -308,6 +359,7 @@ namespace Raven.Server.ServerWide
                             {
                                 clusterTopology = _engine.GetTopology(context);
                             }
+
                             var newNodes = clusterTopology.AllNodes;
                             var nodesChanges = ClusterTopology.DictionaryDiff(oldNodes, newNodes);
                             oldNodes = newNodes;
@@ -316,6 +368,7 @@ namespace Raven.Server.ServerWide
                             {
                                 ClusterMaintenanceSupervisor.RemoveFromCluster(node.Key);
                             }
+
                             foreach (var node in nodesChanges.AddedValues)
                             {
                                 ClusterMaintenanceSupervisor.AddToCluster(node.Key, clusterTopology.GetUrlFromTag(node.Key));
@@ -324,25 +377,26 @@ namespace Raven.Server.ServerWide
                             if (newNodes.Count > 1)
                             {
                                 // calculate only if we have more than one node
-                                await LicenseManager.CalculateLicenseLimits(forceFetchingNodeInfo: true);
+                                LicenseManager.CalculateLicenseLimits(forceFetchingNodeInfo: true).Wait(ServerShutdown);
                             }
 
                             var leaderChanged = _engine.WaitForLeaveState(RachisState.Leader, ServerShutdown);
 
-                            if (await Task.WhenAny(topologyChangedTask, leaderChanged)
-                                    .WithCancellation(ServerShutdown) == leaderChanged)
+                            if (Task.WaitAny(new[] { topologyChangedTask, leaderChanged }, ServerShutdown) == 1)
                                 break;
                         }
                     }
                 }
-                catch (TaskCanceledException)
+                catch (Exception e) when (IsOperationCanceled(e))
                 {
-                    // ServerStore dispose?
-                    throw;
+                    return;
                 }
-                catch (Exception)
+                catch (Exception e)
                 {
-                    //
+                    if (Logger.IsInfoEnabled)
+                    {
+                        Logger.Info($"Failed to execute {nameof(ClusterMaintenanceSetupTask)} task", e);
+                    }
                 }
             }
         }
@@ -375,11 +429,12 @@ namespace Raven.Server.ServerWide
         {
             Configuration.CheckDirectoryPermissions();
 
-            LowMemoryNotification.Initialize(Configuration.Memory.LowMemoryLimit, Configuration.Memory.MinimumFreeCommittedMemory, ServerShutdown);
+            LowMemoryNotification.Initialize(Configuration.Memory.LowMemoryLimit, ServerShutdown);
 
-            PoolOfThreads.GlobalRavenThreadPool.SetMinimumFreeCommittedMemory(Configuration.Memory.MinimumFreeCommittedMemory);
-
-            NativeMemory.SetMinimumFreeCommittedMemory(Configuration.Memory.MinimumFreeCommittedMemory);
+            MemoryInformation.SetFreeCommittedMemory(
+                Configuration.Memory.MinimumFreeCommittedMemoryPercentage,
+                Configuration.Memory.MaxFreeCommittedMemoryToKeepInMb,
+                Configuration.Memory.LowMemoryCommitLimitInMb);
 
             if (Logger.IsInfoEnabled)
                 Logger.Info("Starting to open server store for " + (Configuration.Core.RunInMemory ? "<memory>" : Configuration.Core.DataDirectory.FullPath));
@@ -499,13 +554,19 @@ namespace Raven.Server.ServerWide
                 options.MaxScratchBufferSize = Configuration.Storage.MaxScratchBufferSize.Value.GetValue(SizeUnit.Bytes);
             options.PrefetchSegmentSize = Configuration.Storage.PrefetchBatchSize.GetValue(SizeUnit.Bytes);
             options.PrefetchResetThreshold = Configuration.Storage.PrefetchResetThreshold.GetValue(SizeUnit.Bytes);
+            options.SyncJournalsCountThreshold = Configuration.Storage.SyncJournalsCountThreshold;
+            options.IgnoreInvalidJournalErrors = Configuration.Storage.IgnoreInvalidJournalErrors;
+            options.SkipChecksumValidationOnDatabaseLoading = Configuration.Storage.SkipChecksumValidationOnDatabaseLoading;
+
+            DirectoryExecUtils.SubscribeToOnDirectoryInitializeExec(options, Configuration.Storage, nameof(DirectoryExecUtils.EnvironmentType.System), DirectoryExecUtils.EnvironmentType.System, Logger);
+
             try
             {
                 StorageEnvironment.MaxConcurrentFlushes = Configuration.Storage.MaxConcurrentFlushes;
 
                 try
                 {
-                    _env = LayoutUpdater.OpenEnvironment(options);
+                    _env = StorageLoader.OpenEnvironment(options, StorageEnvironmentWithType.StorageEnvironmentType.System);
                 }
                 catch (Exception e)
                 {
@@ -552,8 +613,10 @@ namespace Raven.Server.ServerWide
             LatestVersionCheck.Check(this);
 
             ConfigureAuditLog();
-        }
 
+            Initialized = true;
+            InitializationCompleted.Set();
+        }
 
         private void BeforeAppendToRaftLog(TransactionOperationContext ctx, CommandBase cmd)
         {
@@ -639,8 +702,14 @@ namespace Raven.Server.ServerWide
                     LastClientConfigurationIndex = clientConfigEtag;
             }
 
-            Task.Run(ClusterMaintenanceSetupTask, ServerShutdown);
-            Task.Run(UpdateTopologyChangeNotification, ServerShutdown);
+            _clusterMaintenanceSetupTask = PoolOfThreads.GlobalRavenThreadPool.LongRunning(x =>
+                ClusterMaintenanceSetupTask(), null, "Cluster Maintenance Setup Task");
+
+            _updateTopologyChangeNotification = PoolOfThreads.GlobalRavenThreadPool.LongRunning(x =>
+            {
+                Thread.CurrentThread.Priority = ThreadPriority.BelowNormal;
+                UpdateTopologyChangeNotification();
+            }, null, "Update Topology Change Notification Task");
         }
 
         private void OnStateChanged(object sender, RachisConsensus.StateTransition state)
@@ -733,6 +802,15 @@ namespace Raven.Server.ServerWide
             NotificationCenter.Add(ClusterTopologyChanged.Create(topologyJson, LeaderTag,
                 NodeTag, _engine.CurrentTerm, _engine.CurrentState, GetNodesStatuses(), LoadLicenseLimits()?.NodeLicenseDetails),
                 DateTime.MinValue);
+
+            foreach (var db in DatabasesLandlord.DatabasesCache)
+            {
+                db.Value.Result.Changes.RaiseNotifications(new TopologyChange
+                {
+                    Url = topologyJson.GetUrlFromTag(NodeTag),
+                    Database = db.Value.Result.Name
+                });
+            }
             // we set the postpone time to the minimum in order to overwrite it and to send this notification every time when a new client connects. 
         }
 
@@ -1310,20 +1388,58 @@ namespace Raven.Server.ServerWide
             string databaseName, BlittableJsonReaderObject etlConfiguration)
         {
             UpdateDatabaseCommand command;
+            var databaseRecord = LoadDatabaseRecord(databaseName, out _);
 
             switch (EtlConfiguration<ConnectionString>.GetEtlType(etlConfiguration))
             {
                 case EtlType.Raven:
-                    command = new AddRavenEtlCommand(JsonDeserializationCluster.RavenEtlConfiguration(etlConfiguration), databaseName);
+                    var rvnEtl = JsonDeserializationCluster.RavenEtlConfiguration(etlConfiguration);
+                    rvnEtl.Validate(out var rvnEtlErr, validateName: false, validateConnection: false);
+                    if (rvnEtl.ValidateConnectionString(databaseRecord) == false)
+                        rvnEtlErr.Add($"Could not find connection string named '{rvnEtl.ConnectionStringName}'. Please supply an existing connection string.");
+
+                    ThrowInvalidConfigurationIfNecessary(rvnEtlErr);
+
+                    command = new AddRavenEtlCommand(rvnEtl, databaseName);
                     break;
                 case EtlType.Sql:
-                    command = new AddSqlEtlCommand(JsonDeserializationCluster.SqlEtlConfiguration(etlConfiguration), databaseName);
+                    var sqlEtl = JsonDeserializationCluster.SqlEtlConfiguration(etlConfiguration);
+                    sqlEtl.Validate(out var sqlEtlErr, validateName: false, validateConnection: false);
+                    if (sqlEtl.ValidateConnectionString(databaseRecord) == false)
+                        sqlEtlErr.Add($"Could not find connection string named '{sqlEtl.ConnectionStringName}'. Please supply an existing connection string.");
+
+                    ThrowInvalidConfigurationIfNecessary(sqlEtlErr);
+
+                    command = new AddSqlEtlCommand(sqlEtl, databaseName);
                     break;
                 default:
                     throw new NotSupportedException($"Unknown ETL configuration type. Configuration: {etlConfiguration}");
             }
 
             return await SendToLeaderAsync(command);
+
+            void ThrowInvalidConfigurationIfNecessary(IReadOnlyCollection<string> errors)
+            {
+                if (errors.Count <= 0)
+                    return;
+
+                var sb = new StringBuilder();
+                sb
+                    .AppendLine("Invalid ETL configuration.")
+                    .AppendLine("Errors:");
+
+                foreach (var err in errors)
+                {
+                    sb
+                        .Append("- ")
+                        .AppendLine(err);
+                }
+
+                sb.AppendLine("Configuration:");
+                sb.AppendLine(etlConfiguration.ToString());
+
+                throw new InvalidOperationException(sb.ToString());
+            }
         }
 
         public async Task<(long, object)> UpdateEtl(TransactionOperationContext context, string databaseName, long id, BlittableJsonReaderObject etlConfiguration)
@@ -1490,7 +1606,19 @@ namespace Raven.Server.ServerWide
                             {
 
                             }
-                        });                    
+                        });
+
+                    exceptionAggregator.Execute(() =>
+                    {
+                        if (_clusterMaintenanceSetupTask != null && _clusterMaintenanceSetupTask != PoolOfThreads.LongRunningWork.Current)
+                            _clusterMaintenanceSetupTask.Join(int.MaxValue);
+                    });
+
+                    exceptionAggregator.Execute(() =>
+                    {
+                        if (_updateTopologyChangeNotification != null && _updateTopologyChangeNotification != PoolOfThreads.LongRunningWork.Current)
+                            _updateTopologyChangeNotification.Join(int.MaxValue);
+                    });
 
                     exceptionAggregator.Execute(_shutdownNotification.Dispose);
 
@@ -1679,14 +1807,14 @@ namespace Raven.Server.ServerWide
 
         public Task<(long Index, object Result)> WriteDatabaseRecordAsync(
             string databaseName, DatabaseRecord record, long? index,
-            Dictionary<string, ExpandoObject> databaseValues = null, bool isRestore = false)
+            Dictionary<string, BlittableJsonReaderObject> databaseValues = null, bool isRestore = false)
         {
             if (databaseValues == null)
-                databaseValues = new Dictionary<string, ExpandoObject>();
+                databaseValues = new Dictionary<string, BlittableJsonReaderObject>();
 
             Debug.Assert(record.Topology != null);
 
-            if(string.IsNullOrEmpty(record.Topology.DatabaseTopologyIdBase64))
+            if (string.IsNullOrEmpty(record.Topology.DatabaseTopologyIdBase64))
                 record.Topology.DatabaseTopologyIdBase64 = Guid.NewGuid().ToBase64Unpadded();
 
             record.Topology.Stamp = new LeaderStamp
@@ -1713,7 +1841,7 @@ namespace Raven.Server.ServerWide
                 return;
 
             _engine.Bootstrap(publicServerUrl ?? _server.ServerStore.GetNodeHttpServerUrl(), nodeTag);
-            LicenseManager.TryActivateLicense();
+            LicenseManager.TryActivateLicense(Server.ThrowOnLicenseActivationFailure);
 
             // we put a certificate in the local state to tell the server who to trust, and this is done before
             // the cluster exists (otherwise the server won't be able to receive initial requests). Only when we 
@@ -1750,7 +1878,7 @@ namespace Raven.Server.ServerWide
             var response = await SendToLeaderAsyncInternal(cmd);
 
 #if DEBUG
-            
+
             if (Leader.GetConvertResult(cmd) == null && // if cmd specifies a convert, it explicitly handles this
                 response.Result.ContainsBlittableObject())
             {
@@ -1913,7 +2041,7 @@ namespace Raven.Server.ServerWide
             {
                 ServerShutdown.ThrowIfCancellationRequested();
 
-                if (_engine.CurrentState == RachisState.Leader)
+                if (_engine.CurrentState == RachisState.Leader && _engine.CurrentLeader?.Running == true)
                 {
                     try
                     {
@@ -2111,6 +2239,14 @@ namespace Raven.Server.ServerWide
                     Logger.Info($"Failed to accept new RAFT connection via TCP from node {header.SourceNodeTag} ({remoteEndpoint}).", e);
                 }
             }
+            catch (RachisException e)
+            {
+                // rachis exceptions are expected, so we will not raise an alert, but only log them.
+                if (Logger.IsInfoEnabled)
+                {
+                    Logger.Info($"Failed to accept new RAFT connection via TCP from node {header.SourceNodeTag} ({remoteEndpoint}).", e);
+                }
+            }
             catch (Exception e)
             {
                 var msg = $"Failed to accept new RAFT connection via TCP from {header.SourceNodeTag} ({remoteEndpoint}).";
@@ -2150,6 +2286,84 @@ namespace Raven.Server.ServerWide
                 ThrowInvalidTcpUrlOnStartup();
             var status = _server.GetTcpServerStatus();
             return Configuration.Core.GetNodeTcpServerUrl(ravenServerWebUrl, status.Port);
+        }
+
+        public async Task<NodeConnectionTestResult> TestConnectionFromRemote(RequestExecutor requestExecutor, JsonOperationContext context, string nodeUrl)
+        {
+            var myUrl = GetNodeHttpServerUrl();
+            NodeConnectionTestResult result;
+
+            var nodeConnectionTest = new TestNodeConnectionCommand(myUrl);
+            try
+            {
+                await requestExecutor.ExecuteAsync(nodeConnectionTest, context);
+                result = nodeConnectionTest.Result;
+
+                if (nodeConnectionTest.Result.Success == false)
+                {
+                    result.Success = false;
+                    result.Error = $"{NodeConnectionTestResult.GetError(myUrl, nodeUrl)}{Environment.NewLine}{nodeConnectionTest.Result.Error}";
+                }
+            }
+            catch (Exception e)
+            {
+                return new NodeConnectionTestResult
+                {
+                    Success = false,
+                    Error = $"{NodeConnectionTestResult.GetError(myUrl, nodeUrl)}{Environment.NewLine}{e}"
+                };
+            }
+
+            return result;
+        }
+
+        public async Task<NodeConnectionTestResult> TestConnectionToRemote(string url, string database)
+        {
+            Task<TcpConnectionInfo> connectionInfo;
+            try
+            {
+                var timeout = TimeoutManager.WaitFor(Configuration.Cluster.OperationTimeout.AsTimeSpan);
+
+                using (var cts = new CancellationTokenSource(Server.Configuration.Cluster.OperationTimeout.AsTimeSpan))
+                {
+                    connectionInfo = ReplicationUtils.GetTcpInfoAsync(url, database, "Test-Connection", Server.Certificate.Certificate,
+                        cts.Token);
+                }
+                Task timeoutTask = await Task.WhenAny(timeout, connectionInfo);
+                if (timeoutTask == timeout)
+                {
+                    throw new TimeoutException($"Waited for {Configuration.Cluster.OperationTimeout.AsTimeSpan} to receive TCP information from '{url}' and got no response");
+                }
+                await connectionInfo;
+            }
+            catch (Exception e)
+            {
+                return new NodeConnectionTestResult
+                {
+                    Success = false,
+                    HTTPSuccess = false,
+                    Error = $"An exception was thrown while trying to connect to '{url}':{Environment.NewLine}{e}"
+                };
+            }
+
+            var result = new NodeConnectionTestResult
+            {
+                HTTPSuccess = true,
+                TcpServerUrl = connectionInfo.Result.Url
+            };
+
+            try
+            {
+                await TestConnectionHandler.ConnectToClientNodeAsync(_server, connectionInfo.Result, Engine.TcpConnectionTimeout,
+                    LoggingSource.Instance.GetLogger("testing-connection", "testing-connection"), database, result);
+            }
+            catch (Exception e)
+            {
+                result.Success = false;
+                result.Error = $"Was able to connect to url '{url}', but exception was thrown while trying to connect to TCP port '{connectionInfo.Result.Url}':{Environment.NewLine}{e}";
+            }
+
+            return result;
         }
 
         private static void ThrowInvalidTcpUrlOnStartup()

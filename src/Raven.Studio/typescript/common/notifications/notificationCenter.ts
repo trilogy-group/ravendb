@@ -24,7 +24,10 @@ import smugglerDatabaseDetails = require("viewmodels/common/notificationCenter/d
 import sqlMigrationDetails = require("viewmodels/common/notificationCenter/detailViewer/operations/sqlMigrationDetails");
 import patchDocumentsDetails = require("viewmodels/common/notificationCenter/detailViewer/operations/patchDocumentsDetails");
 import virtualBulkInsertDetails = require("viewmodels/common/notificationCenter/detailViewer/virtualOperations/virtualBulkInsertDetails");
+import virtualUpdateByQueryDetails = require("viewmodels/common/notificationCenter/detailViewer/virtualOperations/virtualUpdateByQueryDetails");
+import virtualDeleteByQueryDetails = require("viewmodels/common/notificationCenter/detailViewer/virtualOperations/virtualDeleteByQueryDetails");
 import bulkInsertDetails = require("viewmodels/common/notificationCenter/detailViewer/operations/bulkInsertDetails");
+import replayTransactionCommandsDetails = require("viewmodels/common/notificationCenter/detailViewer/operations/replayTransactionCommandsDetails");
 import deleteDocumentsDetails = require("viewmodels/common/notificationCenter/detailViewer/operations/deleteDocumentsDetails");
 import generateClientCertificateDetails = require("viewmodels/common/notificationCenter/detailViewer/operations/generateClientCertificateDetails");
 import compactDatabaseDetails = require("viewmodels/common/notificationCenter/detailViewer/operations/compactDatabaseDetails");
@@ -39,11 +42,12 @@ import recentErrorDetails = require("viewmodels/common/notificationCenter/detail
 import notificationCenterSettings = require("common/notifications/notificationCenterSettings");
 import licenseLimitDetails = require("viewmodels/common/notificationCenter/detailViewer/licenseLimitDetails");
 import requestLatencyDetails = require("viewmodels/common/notificationCenter/detailViewer/performanceHint/requestLatencyDetails");
+import transactionCommandsDetails = require("viewmodels/common/notificationCenter/detailViewer/operations/transactionCommandsDetails");
 
 
 interface detailsProvider {
     supportsDetailsFor(notification: abstractNotification): boolean;
-    showDetailsFor(notification: abstractNotification, notificationCenter: notificationCenter): JQueryPromise<void>;
+    showDetailsFor(notification: abstractNotification, notificationCenter: notificationCenter): JQueryPromise<void> | void;
 }
 
 interface customOperationMerger {
@@ -123,9 +127,13 @@ class notificationCenter {
             deleteDocumentsDetails,
             bulkInsertDetails,
             compactDatabaseDetails,
+            replayTransactionCommandsDetails,
+            transactionCommandsDetails,
             
             // virtual operations:
             virtualBulkInsertDetails,
+            virtualUpdateByQueryDetails,
+            virtualDeleteByQueryDetails,
 
             // performance hints:
             indexingDetails,
@@ -146,6 +154,9 @@ class notificationCenter {
         this.customOperationMerger.push(compactDatabaseDetails);
         
         this.customOperationHandler.push(bulkInsertDetails);
+        this.customOperationHandler.push(patchDocumentsDetails);
+        this.customOperationHandler.push(deleteDocumentsDetails);
+        this.customOperationHandler.push(transactionCommandsDetails);
 
         this.allNotifications = ko.pureComputed(() => {
             const globalNotifications = this.globalNotifications();
@@ -392,7 +403,9 @@ class notificationCenter {
     }
 
     killAttachmentUpload(upload: attachmentUpload) {
-        return viewHelpers.confirmationMessage("Are you sure?", "Do you want to abort attachment upload?", ["No", "Yes"], true)
+        return viewHelpers.confirmationMessage("Are you sure?", "Do you want to abort attachment upload?", {
+            forceRejectWithResolve: true
+        })
             .done((result: confirmDialogResult) => {
                 if (result.can) {
                     // no need for spinners here - it is sync call
@@ -404,7 +417,9 @@ class notificationCenter {
     }
     
     killOperation(operationToKill: operation) {
-        return viewHelpers.confirmationMessage("Are you sure?", "Do you want to abort current operation?", ["No", "Yes"], true)
+        return viewHelpers.confirmationMessage("Are you sure?", "Do you want to abort current operation?", {
+            forceRejectWithResolve: true
+        })
             .done((result: confirmDialogResult) => {
                 if (result.can) {
                     const notificationId = operationToKill.id;

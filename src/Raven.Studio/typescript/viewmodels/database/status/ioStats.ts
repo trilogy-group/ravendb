@@ -13,17 +13,16 @@ type rTreeLeaf = {
     minY: number;
     maxX: number;
     maxY: number;
-    actionType: "toggleIndexes" | "trackItem" | "closedTrackItem" | "gapItem";
+    actionType: "toggleIndexes" | "trackItem" | "gapItem";
     arg?: any;
 }
 
 class hitTest {
-    cursor = ko.observable<string>("auto");   
+    cursor = ko.observable<string>("auto");
     private rTree = rbush<rTreeLeaf>();
     private container: d3.Selection<any>;    
     private onToggleIndexes: () => void;
     private handleTrackTooltip: (item: Raven.Server.Documents.Handlers.IOMetricsRecentStats, x: number, y: number) => void;   
-    private handleClosedTrackTooltip: (item: Raven.Server.Documents.Handlers.IOMetricsRecentStats, x: number, y: number) => void;
     private handleGapTooltip: (item: timeGapInfo, x: number, y: number) => void;
     private removeTooltip: () => void;
 
@@ -34,13 +33,11 @@ class hitTest {
     init(container: d3.Selection<any>,
         onToggleIndexes: () => void,
         handleTrackTooltip: (item: Raven.Server.Documents.Handlers.IOMetricsRecentStats, x: number, y: number) => void,
-        handleClosedTrackTooltip: (item: Raven.Server.Documents.Handlers.IOMetricsRecentStats, x: number, y: number) => void,
         handleGapTooltip: (item: timeGapInfo, x: number, y: number) => void,
         removeTooltip: () => void) {
             this.container = container;
             this.onToggleIndexes = onToggleIndexes;
             this.handleTrackTooltip = handleTrackTooltip;
-            this.handleClosedTrackTooltip = handleClosedTrackTooltip;
             this.handleGapTooltip = handleGapTooltip;
             this.removeTooltip = removeTooltip;
     }
@@ -52,18 +49,6 @@ class hitTest {
             maxX: x + width,
             maxY: y + height,
             actionType: "trackItem",
-            arg: element
-        } as rTreeLeaf;
-        this.rTree.insert(data);
-    }
-
-    registerClosedTrackItem(x: number, y: number, width: number, height: number, element: Raven.Server.Documents.Handlers.IOMetricsRecentStats) {
-        const data = {
-            minX: x,
-            minY: y,
-            maxX: x + width,
-            maxY: y + height,
-            actionType: "closedTrackItem",
             arg: element
         } as rTreeLeaf;
         this.rTree.insert(data);
@@ -133,20 +118,14 @@ class hitTest {
             this.handleTrackTooltip(currentItem, clickLocation[0], clickLocation[1]);
             this.cursor("auto");
         } else {
-            const currentItem = items.filter(x => x.actionType === "closedTrackItem").map(x => x.arg as Raven.Server.Documents.Handlers.IOMetricsRecentStats)[0];
-            if (currentItem) {
-                this.handleClosedTrackTooltip(currentItem, clickLocation[0], clickLocation[1]);
+            const currentGapItem = items.filter(x => x.actionType === "gapItem").map(x => x.arg as timeGapInfo)[0];
+            if (currentGapItem) {
+                this.handleGapTooltip(currentGapItem, clickLocation[0], clickLocation[1]);
                 this.cursor("auto");
             } else {
-                const currentGapItem = items.filter(x => x.actionType === "gapItem").map(x => x.arg as timeGapInfo)[0];
-                if (currentGapItem) {
-                    this.handleGapTooltip(currentGapItem, clickLocation[0], clickLocation[1]);
-                    this.cursor("auto");
-                } else {
-                    this.cursor(overToggleIndexes ? "pointer" : graphHelper.prefixStyle("grab"));
-                    this.removeTooltip();
-                }
-            }           
+                this.cursor(overToggleIndexes ? "pointer" : graphHelper.prefixStyle("grab"));
+                this.removeTooltip();
+            }
         }
     }
 
@@ -163,7 +142,7 @@ class hitTest {
 class legend {
     imageStr = ko.observable<string>();
     maxSize = ko.observable<number>(0);
-    type: string;
+    type: Sparrow.IoMetrics.MeterType;
 
     sizeScale: d3.scale.Linear<number, number>;  // domain: legend pixels, range: item size
     colorScale: d3.scale.Linear<string, string>; // domain: item size,     range: item color    
@@ -267,6 +246,7 @@ class ioStats extends viewModelBase {
     private static readonly step = 200;
     private static readonly minGapSize = 10 * 1000; // 10 seconds
     private static readonly axisHeight = 35; 
+    private static readonly bufferSize = 50000;
 
     private static readonly indexesString = "Indexes";
 
@@ -282,7 +262,7 @@ class ioStats extends viewModelBase {
     private isImport = ko.observable<boolean>(false);
     private trackNames = ko.observableArray<string>();
 
-    private searchText = ko.observable<string>();
+    private searchText = ko.observable<string>("");
     private hasIndexes = ko.observable<boolean>(false);
     private isIndexesExpanded = ko.observable<boolean>(false);     
     private filteredIndexesTracksNames = ko.observableArray<string>();   
@@ -297,6 +277,10 @@ class ioStats extends viewModelBase {
 
     private liveViewClient = ko.observable<liveIOStatsWebSocketClient>();
     private data: Raven.Server.Documents.Handlers.IOMetricsResponse;
+    private bufferIsFull = ko.observable<boolean>(false);
+    private bufferUsage = ko.observable<string>("0.0");
+    private dateCutoff: Date; // used to avoid showing server side cached items, after 'clear' is clicked. 
+    private closedIndexesItemsCache: Array<IOMetricsRecentStatsWithCache>;
     private commonPathsPrefix: string;     
     private totalWidth: number;
     private totalHeight: number; 
@@ -307,8 +291,6 @@ class ioStats extends viewModelBase {
     private hitTest = new hitTest();
     private brushSection: HTMLCanvasElement; // a virtual canvas for brush section
     private brushAndZoomCallbacksDisabled = false;    
-
-    private indexesItemsStartEnds = new Map<Sparrow.IoMetrics.MeterType, Array<[number, number]>>(); // Start & End times for joined duration times for closed index track items
 
     /* d3 */
 
@@ -326,7 +308,10 @@ class ioStats extends viewModelBase {
 
     constructor() {
         super();
-        this.searchText.throttle(200).subscribe(() => this.filterTracks());
+
+        this.bindToCurrentInstance("clearGraphWithConfirm");
+        
+        this.searchText.throttle(700).subscribe(() => this.filterTracks());
 
         ioStats.meterTypes.forEach(type => {
             this.legends.set(type, ko.observable<legend>());
@@ -372,12 +357,11 @@ class ioStats extends viewModelBase {
         this.tooltip = d3.select(".tooltip");
         [this.totalWidth, this.totalHeight] = this.getPageHostDimenensions();
               
-        this.initCanvas();     
+        this.initCanvas();
 
         this.hitTest.init(this.svg,
             () => this.onToggleIndexes(),
             (trackItem, x, y) => this.handleTrackTooltip(trackItem, x, y),
-            (closedTrackItem, x, y) => this.handleClosedTrackTooltip(closedTrackItem, x, y),
             (gapItem, x, y) => this.handleGapTooltip(gapItem, x, y),
             () => this.hideTooltip());
          
@@ -398,8 +382,10 @@ class ioStats extends viewModelBase {
         // 1. Find common paths prefix
         this.commonPathsPrefix = this.findPrefix(this.data.Environments.map(env => env.Path));
 
+        const legendsCache = new Map<string, number>();
+        
         // 1.1 Init max size (for legend scale)
-        this.legends.forEach(x => x().maxSize(0));
+        this.legends.forEach(x => legendsCache.set(x().type, 0));
 
         // 2. Loop on info from EndPoint
         this.data.Environments.forEach(env => {
@@ -414,9 +400,9 @@ class ioStats extends viewModelBase {
                 file.Recent.forEach(recentItem => {
                    
                     // 2.3 Calc highest batch size for each type
-                    const legend = this.legends.get(recentItem.Type)();
                     const itemValue = ioStats.extractItemValue(recentItem);
-                    legend.maxSize(itemValue > legend.maxSize() ? itemValue : legend.maxSize());
+                    const currentLegendMax = legendsCache.get(recentItem.Type);
+                    legendsCache.set(recentItem.Type, itemValue > currentLegendMax ? itemValue : currentLegendMax);
 
                     this.hasAnyData(true);
                 });
@@ -424,7 +410,7 @@ class ioStats extends viewModelBase {
         });
 
         this.legends.forEach(legend => {
-            legend().maxSize(legend().maxSize() === 0 ? 1 : legend().maxSize());
+            legend().maxSize(Math.max(1, legendsCache.get(legend().type)));
         });
     }
 
@@ -532,8 +518,9 @@ class ioStats extends viewModelBase {
         // filteredIndexesTracksNames will be indexes tracks names that are NOT SUPPOSED TO BE SEEN ....
         this.filteredIndexesTracksNames(indexesTracksNames.filter(x => !(x.toLowerCase().includes(criteria))));       
 
-        this.allIndexesAreFiltered(indexesTracks.length === this.filteredIndexesTracksNames().length);     
+        this.allIndexesAreFiltered(this.hasAnyData() && indexesTracks.length === this.filteredIndexesTracksNames().length);     
 
+        this.updateClosedIndexesInfo();
         this.drawMainSection();
     }
 
@@ -542,12 +529,15 @@ class ioStats extends viewModelBase {
 
         const onDataUpdate = (mergedData: Raven.Server.Documents.Handlers.IOMetricsResponse) => {
             let timeRange: [Date, Date];
+            
             if (!firstTime) {
                 const timeToRemap = this.brush.empty() ? this.xBrushNumericScale.domain() as [number, number] : this.brush.extent() as [number, number];
                 timeRange = timeToRemap.map(x => this.xBrushTimeScale.invert(x)) as [Date, Date];
             }
 
-            this.data = mergedData;        
+            this.data = mergedData;
+
+            this.checkBufferUsage();
             this.prepareTimeData();
 
             if (!firstTime) {
@@ -561,6 +551,7 @@ class ioStats extends viewModelBase {
 
             this.initViewData();
             this.setLegendScales();
+            this.updateClosedIndexesInfo();
 
             if (firstTime) {
                 this.initLegendImages();
@@ -573,7 +564,19 @@ class ioStats extends viewModelBase {
             }
         };
 
-        this.liveViewClient(new liveIOStatsWebSocketClient(this.activeDatabase(), onDataUpdate));
+        this.liveViewClient(new liveIOStatsWebSocketClient(this.activeDatabase(), onDataUpdate, this.dateCutoff));
+    }
+    
+    private checkBufferUsage() {
+        const dataCount = _.sumBy(this.data.Environments, env => _.sumBy(env.Files, files => files.Recent.length));
+        
+        const usage = Math.min(100, dataCount * 100.0 / ioStats.bufferSize);
+        this.bufferUsage(usage.toFixed(1));
+
+        if (dataCount > ioStats.bufferSize) {
+            this.bufferIsFull(true);
+            this.cancelLiveView();
+        }
     }
 
     scrollToRight() {
@@ -655,10 +658,6 @@ class ioStats extends viewModelBase {
         this.brushSection.width = this.totalWidth;
         this.brushSection.height = ioStats.brushSectionHeight;
        
-        const timeRanges = this.extractTimeRanges();
-        this.gapFinder = new gapFinder(timeRanges, ioStats.minGapSize);
-        this.xBrushTimeScale = this.gapFinder.createScale(this.totalWidth, 0);
-
         const context = this.brushSection.getContext("2d");
 
         // 2. Draw scale
@@ -675,10 +674,11 @@ class ioStats extends viewModelBase {
 
         this.data.Environments.forEach(env => {
             env.Files.forEach(file => {
+                let lastRegisteredX1 = -1e10;
                 file.Recent.forEach((recentItem: IOMetricsRecentStatsWithCache) => {
 
                     //       Similar to what I did in indexing performance....  For now a default high color is used                       
-                    context.fillStyle = this.calcItemColor(recentItem, false);
+                    context.fillStyle = this.calcItemColor(recentItem.Type);
 
                     switch (recentItem.Type) {
                         case "JournalWrite":
@@ -696,8 +696,13 @@ class ioStats extends viewModelBase {
                     // 4. Draw item on canvas
                     const x1 = this.xBrushTimeScale(recentItem.StartedAsDate);
                     let dx = extentFunc(recentItem.Duration);
-                    dx = dx < ioStats.minItemWidth ? ioStats.minItemWidth : dx;                   
-                    context.fillRect(x1, yStartItem, dx, ioStats.trackHeight);                 
+
+                    let closeToPrevious = dx < 0.5 && x1 < lastRegisteredX1 + 0.5;
+                    if (!closeToPrevious) {
+                        lastRegisteredX1 = x1;
+                        dx = dx < ioStats.minItemWidth ? ioStats.minItemWidth : dx;
+                        context.fillRect(x1, yStartItem, dx, ioStats.trackHeight);
+                    }
                 });
             });
         });
@@ -883,6 +888,10 @@ class ioStats extends viewModelBase {
         }
     }
 
+    toggleScroll() {
+        this.autoScroll.toggle();
+    }
+
     private onZoom() {
         this.autoScroll(false);
         this.clearSelectionVisible(true);
@@ -917,14 +926,10 @@ class ioStats extends viewModelBase {
         this.constructYScale();
 
         const visibleTimeFrame = this.xNumericScale.domain().map(x => this.xBrushTimeScale.invert(x)) as [Date, Date];
-        const visibleStartDateAsInt = visibleTimeFrame[0].getTime();
-        const visibleEndDateAsInt = visibleTimeFrame[1].getTime();
 
         const xScale = this.gapFinder.trimmedScale(visibleTimeFrame, this.totalWidth, 0); 
         const canvas = this.canvas.node() as HTMLCanvasElement;
         const context = canvas.getContext("2d");
-
-        ioStats.meterTypes.forEach(type => this.indexesItemsStartEnds.set(type, []));
 
         try {
             context.save();
@@ -936,10 +941,10 @@ class ioStats extends viewModelBase {
             context.rect(0, 0, this.totalWidth, this.totalHeight - ioStats.brushSectionHeight);
             context.clip();
 
-            // 1. Draw tracks background 
+            // Draw tracks background 
             this.drawTracksBackground(context, xScale);
 
-            // 2. Draw vertical dotted time lines & time labels in main section
+            // Draw vertical dotted time lines & time labels in main section
             if (xScale.domain().length) {
                 const ticks = this.getTicks(xScale);
 
@@ -950,118 +955,39 @@ class ioStats extends viewModelBase {
                 context.restore();
 
                 this.drawXaxisTimeLabels(context, ticks, -20, 17);
-            }          
+            }
 
-            // 3. Draw all other data (track name + items on track)
+            // Draw all other data (track name + items on track)
             context.beginPath();
             context.rect(0, ioStats.axisHeight, this.totalWidth, this.totalHeight - ioStats.brushSectionHeight);
             context.clip(); 
             
             const extentFunc = gapFinder.extentGeneratorForScaleWithGaps(xScale);
-            const indexesExpanded = this.isIndexesExpanded();
+            
+            let hasAtLeastOneIndexTrack = false;
             
             for (let envIdx = 0; envIdx < this.data.Environments.length; envIdx++) {
                 const env = this.data.Environments[envIdx];
-                if (!this.filtered(env.Path)) {
-
-                    // 3.1. Check if this is an index track 
-                    let trackName = env.Path.substring(this.commonPathsPrefix.length);
-                    let isIndexTrack = trackName.startsWith(ioStats.indexesString);
-
-                    // 3.2 Draw track name
-                    const yStart = this.yScale(env.Path);
-                    this.drawTrackName(context, trackName, yStart);
-
-                    const yStartPerTypeCache = new Map<Sparrow.IoMetrics.MeterType, number>();
-                    yStartPerTypeCache.set("JournalWrite", yStart + ioStats.closedTrackHeight + ioStats.itemMargin);
-                    yStartPerTypeCache.set("Compression", yStart + ioStats.closedTrackHeight + ioStats.itemMargin);
-                    yStartPerTypeCache.set("DataFlush", yStart + ioStats.closedTrackHeight + ioStats.itemMargin * 2 + ioStats.itemHeight);
-                    yStartPerTypeCache.set("DataSync", yStart + ioStats.closedTrackHeight + ioStats.itemMargin * 3 + ioStats.itemHeight * 2);
-
-                    // 3.3 Draw item in main canvas area (but only if item is inside the visible/selected area from the brush section..)
-                    context.save();
-
-                    for (let fileIdx = 0; fileIdx < env.Files.length; fileIdx++) {
-                        const file = env.Files[fileIdx];
-                       
-                        let lastRegisteredX1 = -1e10;
-                        
-                        for (let recentIdx = 0; recentIdx < file.Recent.length; recentIdx++) {
-                            const recentItem = file.Recent[recentIdx] as IOMetricsRecentStatsWithCache;
-                            const itemStartDateAsInt = recentItem.StartedAsDate.getTime();
-                            const itemEndDateAsInt = recentItem.CompletedAsDate.getTime();
-
-                            if (itemStartDateAsInt < visibleEndDateAsInt && itemEndDateAsInt > visibleStartDateAsInt) {
-                                
-                                // 3.4 Determine color for item
-                                context.fillStyle = this.calcItemColor(recentItem, !isIndexTrack || indexesExpanded);
-
-                                // 3.5 Determine yStart for item
-                                const yStartItem = yStartPerTypeCache.get(recentItem.Type);
-
-                                const x1 = xScale(recentItem.StartedAsDate);
-                                const originalDx = extentFunc(recentItem.Duration);
-                                const dx = originalDx < ioStats.minItemWidth ? ioStats.minItemWidth : originalDx;
-                                
-                                let registerTracks = true;
-                                // when item is really small and it is quite close to last *registered* item, skip it
-                                // since we register bigger areas anyway
-                                if (originalDx < 0.5 && x1 < lastRegisteredX1 + 0.8) {
-                                    registerTracks = false;
-                                } else {
-                                    lastRegisteredX1 = x1;
-                                }
-
-                                context.fillRect(x1, yStartItem, dx, ioStats.itemHeight);
-                                
-                                // 3.6 Draw the human size text on the item if there is enough space.. but don't draw on closed indexes track 
-                                // Logic: Don't draw if: [closed && isIndexTrack] ==> [!(closed && isIndexTrack)] ==> [open || !isIndexTrack] or it is compression item
-                                if (indexesExpanded || !isIndexTrack) {
-
-                                    // dx > 15 allows to skip itemSizeText calulcation when width is too low to fit
-                                    if (recentItem.Type !== "Compression" && dx > 15) {
-                                        // Calc text size:
-                                        const itemSizeText = generalUtils.formatBytesToSize(recentItem.Size);
-                                        if (dx > itemSizeText.length * ioStats.charWidthApproximation) {
-                                            context.fillStyle = 'black';
-                                            context.textAlign = "center";
-                                            context.font = "bold 10px Lato";
-                                            context.fillText(itemSizeText, x1 + dx / 2, yStartItem + ioStats.trackHeight / 2 + 4);
-                                        }
-                                    }
-                                    
-                                    if (registerTracks) {
-                                        // 3.7 Register track item for tooltip (but not for the 'closed' indexes track)
-                                        this.hitTest.registerTrackItem(x1 - 2, yStartItem, dx + 2, ioStats.itemHeight, recentItem);    
-                                    }
-                                } else {
-                                    
-                                    if (registerTracks) {
-                                        // 3.8 On the closed index track: 
-                                        // Register toggle, so that indexes details will open
-                                        this.hitTest.registerIndexToggle(x1 - 5, yStartItem, dx + 5, ioStats.itemHeight);
-    
-                                        // Register closed index track item for toolip
-                                        this.hitTest.registerClosedTrackItem(x1 - 2, yStartItem, dx + 2, ioStats.itemHeight, recentItem);    
-                                    }
-
-                                    // Update closed index track StartEnd array (durations array), used in the tooltip on closed index track items
-                                    this.indexesItemsStartEnds.get(recentItem.Type).push([itemStartDateAsInt, itemEndDateAsInt]);
-                                }
-                            }
-                        }
-                    }
-
-                    context.restore();
-                };
-            };
-
-            // 4. Compact closed index track StartEnd durations array
-            ioStats.meterTypes.forEach(type => {
-                this.indexesItemsStartEnds.set(type, this.compactDurationsInfo(this.indexesItemsStartEnds.get(type)));
-            });
+                if (this.filtered(env.Path)) {
+                    continue;
+                }
+                const trackName = env.Path.substring(this.commonPathsPrefix.length);
+                const isIndexTrack = trackName.startsWith(ioStats.indexesString);
+                if (isIndexTrack) {
+                    hasAtLeastOneIndexTrack = true;
+                }
+                
+                // draw all non indexes tracks or index track only when indexes track is expanded
+                if (!isIndexTrack || this.isIndexesExpanded()) {
+                    this.drawTrack(context, env, xScale, extentFunc, visibleTimeFrame);    
+                }
+            }
             
-            // 5. Draw gaps   
+            if (hasAtLeastOneIndexTrack && !this.isIndexesExpanded()) {
+                this.drawClosedIndexesTrack(context, xScale, extentFunc, visibleTimeFrame);
+            }
+            
+            // Draw gaps   
             this.drawGaps(context, xScale);
 
             graphHelper.drawScroll(context,
@@ -1069,38 +995,192 @@ class ioStats extends viewModelBase {
                 this.currentYOffset,
                 this.totalHeight - ioStats.brushSectionHeight - ioStats.axisHeight,
                 this.maxYOffset ? this.maxYOffset + this.totalHeight - ioStats.brushSectionHeight - ioStats.axisHeight : 0);
-        }
-        finally {
+        } finally {
             context.restore();
         }
     }
+    
+    private drawTrack(context:CanvasRenderingContext2D, env: Raven.Server.Documents.Handlers.IOMetricsEnvironment,
+                      xScale: d3.time.Scale<number, number>, extentFunc: (millis: number) => number, 
+                      visibleTimeFrame: [Date, Date]) {
+        
+        const yStart = this.yScale(env.Path);
 
-    private compactDurationsInfo(durationsInfo: Array<[number, number]>): Array<[number, number]>{
+        if (yStart - ioStats.axisHeight < -ioStats.openedTrackHeight * 2) {
+            return;
+        }
 
-        const joinedDurations: Array<[number, number]> = [];
-        let joinedIndex = 0;
+        if (yStart > this.totalHeight - ioStats.brushSectionHeight) {
+            return;
+        }
+        
+        const trackName = env.Path.substring(this.commonPathsPrefix.length);
 
-        // 1. Sort array (by start time, a[0] is start time, a[1] is end time)
-        durationsInfo.sort((a, b) => a[0] === b[0] ? a[1] - b[1] : a[0] - b[0]);
+        // Draw track name
+        this.drawTrackName(context, trackName, yStart);
 
-        // 2. Join the overlapping array durations
-        joinedDurations.push(durationsInfo[0]);
+        const yStartPerTypeCache = new Map<Sparrow.IoMetrics.MeterType, number>();
+        yStartPerTypeCache.set("JournalWrite", yStart + ioStats.closedTrackHeight + ioStats.itemMargin);
+        yStartPerTypeCache.set("Compression", yStart + ioStats.closedTrackHeight + ioStats.itemMargin);
+        yStartPerTypeCache.set("DataFlush", yStart + ioStats.closedTrackHeight + ioStats.itemMargin * 2 + ioStats.itemHeight);
+        yStartPerTypeCache.set("DataSync", yStart + ioStats.closedTrackHeight + ioStats.itemMargin * 3 + ioStats.itemHeight * 2);
 
-        for (let i = 1; i < durationsInfo.length; i++) {
-            const currentStart = durationsInfo[i][0];
-            const currentEnd = durationsInfo[i][1];
+        const visibleStartDateAsInt = visibleTimeFrame[0].getTime();
+        const visibleEndDateAsInt = visibleTimeFrame[1].getTime();
+        
+        // Draw item in main canvas area (but only if item is inside the visible/selected area from the brush section..)
+        context.save();
 
-            if (currentStart <= joinedDurations[joinedIndex][1]) {
-                if (currentEnd > joinedDurations[joinedIndex][1]) {
-                    joinedDurations[joinedIndex][1] = currentEnd;
+        for (let fileIdx = 0; fileIdx < env.Files.length; fileIdx++) {
+            const file = env.Files[fileIdx];
+
+            let lastRegisteredX1 = -1e10;
+
+            const recentLength = file.Recent.length;
+            for (let recentIdx = 0; recentIdx < recentLength; recentIdx++) {
+                const recentItem = file.Recent[recentIdx] as IOMetricsRecentStatsWithCache;
+
+                const itemStartDateAsInt = recentItem.StartedAsDate.getTime();
+                if (visibleEndDateAsInt <= itemStartDateAsInt) {
+                    continue;
                 }
-            } else {
-                joinedIndex++;
-                joinedDurations.push(durationsInfo[i]);
+
+                const itemEndDateAsInt = recentItem.CompletedAsDate.getTime();
+                if (itemEndDateAsInt <= visibleStartDateAsInt) {
+                    continue;
+                }
+
+                //  Determine yStart for item
+                const yStartItem = yStartPerTypeCache.get(recentItem.Type);
+
+                const x1 = xScale(recentItem.StartedAsDate);
+                const originalDx = extentFunc(recentItem.Duration);
+
+                let closeToPrevious = originalDx < 0.5 && x1 < lastRegisteredX1 + 1;
+                // when item is really small and it is quite close to last *registered* item, skip it
+                // since we register bigger areas anyway
+                if (!closeToPrevious) {
+                    lastRegisteredX1 = x1;
+                    const dx = originalDx < ioStats.minItemWidth ? ioStats.minItemWidth : originalDx;
+                    context.fillStyle = this.calcItemColor(recentItem.Type, recentItem);
+                    context.fillRect(x1, yStartItem, dx, ioStats.itemHeight);
+
+                    // Register track item for tooltip (but not for the 'closed' indexes track)
+                    this.hitTest.registerTrackItem(x1 - 2, yStartItem, dx + 2, ioStats.itemHeight, recentItem);
+                }
+
+                // dx > 15 allows to skip itemSizeText calculation when width is too low to fit
+                if (originalDx > 15 && recentItem.Type !== "Compression") {
+                    // Calc text size:
+                    const itemSizeText = generalUtils.formatBytesToSize(recentItem.Size);
+                    if (originalDx > itemSizeText.length * ioStats.charWidthApproximation) {
+                        context.fillStyle = 'black';
+                        context.textAlign = "center";
+                        context.font = "bold 10px Lato";
+                        context.fillText(itemSizeText, x1 + originalDx / 2, yStartItem + ioStats.trackHeight / 2 + 4);
+                    }
+                }
             }
         }
 
-        return joinedDurations;
+        context.restore();
+    }
+
+    private drawClosedIndexesTrack(context:CanvasRenderingContext2D, xScale: d3.time.Scale<number, number>, 
+                                   extentFunc: (millis: number) => number, visibleTimeFrame: [Date, Date]) {
+        const items = this.closedIndexesItemsCache;
+        const yStart = this.yScale(ioStats.indexesString);
+
+        // Draw track name
+        this.drawTrackName(context, ioStats.indexesString, yStart);
+
+        const yStartPerTypeCache = new Map<Sparrow.IoMetrics.MeterType, number>();
+        yStartPerTypeCache.set("JournalWrite", yStart + ioStats.closedTrackHeight + ioStats.itemMargin);
+        yStartPerTypeCache.set("Compression", yStart + ioStats.closedTrackHeight + ioStats.itemMargin);
+        yStartPerTypeCache.set("DataFlush", yStart + ioStats.closedTrackHeight + ioStats.itemMargin * 2 + ioStats.itemHeight);
+        yStartPerTypeCache.set("DataSync", yStart + ioStats.closedTrackHeight + ioStats.itemMargin * 3 + ioStats.itemHeight * 2);
+
+        const visibleStartDateAsInt = visibleTimeFrame[0].getTime();
+        const visibleEndDateAsInt = visibleTimeFrame[1].getTime();
+
+        // Draw item in main canvas area (but only if item is inside the visible/selected area from the brush section..)
+        context.save();
+        
+        let lastRegisteredX1 = -1e10;
+        
+        for (let itemIdx = 0; itemIdx < items.length; itemIdx++) {
+            const recentItem = items[itemIdx];
+
+            const itemStartDateAsInt = recentItem.StartedAsDate.getTime();
+            if (visibleEndDateAsInt <= itemStartDateAsInt) {
+                continue;
+            }
+
+            const itemEndDateAsInt = recentItem.CompletedAsDate.getTime();
+            if (itemEndDateAsInt <= visibleStartDateAsInt) {
+                continue;
+            }
+
+            // Determine yStart for item
+            const yStartItem = yStartPerTypeCache.get(recentItem.Type);
+
+            const x1 = xScale(recentItem.StartedAsDate);
+            const originalDx = extentFunc(recentItem.Duration);
+
+            if (lastRegisteredX1 > x1) {
+                // looks like we started new track
+                lastRegisteredX1 = -1e10;
+            }
+            
+            let closeToPrevious = originalDx < 0.5 && x1 < lastRegisteredX1 + 1;
+            // when item is really small and it is quite close to last *registered* item, skip it
+            // since we register bigger areas anyway
+            if (!closeToPrevious) {
+                lastRegisteredX1 = x1;
+                const dx = originalDx < ioStats.minItemWidth ? ioStats.minItemWidth : originalDx;
+                context.fillStyle = this.calcItemColor(recentItem.Type);
+                context.fillRect(x1, yStartItem, dx, ioStats.itemHeight);
+
+                // On the closed index track: 
+                // Register toggle, so that indexes details will open
+                this.hitTest.registerIndexToggle(x1 - 5, yStartItem, dx + 5, ioStats.itemHeight);
+            }
+        }
+        
+        context.restore();
+    }
+
+    /**
+     * Rebuild closed track cache
+     */
+    private updateClosedIndexesInfo() {
+        if (!this.data) {
+            return;
+        }
+        const indexesItemsStartEnds = new Map<Sparrow.IoMetrics.MeterType, Array<[Date, Date]>>();
+        ioStats.meterTypes.forEach(type => indexesItemsStartEnds.set(type, []));
+        
+        const closedIndexesItemsCache = [] as Array<IOMetricsRecentStatsWithCache>;
+
+        for (let envIdx = 0; envIdx < this.data.Environments.length; envIdx++) {
+            const env = this.data.Environments[envIdx];
+            if (this.filtered(env.Path)) {
+                continue;
+            }
+            const trackName = env.Path.substring(this.commonPathsPrefix.length);
+            const isIndexTrack = trackName.startsWith(ioStats.indexesString);
+            if (isIndexTrack) {
+                for (let fileIdx = 0; fileIdx < env.Files.length; fileIdx++) {
+                    const file = env.Files[fileIdx];
+                    for (let recentIdx = 0; recentIdx < file.Recent.length; recentIdx++) {
+                        const recentItem = file.Recent[recentIdx] as IOMetricsRecentStatsWithCache;
+                        closedIndexesItemsCache.push(recentItem);
+                    }
+                }
+            }
+        }
+        
+        this.closedIndexesItemsCache = closedIndexesItemsCache;
     }
 
     private filtered(envPath: string): boolean {
@@ -1154,7 +1234,7 @@ class ioStats extends viewModelBase {
                 addedWidth = 23;
                 drawArrow = true;
                 skipDrawing = this.allIndexesAreFiltered();
-            }           
+            }
         }     
 
         if (!skipDrawing) {
@@ -1255,6 +1335,7 @@ class ioStats extends viewModelBase {
 
     private dataImported(result: string) {
         this.cancelLiveView();
+        this.bufferIsFull(false);
 
         try {
             const importedData: Raven.Server.Documents.Handlers.IOMetricsResponse = JSON.parse(result); 
@@ -1271,6 +1352,7 @@ class ioStats extends viewModelBase {
                 this.prepareTimeData();
                 this.initViewData();
                 this.setLegendScales();
+                this.updateClosedIndexesInfo();
                 this.draw(true);
                 this.isImport(true);
             }
@@ -1290,18 +1372,47 @@ class ioStats extends viewModelBase {
         });
     }
 
-    closeImport() {
-        this.isImport(false);
+    clearGraphWithConfirm() {
+        this.confirmationMessage("Clear graph data", "Do you want to discard all collected IO statistics?")
+            .done(result => {
+                if (result.can) {
+                    this.clearGraph();
+                }
+            })
+    }
+    
+    clearGraph() {
+        this.bufferIsFull(false);
+        this.cancelLiveView();
+        
+        this.setCutOffDate();
+        
         this.hasAnyData(false);
         this.resetGraphData();
         this.enableLiveView();
+    }
+    
+    private setCutOffDate() {
+        const maxDate = d3.max(this.data.Environments, 
+                env => d3.max(env.Files,
+                        file => d3.max(file.Recent, 
+                            (r: IOMetricsRecentStatsWithCache) => r.StartedAsDate)));
+        
+        this.dateCutoff = maxDate;
+    }
+
+    closeImport() {
+        this.dateCutoff = null;
+        this.isImport(false);
+        this.clearGraph();
     }   
 
     private resetGraphData() {
         this.data = null;
         this.searchText("");
         this.hasAnyData(false);   
-        this.allIndexesAreFiltered(false);     
+        this.allIndexesAreFiltered(false);
+        this.bufferUsage("0.0");
         this.setZoomAndBrush([0, this.totalWidth], brush => brush.clear());
     }
 
@@ -1355,11 +1466,11 @@ class ioStats extends viewModelBase {
         return string1.slice(0, i);
     }
 
-    private calcItemColor(recentItem: Raven.Server.Documents.Handlers.IOMetricsRecentStats, calcColorBasedOnSize: boolean): string {
-        if (calcColorBasedOnSize) {
-            return this.legends.get(recentItem.Type)().colorScale(ioStats.extractItemValue(recentItem));
+    private calcItemColor(type: Sparrow.IoMetrics.MeterType, recentItem?: Raven.Server.Documents.Handlers.IOMetricsRecentStats): string {
+        if (recentItem) {
+            return this.legends.get(type)().colorScale(ioStats.extractItemValue(recentItem));
         } else {
-            return ioStats.eventsColors[recentItem.Type].High;
+            return ioStats.eventsColors[type].High;
         }
     }
 
@@ -1404,32 +1515,6 @@ class ioStats extends viewModelBase {
                 "<br/>Gap duration: " + generalUtils.formatMillis((element).durationInMillis);
             this.handleTooltip(element, x, y, tooltipHtml);
         }
-    }
-
-    private handleClosedTrackTooltip(element: Raven.Server.Documents.Handlers.IOMetricsRecentStats, x: number, y: number) {
-        const currentDatum = this.tooltip.datum();
-
-        if (currentDatum !== element) {
-            const typeString = ioStats.getMeterTypeFriendlyName(element.Type);
-            const duration = this.getJoinedDuration(this.indexesItemsStartEnds.get(element.Type), element);
-
-            let tooltipHtml = `*** ${typeString} ***<br/>`;       
-            const durationFormatted = (duration === 0) ? "0" : generalUtils.formatMillis(duration);
-            tooltipHtml += `Duration: ${durationFormatted}<br/>`;
-            tooltipHtml += `Click for details`;
-
-            this.handleTooltip(element, x, y, tooltipHtml);
-        }
-    }
-
-    private getJoinedDuration(joinedDurationInfo: Array<[number, number]>, element: Raven.Server.Documents.Handlers.IOMetricsRecentStats): number {      
-        const elementStart = new Date(element.Start).getTime();
-        const elementEnd = new Date(elementStart + element.Duration).getTime();
-       
-        // Find containing part from the joined durations array
-        const  joinedDuration = joinedDurationInfo.find(duration => (duration[0] <= elementStart) && (elementEnd <= duration[1]));
-        const duration = joinedDuration[1] - joinedDuration[0];       
-        return duration;
     }
 
     private static getMeterTypeFriendlyName(type: Sparrow.IoMetrics.MeterType) {

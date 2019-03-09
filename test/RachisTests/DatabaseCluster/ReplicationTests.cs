@@ -6,7 +6,6 @@ using System.Threading.Tasks;
 using Esprima.Ast;
 using FastTests.Server.Replication;
 using Microsoft.AspNetCore.Http;
-using Microsoft.AspNetCore.Http.Internal;
 using Raven.Client.Documents;
 using Raven.Client.Documents.Operations.OngoingTasks;
 using Raven.Client.Documents.Operations.Replication;
@@ -17,10 +16,11 @@ using Raven.Client.ServerWide;
 using Raven.Client.ServerWide.Operations;
 using Raven.Client.ServerWide.Operations.Certificates;
 using Raven.Server;
+using Raven.Server.Documents;
+using Raven.Server.ServerWide.Context;
 using Raven.Server.Web;
 using Raven.Server.Web.System;
 using Raven.Tests.Core.Utils.Entities;
-using Tests.Infrastructure;
 using Xunit;
 
 namespace RachisTests.DatabaseCluster
@@ -125,7 +125,7 @@ namespace RachisTests.DatabaseCluster
                     databaseName,
                     "users/1",
                     u => u.Name.Equals("Karmel"),
-                    TimeSpan.FromSeconds(clusterSize + 5),
+                    TimeSpan.FromSeconds(60),
                     certificate: clientCertificate));
 
             }
@@ -181,7 +181,7 @@ namespace RachisTests.DatabaseCluster
                     databaseName,
                     "users/1",
                     u => u.Name.Equals("Karmel"),
-                    TimeSpan.FromSeconds(clusterSize + 5),
+                    TimeSpan.FromSeconds(60),
                     adminCertificate));
                 for (var i = 0; i < 5; i++)
                 {
@@ -596,7 +596,7 @@ namespace RachisTests.DatabaseCluster
                {
                    var db = s.DatabasesLandlord.TryGetOrCreateResourceStore(databaseName).Result;
                    return db.ReplicationLoader?.OutgoingConnections.Count();
-               }, clusterSize - 1);
+               }, clusterSize - 1, 60000);
 
                 using (var session = store.OpenAsyncSession())
                 {
@@ -608,7 +608,7 @@ namespace RachisTests.DatabaseCluster
                     databaseName,
                     "users/1",
                     u => u.Name.Equals("Karmel"),
-                    TimeSpan.FromSeconds(clusterSize + 5),
+                    TimeSpan.FromSeconds(60),
                     certificate: adminCertificate));
 
                 topology.RemoveFromTopology(leader.ServerStore.NodeTag);
@@ -644,7 +644,7 @@ namespace RachisTests.DatabaseCluster
                     [databaseName] = DatabaseAccess.Admin
                 }, server: leader);
             }
-            DatabaseTopology topology;
+
             var doc = new DatabaseRecord(databaseName);
             using (var store = new DocumentStore()
             {
@@ -658,7 +658,7 @@ namespace RachisTests.DatabaseCluster
             }.Initialize())
             {
                 var databaseResult = await store.Maintenance.Server.SendAsync(new CreateDatabaseOperation(doc, clusterSize));
-                topology = databaseResult.Topology;
+                var topology = databaseResult.Topology;
                 Assert.Equal(clusterSize, topology.AllNodes.Count());
                 foreach (var server in Servers)
                 {
@@ -673,13 +673,21 @@ namespace RachisTests.DatabaseCluster
                     await session.StoreAsync(new User { Name = "Karmel" }, "users/1");
                     await session.SaveChangesAsync();
                 }
-                Assert.True(await WaitForDocumentInClusterAsync<User>(
-                    topology,
-                    databaseName,
-                    "users/1",
-                    u => u.Name.Equals("Karmel"),
-                    TimeSpan.FromSeconds(clusterSize + 5),
-                    certificate: adminCertificate));
+
+                // we need to wait for database change vector to be updated
+                // which means that we need to wait for replication to do a full mesh propagation
+                Assert.True(await WaitForValueOnGroupAsync(topology, serverStore =>
+                {
+                    var database = serverStore.DatabasesLandlord.TryGetOrCreateResourceStore(databaseName).Result;
+
+                    using (database.DocumentsStorage.ContextPool.AllocateOperationContext(out DocumentsOperationContext context))
+                    using (context.OpenReadTransaction())
+                    {
+                        var cv = DocumentsStorage.GetDatabaseChangeVector(context);
+
+                        return cv != null && cv.Contains("A:1-") && cv.Contains("B:1-") && cv.Contains("C:1-");
+                    }
+                }, expected: true, timeout: 60000));
             }
 
             using (var store = new DocumentStore()
@@ -703,9 +711,9 @@ namespace RachisTests.DatabaseCluster
                 {
                     var user = await session.LoadAsync<User>("users/2");
                     var changeVector = session.Advanced.GetChangeVectorFor(user);
-                    Assert.True(changeVector.Contains("A:1-"));
-                    Assert.True(changeVector.Contains("B:2-"));
-                    Assert.True(changeVector.Contains("C:1-"));
+                    Assert.True(changeVector.Contains("A:1-"), $"No A:1- in {changeVector}");
+                    Assert.True(changeVector.Contains("B:2-"), $"No B:1- in {changeVector}");
+                    Assert.True(changeVector.Contains("C:1-"), $"No C:1- in {changeVector}");
                 }
             }
         }

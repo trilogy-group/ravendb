@@ -84,7 +84,7 @@ namespace Voron.Data.BTrees
                     return decompressedPage;
 
                 HandleUncompressedNodes(decompressedPage, p, usage);
-                
+
                 return decompressedPage;
             }
             finally
@@ -238,7 +238,7 @@ namespace Voron.Data.BTrees
 
             if (decompressedPage.LastMatch != 0)
                 return;
-            
+
             var node = decompressedPage.GetNode(decompressedPage.LastSearchPosition);
 
             if (usage == DecompressionUsage.Write)
@@ -297,7 +297,7 @@ namespace Voron.Data.BTrees
             }
             finally
             {
-                decompressed.CopyToOriginal(_llt, defragRequired: true, wasModified: true);
+                decompressed.CopyToOriginal(_llt, defragRequired: true, wasModified: true, this);
             }
         }
 
@@ -330,7 +330,7 @@ namespace Voron.Data.BTrees
 
             return new DecompressedReadResult(GetValueReaderFromHeader(node), decompressed);
         }
-        
+
         public struct DecompressionInput
         {
             public DecompressionInput(CompressedNodesHeader* header, TreePage p)

@@ -6,6 +6,7 @@ using System.IO;
 using Sparrow.Compression;
 using Sparrow.Utils;
 using Voron.Data;
+using Voron.Exceptions;
 using Voron.Global;
 using Voron.Impl.Paging;
 
@@ -16,8 +17,8 @@ namespace Voron.Impl.Journal
         private readonly AbstractPager _journalPager;
         private readonly AbstractPager _dataPager;
         private readonly AbstractPager _recoveryPager;
-
-        private readonly long _lastSyncedTransactionId;
+        private readonly HashSet<long> _modifiedPages;
+        private readonly JournalInfo _journalInfo;
         private long _readAt4Kb;
         private readonly DiffApplier _diffApplier = new DiffApplier();
         private readonly long _journalPagerNumberOfAllocated4Kb;
@@ -27,14 +28,14 @@ namespace Voron.Impl.Journal
 
         public long Next4Kb => _readAt4Kb;
 
-        public JournalReader(AbstractPager journalPager, AbstractPager dataPager, AbstractPager recoveryPager,
-            long lastSyncedTransactionId, TransactionHeader* previous)
+        public JournalReader(AbstractPager journalPager, AbstractPager dataPager, AbstractPager recoveryPager, HashSet<long> modifiedPages, JournalInfo journalInfo, TransactionHeader* previous)
         {
             RequireHeaderUpdate = false;
             _journalPager = journalPager;
             _dataPager = dataPager;
             _recoveryPager = recoveryPager;
-            _lastSyncedTransactionId = lastSyncedTransactionId;
+            _modifiedPages = modifiedPages;
+            _journalInfo = journalInfo;
             _readAt4Kb = 0;
             LastTransactionHeader = previous;
             _journalPagerNumberOfAllocated4Kb = 
@@ -78,7 +79,7 @@ namespace Voron.Impl.Journal
                 ((size + sizeof(TransactionHeader)) % (4*Constants.Size.Kilobyte) == 0 ? 0 : 1);
 
 
-            if (current->TransactionId <= _lastSyncedTransactionId)
+            if (current->TransactionId <= _journalInfo.LastSyncedTransactionId)
             {
                 _readAt4Kb += transactionSizeIn4Kb;
                 LastTransactionHeader = current;
@@ -95,7 +96,7 @@ namespace Voron.Impl.Journal
                 _recoveryPager.EnsureContinuous(0, numberOfPages);
                 _recoveryPager.EnsureMapped(this, 0, numberOfPages);
                 outputPage = _recoveryPager.AcquirePagePointer(this, 0);
-                UnmanagedMemory.Set(outputPage, 0, (long)numberOfPages * Constants.Storage.PageSize);
+                Memory.Set(outputPage, 0, (long)numberOfPages * Constants.Storage.PageSize);
 
                 try
                 {
@@ -117,7 +118,7 @@ namespace Voron.Impl.Journal
                 _recoveryPager.EnsureContinuous(0, numberOfPages);
                 _recoveryPager.EnsureMapped(this, 0, numberOfPages);
                 outputPage = _recoveryPager.AcquirePagePointer(this, 0);
-                UnmanagedMemory.Set(outputPage, 0, (long)numberOfPages * Constants.Storage.PageSize);
+                Memory.Set(outputPage, 0, (long)numberOfPages * Constants.Storage.PageSize);
                 Memory.Copy(outputPage, (byte*)current + sizeof(TransactionHeader), current->UncompressedSize);
                 pageInfoPtr = (TransactionHeaderPageInfo*)outputPage;
             }
@@ -129,7 +130,7 @@ namespace Voron.Impl.Journal
             for (var i = 0; i < current->PageCount; i++)
             {
                 if(pageInfoPtr[i].PageNumber > current->LastPageNumber)
-                    throw new InvalidDataException($"Transaction {current->TransactionId} contains refeence to page {pageInfoPtr[i].PageNumber} which is after the last allocated page {current->LastPageNumber}");
+                    throw new InvalidDataException($"Transaction {current->TransactionId} contains reference to page {pageInfoPtr[i].PageNumber} which is after the last allocated page {current->LastPageNumber}");
             }
 
             for (var i = 0; i < current->PageCount; i++)
@@ -145,19 +146,45 @@ namespace Voron.Impl.Journal
                 _dataPager.EnsureContinuous(pageInfoPtr[i].PageNumber, numberOfPagesOnDestination);
                 _dataPager.EnsureMapped(this, pageInfoPtr[i].PageNumber, numberOfPagesOnDestination);
 
+
                 // We are going to overwrite the page, so we don't care about its current content
                 var pagePtr = _dataPager.AcquirePagePointerForNewPage(this, pageInfoPtr[i].PageNumber, numberOfPagesOnDestination);
+                _dataPager.MaybePrefetchMemory(pageInfoPtr[i].PageNumber, numberOfPagesOnDestination);
                 
                 var pageNumber = *(long*)(outputPage + totalRead);
                 if (pageInfoPtr[i].PageNumber != pageNumber)
                     throw new InvalidDataException($"Expected a diff for page {pageInfoPtr[i].PageNumber} but got one for {pageNumber}");
                 totalRead += sizeof(long);
 
+                _modifiedPages.Add(pageNumber);
+
+                for (var j = 1; j < numberOfPagesOnDestination; j++)
+                {
+                    _modifiedPages.Remove(pageNumber + j);
+                }
+
                 _dataPager.UnprotectPageRange(pagePtr, (ulong)pageInfoPtr[i].Size);
  
                 if (pageInfoPtr[i].DiffSize == 0)
                 {
-                    Memory.Copy(pagePtr, outputPage + totalRead, pageInfoPtr[i].Size);
+                    if (pageInfoPtr[i].Size == 0)
+                    {
+                        // diff contained no changes
+                        continue;
+                    }
+
+                    var journalPagePtr = outputPage + totalRead;
+
+                    if (options.EncryptionEnabled == false)
+                    {
+                        var pageHeader = (PageHeader*)journalPagePtr;
+
+                        var checksum = StorageEnvironment.CalculatePageChecksum((byte*)pageHeader, pageNumber, out var expectedChecksum);
+                        if (checksum != expectedChecksum) 
+                            ThrowInvalidChecksumOnPageFromJournal(pageNumber, current, expectedChecksum, checksum, pageHeader);
+                    }
+
+                    Memory.Copy(pagePtr, journalPagePtr, pageInfoPtr[i].Size);
                     totalRead += pageInfoPtr[i].Size;
 
                     if (options.EncryptionEnabled)
@@ -200,16 +227,31 @@ namespace Voron.Impl.Journal
             return true;
         }
 
-        public int RecoverAndValidate(StorageEnvironmentOptions options, TransactionHeader[] transactionHeaders)
+        private void ThrowInvalidChecksumOnPageFromJournal(long pageNumber, TransactionHeader* current, ulong expectedChecksum, ulong checksum, PageHeader* pageHeader)
         {
-            int index = 0;
+            var message =
+                $"Invalid checksum for page {pageNumber} in transaction {current->TransactionId}, journal file {_journalPager} might be corrupted, expected hash to be {expectedChecksum} but was {checksum}." +
+                $"Data from journal has not been applied to data file {_dataPager} yet. ";
+
+            message += $"Page flags: {pageHeader->Flags}. ";
+
+            if ((pageHeader->Flags & PageFlags.Overflow) == PageFlags.Overflow)
+                message += $"Overflow size: {pageHeader->OverflowSize}. ";
+
+
+            throw new InvalidDataException(message);
+        }
+
+        public List<TransactionHeader> RecoverAndValidate(StorageEnvironmentOptions options)
+        {
+            var transactionHeaders = new List<TransactionHeader>();
             while (ReadOneTransactionToDataFile(options))
             {
-                transactionHeaders[index++] = *LastTransactionHeader;
+                transactionHeaders.Add(*LastTransactionHeader);
             }
             ZeroRecoveryBufferIfNeeded(this, options);
 
-            return index;
+            return transactionHeaders;
         }
 
         public void ZeroRecoveryBufferIfNeeded(IPagerLevelTransactionState tx, StorageEnvironmentOptions options)
@@ -338,10 +380,23 @@ namespace Voron.Impl.Journal
                 hashIsValid = ValidatePagesHash(options, current);
             }
 
-            if (LastTransactionHeader == null)
-                return hashIsValid;
+            long lastTxId;
 
-            var txIdDiff = current->TransactionId - LastTransactionHeader->TransactionId;
+            if (LastTransactionHeader != null)
+            {
+                lastTxId = LastTransactionHeader->TransactionId;
+            }
+            else
+            {
+                // this is first transaction being processed in the recovery process
+
+                if (_journalInfo.LastSyncedTransactionId == -1 || current->TransactionId <= _journalInfo.LastSyncedTransactionId)
+                    return hashIsValid;
+
+                lastTxId = _journalInfo.LastSyncedTransactionId;
+            }
+
+            var txIdDiff = current->TransactionId - lastTxId;
 
             // 1 is a first storage transaction which does not increment transaction counter after commit
             if (current->TransactionId != 1)
@@ -354,9 +409,17 @@ namespace Voron.Impl.Journal
                     if (hashIsValid)
                     {
                         // TxId is bigger then the last one by nore the '1' but has valid hash which mean we lost transactions in the middle
-                        throw new InvalidDataException(
-                            $"Transaction has valid(!) hash with invalid transaction id {current->TransactionId}, the last valid transaction id is {LastTransactionHeader->TransactionId}." +
-                            $" Journal file {_journalPager.FileName} might be corrupted");
+
+                        if (LastTransactionHeader != null)
+                        {
+                            throw new InvalidJournalException(
+                                $"Transaction has valid(!) hash with invalid transaction id {current->TransactionId}, the last valid transaction id is {LastTransactionHeader->TransactionId}." +
+                                $" Journal file {_journalPager.FileName} might be corrupted", _journalInfo);
+                        }
+
+                        throw new InvalidJournalException(
+                            $"The last synced transaction id was {_journalInfo.LastSyncedTransactionId} (in journal: {_journalInfo.LastSyncedJournal}) but the first transaction being read in the recovery process is {current->TransactionId} (transaction has valid hash). " +
+                            $"Some journals are missing. Current journal file {_journalPager.FileName}.", _journalInfo);
                     }
                 }
 
@@ -398,8 +461,7 @@ namespace Voron.Impl.Journal
                 options.InvokeRecoveryError(this, $"Compresses size {current->CompressedSize} is negative", null);
                 return false;
             }
-            if (size >
-                (_journalPagerNumberOfAllocated4Kb - _readAt4Kb) * 4 * Constants.Size.Kilobyte)
+            if (size > (_journalPagerNumberOfAllocated4Kb - _readAt4Kb) * 4 * Constants.Size.Kilobyte)
             {
                 // we can't read past the end of the journal
                 RequireHeaderUpdate = true;

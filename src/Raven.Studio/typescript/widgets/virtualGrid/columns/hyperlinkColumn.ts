@@ -1,13 +1,8 @@
 ﻿/// <reference path="../../../../typings/tsd.d.ts"/>
 import textColumn = require("widgets/virtualGrid/columns/textColumn");
 import virtualRow = require("widgets/virtualGrid/virtualRow");
+import generalUtils = require("common/generalUtils");
 import virtualGridController = require("widgets/virtualGrid/virtualGridController");
-
-type hypertextColumnOpts<T> = {
-    extraClass?: (item: T) => string;
-    useRawValue?: (item: T) => boolean;
-    handler?: (item: T, event: JQueryEventObject) => void;
-}
 
 /**
  * Virtual grid column that renders hyperlinks.
@@ -34,20 +29,35 @@ class hyperlinkColumn<T> extends textColumn<T> {
         this.customHandler(row.data as T, event);
     }
 
-    renderCell(item: T, isSelected: boolean): string {
+    renderCell(item: T, isSelected: boolean, isSorted: boolean): string {
         const hyperlinkValue = this.hrefAccessor(item);
 
         if (hyperlinkValue) {
             // decorate with link
             const preparedValue = this.prepareValue(item);
-            const extraCssClasses = this.opts.extraClass ? this.opts.extraClass(item) : '';
+            const extraHtml = this.opts.title ? ` title="${generalUtils.escapeHtml(this.opts.title(item))}" ` : '';
+            let extraCssClasses = this.opts.extraClass ? this.opts.extraClass(item) : '';
+            
+            if (isSorted) {
+                extraCssClasses += ' sorted';
+            }
+            
             const customAction = this.customHandler ? `data-link-action="${this.linkActionUniqueId}"` : "";
 
-            return `<div class="cell text-cell ${preparedValue.typeCssClass} ${extraCssClasses}" style="width: ${this.width}"><a href="${hyperlinkValue}" ${customAction}>${preparedValue.rawText}</a></div>`;
+            return `<div ${extraHtml} class="cell text-cell ${preparedValue.typeCssClass} ${extraCssClasses}" style="width: ${this.width}"><a href="${hyperlinkValue}" ${customAction}>${preparedValue.rawText}</a></div>`;
         } else {
             // fallback to plain text column
-            return super.renderCell(item, isSelected);
+            return super.renderCell(item, isSelected, isSorted);
         }
+    }
+
+    toDto(): virtualColumnDto {
+        return {
+            type: "hyperlink",
+            header: this.header,
+            width: this.width,
+            serializedValue: this.valueAccessor.toString()
+        };
     }
 }
 

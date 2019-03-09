@@ -203,6 +203,7 @@ namespace Raven.Server.Documents.Handlers.Admin
                 context.Write(writer, json);
                 writer.Flush();
             }
+
             return Task.CompletedTask;
         }
 
@@ -340,6 +341,18 @@ namespace Raven.Server.Documents.Handlers.Admin
             using (var requestExecutor = ClusterRequestExecutor.CreateForSingleNode(nodeUrl, Server.Certificate.Certificate))
             {
                 requestExecutor.DefaultTimeout = ServerStore.Engine.OperationTimeout;
+
+                // test connection to remote.
+                var result = await ServerStore.TestConnectionToRemote(nodeUrl, database: null);
+                if (result.Success == false)
+                {
+                    throw new InvalidOperationException(result.Error);
+                }
+                
+                // test connection from remote to destination
+                result = await ServerStore.TestConnectionFromRemote(requestExecutor, ctx, nodeUrl);
+                if(result.Success == false)
+                    throw new InvalidOperationException(result.Error);
 
                 var infoCmd = new GetNodeInfoCommand();
                 try
@@ -671,28 +684,6 @@ namespace Raven.Server.Documents.Handlers.Admin
                 await ServerStore.Engine.ModifyTopologyAsync(nodeTag, url, Leader.TopologyModification.NonVoter);
                 NoContentStatus();
             }
-        }
-
-        private void RedirectToLeader()
-        {
-            if (ServerStore.LeaderTag == null)
-                throw new NoLeaderException();
-
-            ClusterTopology topology;
-            using (ServerStore.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
-            using (context.OpenReadTransaction())
-            {
-                topology = ServerStore.GetClusterTopology(context);
-            }
-            var url = topology.GetUrlFromTag(ServerStore.LeaderTag);
-            if (string.Equals(url, ServerStore.GetNodeHttpServerUrl(), StringComparison.OrdinalIgnoreCase))
-            {
-                throw new NoLeaderException($"This node is not the leader, but the current topology does mark it as the leader. Such confusion is usually an indication of a network or configuration problem.");
-            }
-            var leaderLocation = url + HttpContext.Request.Path + HttpContext.Request.QueryString;
-            HttpContext.Response.StatusCode = (int)HttpStatusCode.TemporaryRedirect;
-            HttpContext.Response.Headers.Remove("Content-Type");
-            HttpContext.Response.Headers.Add("Location", leaderLocation);
         }
     }
 }

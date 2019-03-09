@@ -22,7 +22,7 @@ namespace Voron.Debugging
     public class DetailedStorageReport
     {
         public DataFileReport DataFile { get; set; }
-        public List<JournalReport> Journals { get; set; }
+        public JournalsReport Journals { get; set; }
         public List<TempBufferReport> TempBuffers { get; set; }
         public List<TreeReport> Trees { get; set; }
         public List<TableReport> Tables { get; set; }
@@ -37,16 +37,33 @@ namespace Voron.Debugging
         public long FreeSpaceInBytes { get; set; }
     }
 
+    public class JournalsReport
+    {
+        public long LastFlushedJournal { get; set; }
+        public long TotalWrittenButUnsyncedBytes { get; set; }
+        public long LastFlushedTransaction { get; set; }
+        public List<JournalReport> Journals { get; set; }
+    }
+
     public class JournalReport
     {
         public long Number { get; set; }
         public long AllocatedSpaceInBytes { get; set; }
+        public long Available4Kbs { get; set; }
+        public long LastTransaction { get; set; }
     }
 
     public class TempBufferReport
     {
         public string Name { get; set; }
         public long AllocatedSpaceInBytes { get; set; }
+        public TempBufferType Type { get; set; }
+    }
+
+    public enum TempBufferType
+    {
+        Scratch,
+        RecyclableJournal
     }
 
     public class TreeReport
@@ -67,6 +84,7 @@ namespace Voron.Debugging
         public long UsedSpaceInBytes { get; set; }
 
         public StreamsReport Streams { get; set; }
+        public Dictionary<int, int> BalanceHistogram { get; internal set; }
     }
 
     public class MultiValuesReport

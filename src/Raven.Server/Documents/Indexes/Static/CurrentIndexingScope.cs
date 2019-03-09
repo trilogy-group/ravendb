@@ -18,7 +18,9 @@ namespace Raven.Server.Documents.Indexes.Static
         private readonly DocumentsStorage _documentsStorage;
         private readonly DocumentsOperationContext _documentsContext;
 
-        public UnmanagedBuffersPoolWithLowMemoryHandling UnmanagedBuffersPool { get; }
+        public readonly UnmanagedBuffersPoolWithLowMemoryHandling UnmanagedBuffersPool;
+
+        public Dictionary<string, FieldIndexing> DynamicFields;
 
         private readonly Func<string, SpatialField> _getSpatialField;
 
@@ -92,7 +94,7 @@ namespace Raven.Server.Documents.Indexes.Static
 
                     // we intentionally don't dispose of the scope here, this is being tracked by the references
                     // and will be disposed there.
-                    Slice.External(_documentsContext.Allocator, keyLazy.Buffer, keyLazy.Size, out keySlice);
+                    Slice.External(_documentsContext.Allocator, keyLazy, out keySlice);
                 }
                 else
                 {

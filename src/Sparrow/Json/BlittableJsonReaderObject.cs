@@ -29,6 +29,8 @@ namespace Sparrow.Json
 
         public override string ToString()
         {
+            AssertContextNotDisposed();
+
             using (var memoryStream = new MemoryStream())
             {
                 WriteJsonTo(memoryStream);
@@ -39,7 +41,9 @@ namespace Sparrow.Json
         }
 
         public void WriteJsonTo(Stream stream)
-        {
+        {         
+            AssertContextNotDisposed();
+
             _context.Write(stream, this);
         }
 
@@ -91,6 +95,8 @@ namespace Sparrow.Json
 
         private void SetupPropertiesAccess(byte* mem, int propsOffset)
         {
+            AssertContextNotDisposed();
+
             _propNames = (mem + propsOffset);
             var propNamesOffsetFlag = (BlittableJsonToken)(*_propNames);
             switch (propNamesOffsetFlag)
@@ -161,6 +167,8 @@ namespace Sparrow.Json
         {
             get
             {
+                AssertContextNotDisposed();
+
                 if (_parent != null)
                     InvalidAttemptToCopyNestedObject();
 
@@ -168,7 +176,15 @@ namespace Sparrow.Json
             }
         }
 
-        public ulong DebugHash => Hashing.XXHash64.Calculate(_mem, (ulong)_size);
+        public ulong DebugHash
+        {
+            get
+            {
+                AssertContextNotDisposed();
+
+                return Hashing.XXHash64.Calculate(_mem, (ulong)_size);
+            }
+        }
 
 
         /// <summary>
@@ -177,6 +193,8 @@ namespace Sparrow.Json
         /// <returns></returns>
         public string[] GetPropertyNames()
         {
+            AssertContextNotDisposed();
+
             var offsets = new int[_propCount];
             var propertyNames = new string[_propCount];
 
@@ -201,6 +219,8 @@ namespace Sparrow.Json
 
         private LazyStringValue GetPropertyName(int propertyId)
         {
+            AssertContextNotDisposed();
+
             var propertyNameOffsetPtr = _propNames + sizeof(byte) + propertyId * _propNamesDataOffsetSize;
             var propertyNameOffset = ReadNumber(propertyNameOffsetPtr, _propNamesDataOffsetSize);
 
@@ -238,6 +258,12 @@ namespace Sparrow.Json
                 obj = default(T);
                 return false;
             }
+#if DEBUG
+            finally
+            {
+                AssertContextNotDisposed();
+            }
+#endif
         }
 
         public bool TryGet<T>(StringSegment name, out T obj)
@@ -448,9 +474,40 @@ namespace Sparrow.Json
             return TryGetMember(new StringSegment(name), out result);
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private bool TryGetObjectByIndex(int index, BlittableJsonToken expectedToken, out object result)
+        {
+            AssertContextNotDisposed();
+
+            var metadataSize = _currentOffsetSize + _currentPropertyIdSize + sizeof(byte);
+
+            GetPropertyTypeAndPosition(index, metadataSize, out var token, out var position, out var propertyId);
+            if (CompareTokens(expectedToken, token) == false)
+            {
+                result = null;
+                return false;
+            }
+            result = GetObject(token, (int)(_objStart - _mem - position));
+            return true;
+        }
+
+        private bool CompareTokens(BlittableJsonToken firstToken, BlittableJsonToken secondToken)
+        {
+            AssertContextNotDisposed();
+
+            var firstClearedToken = (firstToken & TypesMask);
+            var secondClearedToken = (secondToken & TypesMask);
+            if (firstClearedToken == secondClearedToken)
+                return true;
+            
+            return (firstClearedToken == BlittableJsonToken.EmbeddedBlittable && secondClearedToken == BlittableJsonToken.StartObject 
+                    || firstClearedToken == BlittableJsonToken.StartObject && secondClearedToken == BlittableJsonToken.EmbeddedBlittable);
+        }
 
         public bool TryGetMember(StringSegment name, out object result)
         {
+            AssertContextNotDisposed();
+
             if (_mem == null)
                 goto ThrowDisposed;
 
@@ -481,10 +538,10 @@ namespace Sparrow.Json
                 AddToCache(name, result, index);
             }
 
-Return:
+        Return:
             return opResult;
 
-ThrowDisposed:
+        ThrowDisposed:
             ThrowObjectDisposed();
             result = null;
             return false;
@@ -493,6 +550,8 @@ ThrowDisposed:
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void AddToCache(StringSegment name, object result, int index)
         {
+            AssertContextNotDisposed();
+
             if (_objectsPathCache == null)
             {
                 _context.AcquirePathCache(out _objectsPathCache, out _objectsPathCacheByIndex);
@@ -504,6 +563,8 @@ ThrowDisposed:
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void GetPropertyTypeAndPosition(int index, long metadataSize, out BlittableJsonToken token, out int position, out int propertyId)
         {
+            AssertContextNotDisposed();
+
             var propPos = _metadataPtr + index * metadataSize;
             position = ReadNumber(propPos, _currentOffsetSize);
             propertyId = ReadNumber(propPos + _currentOffsetSize, _currentPropertyIdSize);
@@ -520,6 +581,8 @@ ThrowDisposed:
 
         public void GetPropertyByIndex(int index, ref PropertyDetails prop, bool addObjectToCache = false)
         {
+            AssertContextNotDisposed();
+
             if (_mem == null)
                 ThrowObjectDisposed();
 
@@ -527,10 +590,10 @@ ThrowDisposed:
                 ThrowOutOfRangeException();
 
             var metadataSize = _currentOffsetSize + _currentPropertyIdSize + sizeof(byte);
-            
-            GetPropertyTypeAndPosition(index, metadataSize, 
-                out var token, 
-                out var position, 
+
+            GetPropertyTypeAndPosition(index, metadataSize,
+                out var token,
+                out var position,
                 out var propertyId);
 
             var stringValue = GetPropertyName(propertyId);
@@ -562,17 +625,29 @@ ThrowDisposed:
 
         public int GetPropertyIndex(string name)
         {
+            AssertContextNotDisposed();
+
             return GetPropertyIndex(new StringSegment(name));
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public int GetPropertyIndex(StringSegment name)
         {
+            AssertContextNotDisposed();
+
+            var comparer = _context.GetLazyStringForFieldWithCaching(name);
+            return GetPropertyIndex(comparer);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private int GetPropertyIndex(LazyStringValue comparer)
+        {
+            AssertContextNotDisposed();
+
             if (_propCount == 0)
                 goto NotFound;
 
             int min = 0, max = _propCount - 1;
-            var comparer = _context.GetLazyStringForFieldWithCaching(name);
 
             long currentOffsetSize = _currentOffsetSize;
             long currentPropertyIdSize = _currentPropertyIdSize;
@@ -607,7 +682,7 @@ ThrowDisposed:
 
             } while (min <= max);
 
-NotFound:
+        NotFound:
             return -1;
         }
 
@@ -620,6 +695,8 @@ NotFound:
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private int ComparePropertyName(int propertyId, LazyStringValue comparer)
         {
+            AssertContextNotDisposed();
+
             // Get the offset of the property name from the _proprNames position
             var propertyNameOffsetPtr = _propNames + 1 + propertyId * _propNamesDataOffsetSize;
             var propertyNameOffset = ReadNumber(propertyNameOffsetPtr, _propNamesDataOffsetSize);
@@ -645,6 +722,8 @@ NotFound:
 
         public int GetPropertiesByInsertionOrder(PropertiesInsertionBuffer buffers)
         {
+            AssertContextNotDisposed();
+
             if (_metadataPtr == null)
                 ThrowObjectDisposed();
 
@@ -671,6 +750,8 @@ NotFound:
 
         public ulong GetHashOfPropertyNames()
         {
+            AssertContextNotDisposed();
+
             ulong hash = (ulong)_propCount;
             for (int i = 0; i < _propCount; i++)
             {
@@ -688,6 +769,8 @@ NotFound:
 
         public int[] GetPropertiesByInsertionOrder()
         {
+            AssertContextNotDisposed();
+
             var props = new int[_propCount];
             var offsets = new int[_propCount];
             var metadataSize = _currentOffsetSize + _currentPropertyIdSize + sizeof(byte);
@@ -706,6 +789,8 @@ NotFound:
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal object GetObject(BlittableJsonToken type, int position)
         {
+            AssertContextNotDisposed();
+
             BlittableJsonToken actualType = type & TypesMask;
             if (actualType == BlittableJsonToken.String)
                 return ReadStringLazily(position);
@@ -719,6 +804,8 @@ NotFound:
 
         private object GetObjectUnlikely(BlittableJsonToken type, int position, BlittableJsonToken actualType)
         {
+            AssertContextNotDisposed();
+
             switch (actualType)
             {
                 case BlittableJsonToken.EmbeddedBlittable:
@@ -743,6 +830,8 @@ NotFound:
 
         public void Dispose()
         {
+            AssertContextNotDisposed();
+
             if (_mem == null) //double dispose will do nothing
                 return;
             if (_allocatedMemory != null && _buffer.IsDisposed == false)
@@ -771,6 +860,8 @@ NotFound:
 
         public void CopyTo(byte* ptr)
         {
+            AssertContextNotDisposed();
+
             if (_parent != null)
                 InvalidAttemptToCopyNestedObject();
             Memory.Copy(ptr, _mem, _size);
@@ -789,6 +880,8 @@ NotFound:
 
         public BlittableJsonReaderObject Clone(JsonOperationContext context)
         {
+            AssertContextNotDisposed();
+
             if (_parent != null)
                 return context.ReadObject(this, "cloning nested obj");
 
@@ -860,6 +953,8 @@ NotFound:
 
         private int PropertiesNamesValidation(int numberOfProps, int propsOffsetList, int propsNamesOffsetSize, int currentSize)
         {
+            AssertContextNotDisposed();
+
             var blittableSize = currentSize;
             var offsetCounter = 0;
             for (var i = numberOfProps - 1; i >= 0; i--)
@@ -881,6 +976,8 @@ NotFound:
 
         private int StringValidation(int stringOffset)
         {
+            AssertContextNotDisposed();
+
             byte lenOffset;
             byte escOffset;
             int stringLength;
@@ -895,8 +992,7 @@ NotFound:
                 var prevEscCharOffset = 0;
                 for (var i = 0; i < escCount; i++)
                 {
-                    byte escCharOffsetLen;
-                    var escCharOffset = ReadVariableSizeInt(str + stringLength + escOffset + totalEscCharLen, out escCharOffsetLen);
+                    var escCharOffset = ReadVariableSizeInt(str + stringLength + escOffset + totalEscCharLen, out var escCharOffsetLen);
                     escCharOffset += prevEscCharOffset;
                     var escChar = (char)ReadNumber(_mem + str + escCharOffset, 1);
                     switch (escChar)
@@ -911,7 +1007,9 @@ NotFound:
                         case '\t':
                             break;
                         default:
-                            throw new InvalidDataException("String not valid, invalid escape character: " + escChar);
+                            if (escChar >= 32)
+                                throw new InvalidDataException("String not valid, invalid escape character: " + escChar);
+                            break;
                     }
                     totalEscCharLen += escCharOffsetLen;
                     prevEscCharOffset = escCharOffset + 1;
@@ -923,6 +1021,8 @@ NotFound:
         private BlittableJsonToken TokenValidation(byte tokenStart, out int propOffsetSize,
             out int propIdSize)
         {
+            AssertContextNotDisposed();
+
             var token = (BlittableJsonToken)tokenStart;
             var tokenType = ProcessTokenTypeFlags(token);
             propOffsetSize = ((tokenType == BlittableJsonToken.StartObject) ||
@@ -939,6 +1039,8 @@ NotFound:
         private int PropertiesValidation(BlittableJsonToken rootTokenTypen, int mainPropOffsetSize, int mainPropIdSize,
             int objStartOffset, int numberOfPropsNames)
         {
+            AssertContextNotDisposed();
+
             byte offset;
             var numberOfProperties = ReadVariableSizeInt(_mem + objStartOffset, 0, out offset);
             var current = objStartOffset + offset;
@@ -1030,6 +1132,8 @@ NotFound:
         public void AddItemsToStream<T>(ManualBlittableJsonDocumentBuilder<T> writer)
             where T : struct, IUnmanagedWriteBuffer
         {
+            AssertContextNotDisposed();
+
             for (var i = 0; i < Count; i++)
             {
                 var prop = new PropertyDetails();
@@ -1081,6 +1185,7 @@ NotFound:
 
         public override bool Equals(object obj)
         {
+            AssertContextNotDisposed();
             if (ReferenceEquals(null, obj))
                 return false;
 
@@ -1097,16 +1202,35 @@ NotFound:
 
         protected bool Equals(BlittableJsonReaderObject other)
         {
+            AssertContextNotDisposed();
             if (_propCount != other._propCount)
                 return false;
 
-            foreach (var propertyName in GetPropertyNames())
+            if (_isRoot && other._isRoot)
             {
-                object result;
-                if (other.TryGetMember(propertyName, out result) == false)
+                if (_size == other.Size && Memory.CompareInline(_mem, other._mem, _size) == 0)
+                    return true;
+            }
+
+            var metadataSize = (_currentOffsetSize + _currentPropertyIdSize + sizeof(byte));
+
+            for (var i = 0; i < _propCount; i++)
+            {
+                GetPropertyTypeAndPosition(i, metadataSize, out var token, out var position, out var id);
+
+                var propertyName = GetPropertyName(id);
+
+                var otherId = other.GetPropertyIndex(propertyName);
+
+                if (otherId == -1)
                     return false;
 
-                var current = this[propertyName];
+                if (other.TryGetObjectByIndex(otherId, token, out var result) == false) 
+                    return false;
+
+                var thisId = GetPropertyIndex(propertyName);
+
+                TryGetObjectByIndex(thisId, token, out var current);
 
                 if (current == null && result == null)
                     continue;
@@ -1120,12 +1244,15 @@ NotFound:
 
         public override int GetHashCode()
         {
-            return _isRoot ? _size ^ _propCount : _propCount;
+            AssertContextNotDisposed();
+            return _propCount;
         }
 
         [Conditional("DEBUG")]
         public static void AssertNoModifications(BlittableJsonReaderObject data, string id, bool assertChildren, bool assertRemovals = true, bool assertProperties = true)
         {
+            data.AssertContextNotDisposed();            
+
             if (assertRemovals == false && assertProperties == false)
                 throw new InvalidOperationException($"Both {nameof(assertRemovals)} and {nameof(assertProperties)} cannot be set to false.");
 
@@ -1170,6 +1297,8 @@ NotFound:
 
         public bool Contains(LazyStringValue propertyName)
         {
+            AssertContextNotDisposed();
+
             var metadataSize = (_currentOffsetSize + _currentPropertyIdSize + sizeof(byte));
 
             for (int i = 0; i < _propCount; i++)
