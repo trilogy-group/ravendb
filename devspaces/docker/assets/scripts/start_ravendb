@@ -1,0 +1,8 @@
+#!/bin/bash
+
+BASEDIR=/data
+COMMAND="$BASEDIR/artifacts/linux-x64/ServerPackage/RavenDB/Server/Raven.Server -c=/opt/devspaces/assets/settings.json"
+
+eval $COMMAND
+exit $?
+

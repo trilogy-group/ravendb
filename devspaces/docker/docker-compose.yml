@@ -1,16 +1,20 @@
-version: '2'
+version: '3.2'
 
 services:
   ravendb-dev:
     build:
       context: .
       dockerfile: ./Dockerfile
+    entrypoint: 
     container_name: ravendb-dev
     ports:
-      - 8080
-      - 38888
-      - 5005
+      - 8080:8080
+      - 38888:38888
     volumes:
-      - ..:/data:Z
+      - ../../:/data:Z
     command: bash
     tty: true
+    networks:
+      - ravendb_net
+networks:
+  ravendb_net:

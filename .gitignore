@@ -119,3 +119,8 @@ temp
 /test/Tryouts/Databases/*
 bench/Micro.Benchmark/BenchmarkDotNet.Artifacts/
 /src/Raven.Server/*.DotSettings
+
+
+/devspaces/docker/assets/license.json
+/devspaces/docker/rdbscripts
+
