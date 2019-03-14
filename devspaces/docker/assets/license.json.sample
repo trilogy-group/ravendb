@@ -1,0 +1,8 @@
+{
+    "Id": "<SOME_ID>",
+    "Name": "<SOME_NAME>",
+    "Keys": [
+        "<SOME_KEY>",
+        "<ANOTHER_KEY>"
+    ]
+}

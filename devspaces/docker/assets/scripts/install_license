@@ -1,0 +1,2 @@
+mkdir -p /data/test/FastTests/bin/Release/netcoreapp2.1/
+cp /opt/devspaces/assets/license.json /data/test/FastTests/bin/Release/netcoreapp2.1/license.json
